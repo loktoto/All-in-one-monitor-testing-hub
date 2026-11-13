@@ -41,15 +41,20 @@ pub fn spawn(shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>) -> thread::Joi
         let mut system = System::new_all();
         let mut disks = Disks::new_with_refreshed_list();
         // Adapter enumeration is discovery, not a GPU load or a test.
-        let instance = wgpu::Instance::default();
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
-        let gpu_names: Vec<String> = adapters
-            .iter()
-            .map(|a| {
-                let info = a.get_info();
-                format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend)
-            })
-            .collect();
+        let gpu_names: Vec<String> = std::panic::catch_unwind(|| {
+            let instance = wgpu::Instance::default();
+            instance
+                .enumerate_adapters(wgpu::Backends::all())
+                .iter()
+                .map(|adapter| {
+                    let info = adapter.get_info();
+                    format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+        // CPU usage needs two samples separated in time.
+        thread::sleep(Duration::from_millis(250));
         let nvml = nvml_wrapper::Nvml::init().ok();
         while !stop.load(Ordering::Relaxed) {
             system.refresh_cpu_all();
