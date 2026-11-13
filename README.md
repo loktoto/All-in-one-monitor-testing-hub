@@ -33,7 +33,7 @@ cargo test
 cargo run
 ```
 
-Windows CI builds the MSVC release executable and publishes it as a workflow artifact. It also runs the tests on Windows. See [architecture and roadmap](docs/architecture.md) for boundaries and reference notes. Test on actual Windows hardware with representative NVIDIA/AMD/Intel adapters and storage devices before relying on it. No real Windows hardware validation is implied by a CI build.
+Windows CI builds the MSVC release executable and publishes it as a workflow artifact. It also runs the tests on Windows. See [architecture and roadmap](docs/architecture.md) and the [public reference study](docs/reference-study.md) for evidence, feature gaps and boundaries. Test on actual Windows hardware with representative NVIDIA/AMD/Intel adapters and storage devices before relying on it. No real Windows hardware validation is implied by a CI build.
 
 ## 繁體中文
 

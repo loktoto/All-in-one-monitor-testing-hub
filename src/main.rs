@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui::{self, Color32, RichText};
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Legend, Line, Plot, PlotPoints};
 use hardware_hub::{
     stress::{self, Config, Kind, State},
     telemetry::{self, Snapshot},
@@ -115,6 +115,7 @@ impl App {
         let mem: PlotPoints = self.history.iter().map(|v| [v[0], v[2]]).collect();
         Plot::new("history")
             .height(150.0)
+            .legend(Legend::default())
             .include_y(0.0)
             .include_y(100.0)
             .show_x(false)
@@ -197,7 +198,7 @@ impl App {
             }
         }
         ui.add_space(14.0);
-        ui.weak("There is no automatic temperature-based shutdown. Monitor temperatures with a compatible tool and stop the test if necessary. Stop may wait for the current disk operation.");
+        ui.label(RichText::new("There is no automatic temperature-based shutdown. Monitor temperatures with a compatible tool and stop the test if necessary. Stop may wait for the current disk operation.").color(Color32::LIGHT_GRAY));
         ui.colored_label(Color32::LIGHT_BLUE, &self.message);
     }
     fn reports(&mut self, ui: &mut egui::Ui) {
@@ -256,6 +257,16 @@ impl Drop for App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         let running = self.state.lock().map(|s| s.running).unwrap_or(false);
+        if !running && (self.message.starts_with("Stopping") || self.message == "Test started") {
+            if let Ok(state) = self.state.lock() {
+                if let Some(result) = state.results.last() {
+                    self.message = format!(
+                        "Test {}. See Reports for details.",
+                        result.status.to_lowercase()
+                    );
+                }
+            }
+        }
         if ctx.input(|i| i.viewport().close_requested()) && running {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.cancel.store(true, Ordering::Relaxed);
