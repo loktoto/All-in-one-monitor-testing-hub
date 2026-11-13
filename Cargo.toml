@@ -1,0 +1,18 @@
+[package]
+name = "hardware-hub"
+version = "0.1.0"
+edition = "2021"
+description = "A local hardware monitor and bounded manual test bench"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+egui_plot = "0.31"
+sysinfo = "0.33"
+nvml-wrapper = "0.11"
+wgpu = "24"
+pollster = "0.4"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
