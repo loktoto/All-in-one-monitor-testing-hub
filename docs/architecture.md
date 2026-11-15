@@ -9,3 +9,5 @@ Future work: real Windows hardware validation, physical device-to-volume mapping
 ## References and licensing
 
 [Craft Anything](https://github.com/storytold/craft-anything) describes a Rust clean-room application-building engine (MIT OR Apache-2.0). [REA](https://github.com/morluto/rea) is a reverse-engineering MCP toolkit (MIT). Their documented workflows informed the manual public-documentation study in [reference-study.md](reference-study.md); neither tool was executed, bundled, or copied. Dependencies are resolved in `Cargo.lock`; consult their upstream licenses and transitive notices before redistribution. Principal libraries: eframe/egui (MIT OR Apache-2.0), wgpu (MIT OR Apache-2.0), sysinfo (MIT), nvml-wrapper (MIT), and pollster (MIT OR Apache-2.0).
+
+The broader Traditional Chinese [product evidence and capability study](research/01-product-evidence.zh-Hant.md) and [dependency-ordered roadmap](research/03-roadmap-and-ux.zh-Hant.md) are proposals, not implemented features.

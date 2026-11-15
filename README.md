@@ -40,3 +40,11 @@ Windows CI builds the MSVC release executable and publishes it as a workflow art
 這是以 Windows 為優先的本機監控與手動測試工具。開啟後不會自動執行壓力測試。可查看 CPU、記憶體、磁碟區與 GPU 清單；只有可用的 NVIDIA NVML 驅動能提供 GPU 負載、溫度與顯示記憶體資訊。CPU、記憶體及磁碟溫度、SMART 與風扇轉速尚未支援，也沒有過熱自動停止功能。請使用相容的外部工具監看溫度。
 
 測試有時間與資源上限。磁碟測試只建立獨立暫存檔並驗證讀回資料，最多寫入 1 GiB，但仍會造成 SSD 耗損；異常斷電可能留下暫存檔。停止可能需等待目前的磁碟或 GPU 操作完成。結果可從 Reports 匯出，未匯出的結果會在程式結束時消失。
+
+## 參考產品優點研究（繁體中文）
+
+以公開官方資料整理的廣泛代表性研究，並非聲稱已涵蓋所有產品或功能。內容包括證據與待核實項目、44 項去重能力的 MVP 對照，以及按安全前提排序的路線圖／介面規格。這些是研究與建議，並不代表功能已實作。
+
+- [產品與來源：監控、測試、基準、儲存及診斷](docs/research/01-product-evidence.zh-Hant.md)
+- [去重能力目錄與現有版本落差](docs/research/02-capability-catalog.zh-Hant.md)
+- [優先路線圖、可行性及介面規格](docs/research/03-roadmap-and-ux.zh-Hant.md)
