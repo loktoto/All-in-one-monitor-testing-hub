@@ -126,7 +126,11 @@ fn merge_gpu_lists(adapters: Vec<Gpu>, nvml: Vec<Gpu>) -> Vec<Gpu> {
         }
         if a_counts.contains_key(&key) {
             n.detail.push_str(" · adapter mapping ambiguous");
+        } else if !a_counts.is_empty() {
+            n.detail
+                .push_str(" · not matched by name; may overlap an adapter");
         }
+        n.name = format!("NVML sensor source: {}", n.name);
         merged.push(n);
     }
     merged
@@ -257,6 +261,16 @@ mod tests {
         let r = merge_gpu_lists(vec![g("GPU A", "adapter")], vec![g("gpu a", "nvml")]);
         assert_eq!(r.len(), 1);
         assert!(r[0].detail.contains("nvml"));
+    }
+    #[test]
+    fn unmatched_names_disclose_possible_overlap() {
+        let result = merge_gpu_lists(
+            vec![g("GPU A", "adapter")],
+            vec![g("GPU A variant", "nvml")],
+        );
+        assert_eq!(result.len(), 2);
+        assert!(result[1].detail.contains("may overlap"));
+        assert!(result[1].name.starts_with("NVML sensor source:"));
     }
     #[test]
     fn identical_devices_are_not_collapsed_or_misattributed() {
