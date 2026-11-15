@@ -1,12 +1,13 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use sysinfo::{Disks, System};
+use sysinfo::{Components, Disks, System};
 
 #[derive(Clone, Default)]
 pub struct Disk {
@@ -23,6 +24,18 @@ pub struct Gpu {
     pub name: String,
     pub detail: String,
 }
+#[derive(Clone)]
+pub struct Adapter {
+    pub handle: wgpu::Adapter,
+    pub name: String,
+    pub backend: String,
+    pub software: bool,
+}
+#[derive(Clone)]
+pub struct Temperature {
+    pub label: String,
+    pub celsius: Option<f32>,
+}
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub cpu_name: String,
@@ -33,34 +46,106 @@ pub struct Snapshot {
     pub memory_available: u64,
     pub disks: Vec<Disk>,
     pub gpus: Vec<Gpu>,
+    pub adapters: Vec<Adapter>,
+    pub temperatures: Vec<Temperature>,
+    pub updated_at: Option<Instant>,
     pub ready: bool,
+}
+
+// A single platform-preferred backend prevents the same GPU appearing once per API.
+// Adapter handles are retained and reused for test selection; identical models stay distinct.
+fn discover_adapters() -> Vec<Adapter> {
+    std::panic::catch_unwind(|| {
+        let instance = wgpu::Instance::default();
+        #[cfg(target_os = "windows")]
+        let preferred = wgpu::Backends::DX12;
+        #[cfg(not(target_os = "windows"))]
+        let preferred = wgpu::Backends::VULKAN;
+        let mut found = instance.enumerate_adapters(preferred);
+        if found.is_empty()
+            || found
+                .iter()
+                .all(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
+        {
+            let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                instance.enumerate_adapters(wgpu::Backends::GL)
+            }))
+            .unwrap_or_default();
+            if found.is_empty()
+                || fallback
+                    .iter()
+                    .any(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            {
+                found = fallback;
+            }
+        }
+        found
+            .into_iter()
+            .map(|handle| {
+                let info = handle.get_info();
+                Adapter {
+                    name: info.name,
+                    backend: format!("{:?}", info.backend),
+                    software: info.device_type == wgpu::DeviceType::Cpu,
+                    handle,
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+// Match NVML to an adapter only when the name is unique on both sides. Ambiguous
+// same-model devices remain separate rather than attributing telemetry incorrectly.
+fn merge_gpu_lists(adapters: Vec<Gpu>, nvml: Vec<Gpu>) -> Vec<Gpu> {
+    let mut a_counts = HashMap::<String, usize>::new();
+    let mut n_counts = HashMap::<String, usize>::new();
+    for g in &adapters {
+        *a_counts.entry(g.name.to_lowercase()).or_default() += 1;
+    }
+    for g in &nvml {
+        *n_counts.entry(g.name.to_lowercase()).or_default() += 1;
+    }
+    let mut merged = Vec::new();
+    for mut g in adapters {
+        let key = g.name.to_lowercase();
+        if a_counts.get(&key) == Some(&1) && n_counts.get(&key) == Some(&1) {
+            if let Some(n) = nvml.iter().find(|n| n.name.eq_ignore_ascii_case(&g.name)) {
+                g.detail = format!("{} · {} · name match only (unverified)", g.detail, n.detail);
+            }
+        } else if n_counts.contains_key(&key) {
+            g.detail
+                .push_str(" · NVML mapping ambiguous; see separate sensors");
+        }
+        merged.push(g);
+    }
+    for mut n in nvml {
+        let key = n.name.to_lowercase();
+        if a_counts.get(&key) == Some(&1) && n_counts.get(&key) == Some(&1) {
+            continue;
+        }
+        if a_counts.contains_key(&key) {
+            n.detail.push_str(" · adapter mapping ambiguous");
+        }
+        merged.push(n);
+    }
+    merged
 }
 
 pub fn spawn(shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = System::new_all();
         let mut disks = Disks::new_with_refreshed_list();
-        // Adapter enumeration is discovery, not a GPU load or a test.
-        let gpu_names: Vec<String> = std::panic::catch_unwind(|| {
-            let instance = wgpu::Instance::default();
-            instance
-                .enumerate_adapters(wgpu::Backends::all())
-                .iter()
-                .map(|adapter| {
-                    let info = adapter.get_info();
-                    format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-        // CPU usage needs two samples separated in time.
+        let adapters = discover_adapters();
         thread::sleep(Duration::from_millis(250));
         let nvml = nvml_wrapper::Nvml::init().ok();
         while !stop.load(Ordering::Relaxed) {
             system.refresh_cpu_all();
             system.refresh_memory();
             disks.refresh(true);
-            let mut gpus: Vec<Gpu> = Vec::new();
+            // Recreate the list so a failed read cannot retain a prior value.
+            let components = Components::new_with_refreshed_list();
+            let mut nvidia = Vec::new();
             if let Some(nvml) = &nvml {
                 if let Ok(count) = nvml.device_count() {
                     for i in 0..count {
@@ -86,27 +171,26 @@ pub fn spawn(shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>) -> thread::Joi
                                     )
                                 })
                                 .unwrap_or_else(|_| "VRAM unavailable".into());
-                            gpus.push(Gpu {
+                            nvidia.push(Gpu {
                                 name,
-                                detail: format!("NVIDIA NVML · {load} · {temp} · {memory}"),
+                                detail: format!("NVML device {i} · {load} · {temp} · {memory}"),
                             });
                         }
                     }
                 }
             }
-            for name in &gpu_names {
-                // Avoid showing the NVML device twice; adapters can have multiple backend entries.
-                if !gpus
-                    .iter()
-                    .any(|g| name.to_lowercase().contains(&g.name.to_lowercase()))
-                    && !gpus.iter().any(|g| g.name == *name)
-                {
-                    gpus.push(Gpu {
-                        name: name.clone(),
-                        detail: "Adapter inventory · load, temperature and VRAM unavailable".into(),
-                    });
-                }
-            }
+            let adapter_gpus = adapters
+                .iter()
+                .enumerate()
+                .map(|(i, a)| Gpu {
+                    name: a.name.clone(),
+                    detail: format!(
+                        "Adapter {i} · {}{} · wgpu inventory",
+                        a.backend,
+                        if a.software { " · software" } else { "" }
+                    ),
+                })
+                .collect();
             let snapshot = Snapshot {
                 cpu_name: system
                     .cpus()
@@ -134,7 +218,17 @@ pub fn spawn(shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>) -> thread::Joi
                         }
                     })
                     .collect(),
-                gpus,
+                gpus: merge_gpu_lists(adapter_gpus, nvidia),
+                adapters: adapters.clone(),
+                temperatures: components
+                    .list()
+                    .iter()
+                    .map(|c| Temperature {
+                        label: c.label().to_owned(),
+                        celsius: c.temperature().filter(|v| v.is_finite()),
+                    })
+                    .collect(),
+                updated_at: Some(Instant::now()),
                 ready: true,
             };
             if let Ok(mut out) = shared.lock() {
@@ -148,4 +242,29 @@ pub fn spawn(shared: Arc<Mutex<Snapshot>>, stop: Arc<AtomicBool>) -> thread::Joi
             }
         }
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn g(name: &str, detail: &str) -> Gpu {
+        Gpu {
+            name: name.into(),
+            detail: detail.into(),
+        }
+    }
+    #[test]
+    fn unique_names_are_merged() {
+        let r = merge_gpu_lists(vec![g("GPU A", "adapter")], vec![g("gpu a", "nvml")]);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].detail.contains("nvml"));
+    }
+    #[test]
+    fn identical_devices_are_not_collapsed_or_misattributed() {
+        let r = merge_gpu_lists(
+            vec![g("GPU A", "adapter 1"), g("GPU A", "adapter 2")],
+            vec![g("GPU A", "nvml 1"), g("GPU A", "nvml 2")],
+        );
+        assert_eq!(r.len(), 4);
+        assert!(r.iter().all(|v| v.detail.contains("ambiguous")));
+    }
 }

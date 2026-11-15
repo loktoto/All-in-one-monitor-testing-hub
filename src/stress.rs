@@ -10,12 +10,22 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub enum Kind {
     Cpu,
     Gpu,
     Memory,
     Disk,
+}
+impl Kind {
+    pub fn unit(self) -> &'static str {
+        match self {
+            Self::Cpu => "compute rounds",
+            Self::Gpu => "compute dispatches",
+            Self::Memory => "memory passes",
+            Self::Disk => "file passes",
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -24,14 +34,87 @@ pub struct Config {
     pub workers: usize,
     pub mib: usize,
     pub directory: PathBuf,
+    pub gpu_adapter: Option<String>,
+    pub disk_write_limit_mib: u64,
 }
-#[derive(Clone, Debug)]
+// Export only fields that actually influence this test kind.
+impl serde::Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer.serialize_struct("Config", 4)?;
+        out.serialize_field("kind", &self.kind)?;
+        out.serialize_field("duration_seconds", &self.seconds)?;
+        match self.kind {
+            Kind::Cpu => out.serialize_field("workers", &self.workers)?,
+            Kind::Gpu => out.serialize_field("gpu_adapter", &self.gpu_adapter)?,
+            Kind::Memory => out.serialize_field("memory_mib", &self.mib)?,
+            Kind::Disk => {
+                out.serialize_field("file_mib", &self.mib)?;
+                out.serialize_field("directory", &self.directory)?;
+                out.serialize_field("write_limit_mib", &self.disk_write_limit_mib)?;
+            }
+        }
+        out.end()
+    }
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub enum Status {
+    Completed,
+    Stopped,
+    Failed,
+    Inconclusive,
+    Unavailable,
+}
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct ReportContext {
+    pub cpu: String,
+    pub logical_cpus: usize,
+    pub memory_total: u64,
+    pub adapters: Vec<String>,
+    pub os: String,
+    pub snapshot_age_seconds: Option<f64>,
+}
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ResultRecord {
     pub kind: Kind,
-    pub status: String,
+    pub status: Status,
     pub detail: String,
+    pub verified_units: Option<u64>,
+    pub verified_unit: &'static str,
     pub elapsed: f64,
     pub timestamp: u64,
+    pub config: Config,
+    pub context: ReportContext,
+}
+#[derive(Debug)]
+struct Outcome {
+    verified: u64,
+    detail: String,
+}
+impl Outcome {
+    fn new(verified: u64, detail: String) -> Self {
+        Self { verified, detail }
+    }
+}
+#[derive(Debug)]
+enum TestError {
+    Failed(String),
+    Unavailable(String),
+}
+impl From<String> for TestError {
+    fn from(s: String) -> Self {
+        Self::Failed(s)
+    }
+}
+impl From<&str> for TestError {
+    fn from(s: &str) -> Self {
+        Self::Failed(s.into())
+    }
 }
 #[derive(Default)]
 pub struct State {
@@ -45,48 +128,61 @@ pub fn start(
     config: Config,
     state: Arc<Mutex<State>>,
     cancel: Arc<AtomicBool>,
+    adapter: Option<wgpu::Adapter>,
+    context: ReportContext,
 ) -> Result<(), String> {
-    if !(1..=600).contains(&config.seconds)
-        || !(1..=8).contains(&config.workers)
-        || !(1..=256).contains(&config.mib)
-    {
-        return Err("Limits: 1–600 seconds, 1–8 workers, 1–256 MiB.".into());
+    let valid = (1..=600).contains(&config.seconds)
+        && match config.kind {
+            Kind::Cpu => (1..=8).contains(&config.workers),
+            Kind::Gpu => true,
+            Kind::Memory => (1..=256).contains(&config.mib),
+            Kind::Disk => {
+                (1..=256).contains(&config.mib)
+                    && (1..=1024).contains(&config.disk_write_limit_mib)
+                    && config.disk_write_limit_mib >= config.mib as u64
+            }
+        };
+    if !valid {
+        return Err("Limits: 1–600 seconds; CPU 1–8 workers; memory/file 1–256 MiB; disk write limit must be at least file size and at most 1024 MiB.".into());
     }
     {
         let mut s = state.lock().map_err(|_| "Test state unavailable")?;
         if s.running {
             return Err("A test is already running.".into());
         }
+        cancel.store(false, Ordering::Relaxed);
         s.running = true;
         s.progress = "Starting…".into();
         s.started = Some(Instant::now());
     }
-    cancel.store(false, Ordering::Relaxed);
     thread::spawn(move || {
         let started = Instant::now();
         let deadline = started + Duration::from_secs(config.seconds);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match config.kind {
             Kind::Cpu => cpu(&config, &cancel, deadline),
-            Kind::Gpu => gpu(&cancel, deadline),
+            Kind::Gpu => gpu(adapter.as_ref(), &cancel, deadline),
             Kind::Memory => memory(&config, &cancel, deadline),
             Kind::Disk => disk(&config, &cancel, deadline),
         }))
-        .unwrap_or_else(|_| Err("Test worker panicked; no result was verified".into()));
-        let (status, detail) = match result {
-            Ok(detail) if cancel.load(Ordering::Relaxed) => ("Stopped".into(), detail),
-            Ok(detail) if detail.starts_with("0 ") => ("Inconclusive".into(), detail),
-            Ok(detail) => ("Completed".into(), detail),
-            Err(e) => ("Failed".into(), e),
-        };
+        .unwrap_or_else(|_| {
+            Err(TestError::Failed(
+                "Test worker panicked; no result was verified".into(),
+            ))
+        });
+        let (status, verified_units, detail) = classify(result, cancel.load(Ordering::Relaxed));
         let record = ResultRecord {
             kind: config.kind,
             status,
             detail,
+            verified_units,
+            verified_unit: config.kind.unit(),
             elapsed: started.elapsed().as_secs_f64(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            config,
+            context,
         };
         if let Ok(mut s) = state.lock() {
             s.running = false;
@@ -98,6 +194,20 @@ pub fn start(
     Ok(())
 }
 
+fn classify(result: Result<Outcome, TestError>, cancelled: bool) -> (Status, Option<u64>, String) {
+    match result {
+        Ok(outcome) if cancelled => (Status::Stopped, Some(outcome.verified), outcome.detail),
+        Ok(outcome) if outcome.verified == 0 => (Status::Inconclusive, Some(0), outcome.detail),
+        Ok(outcome) => (Status::Completed, Some(outcome.verified), outcome.detail),
+        Err(TestError::Failed(message)) => (Status::Failed, None, message),
+        Err(TestError::Unavailable(message)) => (Status::Unavailable, Some(0), message),
+    }
+}
+
+const CPU_EXPECTED: u64 = 0x42e1_bf14_e0f1_2920;
+fn cpu_result_is_correct(actual: u64) -> bool {
+    actual == CPU_EXPECTED
+}
 fn calculation(seed: u64) -> u64 {
     let mut x = seed;
     for _ in 0..100_000 {
@@ -108,18 +218,18 @@ fn calculation(seed: u64) -> u64 {
     }
     x
 }
-fn cpu(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, String> {
+fn cpu(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<Outcome, TestError> {
     let mut rounds = 0u64;
     let mut failures = 0u64;
     thread::scope(|scope| {
         let mut tasks = Vec::new();
-        for worker in 0..c.workers {
+        for _worker in 0..c.workers {
             tasks.push(scope.spawn(move || {
-                let expected = calculation(worker as u64);
+                // Expected value is fixed, not derived from the tested execution.
                 let mut n = 0;
                 let mut bad = 0;
                 while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
-                    if calculation(worker as u64) != expected {
+                    if !cpu_result_is_correct(calculation(0)) {
                         bad += 1;
                     }
                     n += 1;
@@ -140,15 +250,19 @@ fn cpu(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, Str
     if failures > 0 {
         Err(format!(
             "{failures} computation mismatches or worker failures after {rounds} checked rounds"
-        ))
+        )
+        .into())
     } else {
-        Ok(format!(
-            "{rounds} checked compute rounds across {} workers; no mismatches detected",
-            c.workers
+        Ok(Outcome::new(
+            rounds,
+            format!(
+                "{rounds} checked compute rounds across {} workers; no mismatches detected",
+                c.workers
+            ),
         ))
     }
 }
-fn memory(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, String> {
+fn memory(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<Outcome, TestError> {
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     let requested = c.mib as u64 * 1024 * 1024;
@@ -158,7 +272,8 @@ fn memory(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, 
             "Requested {} MiB exceeds one quarter of currently available memory ({} MiB).",
             c.mib,
             allowed / 1024 / 1024
-        ));
+        )
+        .into());
     }
     let mut bytes = Vec::new();
     bytes
@@ -170,9 +285,9 @@ fn memory(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, 
         let pattern = if passes % 2 == 0 { 0x55 } else { 0xaa };
         for chunk in bytes.chunks_mut(1024 * 1024) {
             if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                return Ok(format!(
-                    "{passes} complete write/read passes over {} MiB",
-                    c.mib
+                return Ok(Outcome::new(
+                    passes,
+                    format!("{passes} complete write/read passes over {} MiB", c.mib),
                 ));
             }
             chunk.fill(pattern);
@@ -180,20 +295,23 @@ fn memory(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, 
         std::hint::black_box(&mut bytes);
         for chunk in bytes.chunks(1024 * 1024) {
             if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                return Ok(format!(
-                    "{passes} complete write/read passes over {} MiB",
-                    c.mib
+                return Ok(Outcome::new(
+                    passes,
+                    format!("{passes} complete write/read passes over {} MiB", c.mib),
                 ));
             }
             if chunk.iter().any(|&b| b != pattern) {
-                return Err(format!("Memory pattern mismatch in pass {}", passes + 1));
+                return Err(format!("Memory pattern mismatch in pass {}", passes + 1).into());
             }
         }
         passes += 1;
     }
-    Ok(format!(
-        "{passes} complete write/read passes over {} MiB; no mismatches detected",
-        c.mib
+    Ok(Outcome::new(
+        passes,
+        format!(
+            "{passes} complete write/read passes over {} MiB; no mismatches detected",
+            c.mib
+        ),
     ))
 }
 struct Scratch(PathBuf);
@@ -225,15 +343,15 @@ fn scratch(dir: &Path) -> Result<(Scratch, fs::File), String> {
     }
     Err("Could not create a unique test file".into())
 }
-fn disk(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<String, String> {
-    disk_with_cap(c, cancel, deadline, 1024)
+fn disk(c: &Config, cancel: &AtomicBool, deadline: Instant) -> Result<Outcome, TestError> {
+    disk_with_cap(c, cancel, deadline, c.disk_write_limit_mib)
 }
 fn disk_with_cap(
     c: &Config,
     cancel: &AtomicBool,
     deadline: Instant,
     cap_mib: u64,
-) -> Result<String, String> {
+) -> Result<Outcome, TestError> {
     let (_scratch, mut file) = scratch(&c.directory)?;
     let block = vec![0xa5u8; 1024 * 1024];
     let mut passes = 0u64;
@@ -245,7 +363,10 @@ fn disk_with_cap(
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         for _ in 0..c.mib {
             if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                return Ok(format!("{passes} verified passes; {written} MiB written"));
+                return Ok(Outcome::new(
+                    passes,
+                    format!("{passes} verified passes; {written} MiB written"),
+                ));
             }
             file.write_all(&block)
                 .map_err(|e| format!("Write failed: {e}"))?;
@@ -256,7 +377,10 @@ fn disk_with_cap(
         let mut read = vec![0; block.len()];
         for _ in 0..c.mib {
             if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                return Ok(format!("{passes} verified passes; {written} MiB written"));
+                return Ok(Outcome::new(
+                    passes,
+                    format!("{passes} verified passes; {written} MiB written"),
+                ));
             }
             file.read_exact(&mut read)
                 .map_err(|e| format!("Read failed: {e}"))?;
@@ -266,7 +390,10 @@ fn disk_with_cap(
         }
         passes += 1;
     }
-    Ok(format!("{passes} verified passes; {written} MiB written"))
+    Ok(Outcome::new(
+        passes,
+        format!("{passes} verified passes; {written} MiB written"),
+    ))
 }
 
 #[cfg(test)]
@@ -279,6 +406,8 @@ mod tests {
             workers: 1,
             mib: 1,
             directory: std::env::temp_dir(),
+            gpu_adapter: None,
+            disk_write_limit_mib: 1,
         }
     }
     #[test]
@@ -303,7 +432,7 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(result.starts_with("1 verified passes"), "{result}");
+        assert!(result.detail.starts_with("1 verified passes"), "{result:?}");
         assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
@@ -316,7 +445,7 @@ mod tests {
             Instant::now() + Duration::from_millis(200),
         )
         .unwrap();
-        assert!(!result.starts_with("0 "), "{result}");
+        assert!(!result.detail.starts_with("0 "), "{result:?}");
     }
     #[test]
     fn cancelled_disk_test_does_not_write() {
@@ -327,12 +456,125 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(result.contains("0 MiB written"));
+        assert!(result.detail.contains("0 MiB written"));
+    }
+    #[test]
+    fn status_reflects_verified_work_and_unavailable_devices() {
+        assert_eq!(
+            classify(Ok(Outcome::new(0, "nothing".into())), false).0,
+            Status::Inconclusive
+        );
+        assert_eq!(
+            classify(Ok(Outcome::new(1, "ok".into())), false).0,
+            Status::Completed
+        );
+        assert_eq!(
+            classify(Ok(Outcome::new(1, "ok".into())), true).0,
+            Status::Stopped
+        );
+        assert_eq!(
+            classify(Err(TestError::Unavailable("no device".into())), false).0,
+            Status::Unavailable
+        );
+        assert_eq!(
+            classify(Err(TestError::Failed("error".into())), true).0,
+            Status::Failed
+        );
+        assert!(matches!(
+            gpu(
+                None,
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(TestError::Unavailable(_))
+        ));
+    }
+    #[test]
+    fn worker_cancellation_and_restart_clear_running_state() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut config = test_config(Kind::Cpu);
+        config.seconds = 1;
+        start(
+            config.clone(),
+            state.clone(),
+            stop.clone(),
+            None,
+            ReportContext::default(),
+        )
+        .unwrap();
+        assert!(start(
+            config.clone(),
+            state.clone(),
+            stop.clone(),
+            None,
+            ReportContext::default()
+        )
+        .is_err());
+        stop.store(true, Ordering::Relaxed);
+        let until = Instant::now() + Duration::from_secs(15);
+        while state.lock().unwrap().running && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!state.lock().unwrap().running);
+        assert_eq!(state.lock().unwrap().results[0].status, Status::Stopped);
+        start(
+            config,
+            state.clone(),
+            stop.clone(),
+            None,
+            ReportContext::default(),
+        )
+        .unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while state.lock().unwrap().running && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let state = state.lock().unwrap();
+        assert!(!state.running);
+        assert_eq!(state.results.len(), 2);
+        assert_eq!(state.results[1].status, Status::Completed);
+        assert!(state.results[1].verified_units.unwrap_or(0) > 0);
+    }
+    #[test]
+    fn disk_invalid_directory_is_an_error() {
+        let mut c = test_config(Kind::Disk);
+        c.directory = std::env::temp_dir().join(format!(
+            "hardware-hub-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(matches!(
+            disk(
+                &c,
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(TestError::Failed(_))
+        ));
     }
     #[test]
     fn deterministic_cpu() {
-        assert_eq!(calculation(42), calculation(42));
-        assert_ne!(calculation(42), calculation(43));
+        // Independent geometric-series exponentiation: sum a^i in Z/(2^64).
+        let (mut base_pow, mut base_sum) = (6364136223846793005u64, 1u64);
+        let (mut accum_pow, mut accum_sum) = (1u64, 0u64);
+        let mut count = 100_000u64;
+        while count > 0 {
+            if count & 1 != 0 {
+                accum_sum = accum_sum.wrapping_add(accum_pow.wrapping_mul(base_sum));
+                accum_pow = accum_pow.wrapping_mul(base_pow);
+            }
+            base_sum = base_sum.wrapping_mul(1u64.wrapping_add(base_pow));
+            base_pow = base_pow.wrapping_mul(base_pow);
+            count >>= 1;
+        }
+        let independent = 1442695040888963407u64.wrapping_mul(accum_sum);
+        assert_eq!(independent, CPU_EXPECTED);
+        assert!(cpu_result_is_correct(calculation(0)));
+        assert!(!cpu_result_is_correct(calculation(0) ^ 1));
     }
     #[test]
     fn disk_owns_and_removes_file() {
@@ -354,28 +596,39 @@ mod tests {
             workers: 1,
             mib: 257,
             directory: std::env::temp_dir(),
+            gpu_adapter: None,
+            disk_write_limit_mib: 1,
         };
-        assert!(start(c, s.clone(), Arc::new(AtomicBool::new(false))).is_err());
+        assert!(start(
+            c,
+            s.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            ReportContext::default()
+        )
+        .is_err());
         assert!(!s.lock().unwrap().running);
     }
 }
 
-fn gpu(cancel: &AtomicBool, deadline: Instant) -> Result<String, String> {
+fn gpu(
+    adapter: Option<&wgpu::Adapter>,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<Outcome, TestError> {
     use wgpu::util::DeviceExt;
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }))
-    .ok_or("No compatible GPU compute adapter found")?;
+    let adapter = adapter.ok_or_else(|| {
+        TestError::Unavailable("No GPU adapter was selected or discovered".into())
+    })?;
     let info = adapter.get_info();
     if info.device_type == wgpu::DeviceType::Cpu {
-        return Err("Only a software adapter was found; GPU test unavailable".into());
+        return Err(TestError::Unavailable(
+            "Only a software adapter was selected; GPU test unavailable".into(),
+        ));
     }
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-            .map_err(|e| format!("GPU device request failed: {e}"))?;
+            .map_err(|e| TestError::Unavailable(format!("GPU device request failed: {e}")))?;
     let errors = Arc::new(Mutex::new(None::<String>));
     let error_out = errors.clone();
     device.on_uncaptured_error(Box::new(move |e| {
@@ -427,7 +680,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }],
     });
     if let Some(e) = pollster::block_on(device.pop_error_scope()) {
-        return Err(format!("GPU setup failed: {e}"));
+        return Err(format!("GPU setup failed: {e}").into());
     }
     let mut expected = Vec::with_capacity(WORDS);
     for i in 0..WORDS {
@@ -471,18 +724,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 .map_err(|_| "GPU error state unavailable")?
                 .take()
             {
-                return Err(format!("GPU error: {e}"));
+                return Err(format!("GPU error: {e}").into());
             }
             if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                return Ok(format!(
+                return Ok(Outcome::new(
+                    rounds,
+                    format!(
                     "{rounds} verified compute dispatches on {}; pending dispatch was not verified",
                     info.name
+                ),
                 ));
             }
             if dispatch_started.elapsed() >= Duration::from_secs(15) {
-                return Err(format!(
-                    "GPU readback timed out after {rounds} verified dispatches"
-                ));
+                return Err(
+                    format!("GPU readback timed out after {rounds} verified dispatches").into(),
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -493,7 +749,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 if value != expected[index] {
                     return Err(format!(
                         "GPU result mismatch at word {index} after {rounds} verified dispatches"
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -503,17 +760,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             .map_err(|_| "GPU error state unavailable")?
             .take()
         {
-            return Err(format!("GPU error: {e}"));
+            return Err(format!("GPU error: {e}").into());
         }
         rounds += 1;
     }
-    if rounds == 0 && !cancel.load(Ordering::Relaxed) {
-        return Err(
-            "No GPU dispatch completed before the time limit; increase the duration".into(),
-        );
-    }
-    Ok(format!(
-        "{rounds} verified compute dispatches on {} ({:?}); no mismatches detected",
-        info.name, info.backend
+    Ok(Outcome::new(
+        rounds,
+        format!(
+            "{rounds} verified compute dispatches on {} ({:?}); no mismatches detected",
+            info.name, info.backend
+        ),
     ))
 }

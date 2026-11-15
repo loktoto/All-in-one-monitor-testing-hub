@@ -13,37 +13,38 @@ Requires a working graphics driver for the window. GPU compute requires a compat
 ## Measurements and limitations
 
 - `sysinfo` supplies CPU model and aggregate/per-logical-core load, memory, and mounted volume capacity, type and I/O counters. Volume identity is not necessarily a physical drive; a physical disk may have multiple volumes. The OS can report unknown disk type, unavailable counters or omit devices; zero counters are not proof of zero activity. Values reflect the operating system, not a hardware diagnosis.
-- `wgpu` enumerates graphics adapters. NVIDIA's optional NVML driver library supplies GPU load, temperature and VRAM when available. Other GPUs have adapter inventory only; AMD/Intel load, temperature and VRAM are not available. More than one graphics backend can expose the same adapter.
-- CPU, memory and storage temperature, fan speeds, power, SMART data and health are **not available**. There is **no thermal automatic stop**. Use a compatible external monitoring tool and stop if temperatures or system behavior are unsafe. Readings can be unavailable due to drivers, OS, device, permissions or virtualization.
+- `wgpu` enumerates graphics adapters. NVIDIA's optional NVML driver library supplies GPU load, temperature and VRAM when available. Other GPUs have adapter inventory only; AMD/Intel load, temperature and VRAM are not available. The app enumerates one preferred backend and reuses its adapter handles for GPU selection. A unique NVML name match is only a heuristic, not a verified physical identity; ambiguous identical devices are kept separate and labelled.
+- `sysinfo` may expose system temperature sensors; their names and device association can be ambiguous, and they may be absent. The displayed collection age is when the batch was collected, not an individual sensor timestamp. Fan speeds, power, SMART data and health are **not available**. There is **no thermal automatic stop**. Use a compatible external monitoring tool and stop if temperatures or system behavior are unsafe. Readings can be unavailable due to drivers, OS, device, permissions or virtualization.
 - Disk throughput counters are bytes since the last refresh (approximately one second), not a guaranteed precise per-second rate. They are OS-provided and can be unavailable or zero even when activity occurs.
 
 ## Manual tests
 
-Only one test runs at a time; choose **Stop test** to request cancellation. Closing the window while a test runs requests a stop and keeps the window open until it finishes. CPU uses at most eight workers and may not load all cores; memory covers only the allocated region. CPU checks repeated integer results against a run-time reference; memory writes and verifies alternating byte patterns; file I/O writes, flushes and reads back a newly created unique scratch file in the chosen directory; GPU runs a small integer shader and verifies every result on the CPU; this is a light compute check and not a full GPU stress test. These checks can find some errors, but do not prove hardware is healthy or replace comprehensive diagnostics. The GPU test selects the default high-performance hardware adapter, not a user-selected GPU.
+Only one test runs at a time; choose **Stop test** to request cancellation. Closing the window while a test runs requests a stop and keeps the window open until it finishes. CPU uses at most eight workers and may not load all cores; memory covers only the allocated region. CPU checks repeated integer results against a fixed known answer; memory writes and verifies alternating byte patterns; file I/O writes, flushes and reads back a newly created unique scratch file in the chosen directory; GPU runs a small integer shader and verifies every result on the CPU; this is a light compute check and not a full GPU stress test. These checks can find some errors, but do not prove hardware is healthy or replace comprehensive diagnostics. The GPU test uses the adapter selected in the UI; software adapters are reported unavailable.
 
-Duration is 1–600 seconds; CPU is limited to 1–8 threads; memory is at most 256 MiB and at most one quarter of currently available memory; the file size is 1–256 MiB and total writes are capped at 1 GiB per run. Tests may finish before the duration limit. File writes consume free space and cause SSD wear; use a suitable directory. No raw disk or existing user file is opened for writing. The owned scratch file is removed on normal completion, failure or cancellation; a power loss, crash or forced termination can leave it behind. Stop is checked between disk chunks and while polling GPU completion; a blocked disk operation or GPU driver can still delay stopping. Unfinished GPU work is not counted as verified. GPU initialization also counts toward the time limit. A run with zero full verification passes is reported as inconclusive.
+Duration is 1–600 seconds; CPU is limited to 1–8 threads; memory is at most 256 MiB and at most one quarter of currently available memory; the file size is 1–256 MiB and total writes have a user-set cap (64 MiB by default, at most 1 GiB per run). Tests may finish before the duration limit. File writes consume free space and cause SSD wear; use a suitable directory. No raw disk or existing user file is opened for writing. The owned scratch file is removed on normal completion, failure or cancellation; a power loss, crash or forced termination can leave it behind. Stop is checked between disk chunks and while polling GPU completion; a blocked disk operation or GPU driver can still delay stopping. Unfinished GPU work is not counted as verified. GPU initialization also counts toward the time limit. A run with zero full verification passes is reported as inconclusive.
 
-Reports contain test type, status, details, elapsed time and Unix timestamp. They are local plain text and are retained in memory only until exported.
+Reports contain test type, status, verified work when known, settings, system context, elapsed time and Unix timestamp. They stay in memory until exported as text or JSON; a new path is required and existing files are never overwritten. Reports include the selected directory and hardware/OS details, so review before sharing.
 
 ## Development
 
 ```sh
 cargo fmt --check
 cargo test
+cargo run --example smoke  # bounded local CPU / 1 MiB RAM / 1 MiB file checks
 cargo run
 ```
 
-Windows CI builds the MSVC release executable and publishes it as a workflow artifact. It also runs the tests on Windows. See [architecture and roadmap](docs/architecture.md) and the [public reference study](docs/reference-study.md) for evidence, feature gaps and boundaries. Test on actual Windows hardware with representative NVIDIA/AMD/Intel adapters and storage devices before relying on it. No real Windows hardware validation is implied by a CI build.
+Windows CI builds the MSVC release executable and publishes it as a workflow artifact. It also runs the tests on Windows. See the [current capability inventory](docs/capabilities.md), [architecture and roadmap](docs/architecture.md) and the [public reference study](docs/reference-study.md) for evidence, feature gaps and boundaries. Test on actual Windows hardware with representative NVIDIA/AMD/Intel adapters and storage devices before relying on it. No real Windows hardware validation is implied by a CI build.
 
 ## 繁體中文
 
-這是以 Windows 為優先的本機監控與手動測試工具。開啟後不會自動執行壓力測試。可查看 CPU、記憶體、磁碟區與 GPU 清單；只有可用的 NVIDIA NVML 驅動能提供 GPU 負載、溫度與顯示記憶體資訊。CPU、記憶體及磁碟溫度、SMART 與風扇轉速尚未支援，也沒有過熱自動停止功能。請使用相容的外部工具監看溫度。
+這是以 Windows 為優先的本機監控與手動測試工具。開啟後不會自動執行壓力測試。可查看 CPU、記憶體、磁碟區與 GPU 清單；只有可用的 NVIDIA NVML 驅動能提供 GPU 負載、溫度與顯示記憶體資訊。系統可能提供部分溫度感測器，但標籤與設備對應未必明確；SMART 與風扇轉速尚未支援，也沒有過熱自動停止功能。請使用相容的外部工具監看溫度。
 
-測試有時間與資源上限。磁碟測試只建立獨立暫存檔並驗證讀回資料，最多寫入 1 GiB，但仍會造成 SSD 耗損；異常斷電可能留下暫存檔。停止可能需等待目前的磁碟或 GPU 操作完成。結果可從 Reports 匯出，未匯出的結果會在程式結束時消失。
+測試有時間與資源上限。磁碟測試只建立獨立暫存檔並驗證讀回資料，可設定總寫入上限（預設 64 MiB，最多 1 GiB），但仍會造成 SSD 耗損；異常斷電可能留下暫存檔。停止可能需等待目前的磁碟或 GPU 操作完成。結果可從 Reports 匯出，未匯出的結果會在程式結束時消失。
 
 ## 參考產品優點研究（繁體中文）
 
-以公開官方資料整理的廣泛代表性研究，並非聲稱已涵蓋所有產品或功能。內容包括證據與待核實項目、44 項去重能力的 MVP 對照，以及按安全前提排序的路線圖／介面規格。這些是研究與建議，並不代表功能已實作。
+以公開官方資料整理的廣泛代表性研究，並非聲稱已涵蓋所有產品或功能。內容包括證據與待核實項目、44 項去重能力的研究時 MVP 對照（後續更新請看 current capability inventory），以及按安全前提排序的路線圖／介面規格。這些是研究與建議，並不代表功能已實作。
 
 - [產品與來源：監控、測試、基準、儲存及診斷](docs/research/01-product-evidence.zh-Hant.md)
 - [去重能力目錄與現有版本落差](docs/research/02-capability-catalog.zh-Hant.md)
