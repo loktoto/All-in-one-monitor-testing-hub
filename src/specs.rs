@@ -8,6 +8,7 @@
 //! Each field is optional on purpose: a missing value is reported as unavailable
 //! instead of being guessed, because the sources differ per platform.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 #[derive(Clone, Default)]
@@ -317,7 +318,7 @@ mod portable {
             specs.cpu.base_mhz = Some(cpu.frequency()).filter(|v| *v > 0);
         }
         specs.cpu.architecture = std::env::consts::ARCH.into();
-        specs.cpu.physical_cores = sysinfo::System::physical_core_count().map(|n| n as u32);
+        specs.cpu.physical_cores = system.physical_core_count().map(|n| n as u32);
         specs.cpu.logical_cores = Some(system.cpus().len() as u32);
         specs.memory.total_bytes = Some(system.total_memory());
         specs.unavailable.push(
