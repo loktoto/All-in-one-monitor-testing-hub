@@ -22,21 +22,22 @@ use std::{
 };
 
 // ---------------------------------------------------------------- design tokens
-const BG: Color32 = Color32::from_rgb(11, 15, 22);
-const PANEL: Color32 = Color32::from_rgb(16, 21, 30);
-const CARD: Color32 = Color32::from_rgb(21, 27, 38);
-const CARD_HI: Color32 = Color32::from_rgb(27, 35, 48);
-const BORDER: Color32 = Color32::from_rgb(33, 43, 58);
-const TRACK: Color32 = Color32::from_rgb(35, 45, 60);
-const TEXT: Color32 = Color32::from_rgb(231, 238, 247);
-const TEXT_DIM: Color32 = Color32::from_rgb(154, 168, 186);
-const MUTED: Color32 = Color32::from_rgb(116, 132, 152);
-const ACCENT: Color32 = Color32::from_rgb(84, 158, 255);
-const ACCENT_SOFT: Color32 = Color32::from_rgb(29, 52, 82);
-const GREEN: Color32 = Color32::from_rgb(61, 214, 152);
-const AMBER: Color32 = Color32::from_rgb(238, 176, 82);
-const RED: Color32 = Color32::from_rgb(238, 106, 106);
-const VIOLET: Color32 = Color32::from_rgb(166, 146, 246);
+// Apple system dark palette — neutral graphite surfaces with high-contrast labels.
+const BG: Color32 = Color32::from_rgb(28, 28, 30);
+const PANEL: Color32 = Color32::from_rgb(36, 36, 38);
+const CARD: Color32 = Color32::from_rgb(44, 44, 46);
+const CARD_HI: Color32 = Color32::from_rgb(58, 58, 60);
+const BORDER: Color32 = Color32::from_rgb(52, 52, 54);
+const TRACK: Color32 = Color32::from_rgb(64, 64, 66);
+const TEXT: Color32 = Color32::from_rgb(245, 245, 247);
+const TEXT_DIM: Color32 = Color32::from_rgb(174, 174, 178);
+const MUTED: Color32 = Color32::from_rgb(134, 134, 139);
+const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(36, 62, 96);
+const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
+const AMBER: Color32 = Color32::from_rgb(255, 159, 10);
+const RED: Color32 = Color32::from_rgb(255, 69, 58);
+const VIOLET: Color32 = Color32::from_rgb(191, 90, 242);
 
 const KINDS: [(Kind, &str, &str); 4] = [
     (
@@ -115,6 +116,14 @@ impl Page {
     }
     fn title(self) -> &'static str {
         self.label()
+    }
+    fn group(self) -> &'static str {
+        match self {
+            Page::Details | Page::Processes | Page::Frames | Page::Tests | Page::Reports => {
+                "WORKSPACE"
+            }
+            _ => "HARDWARE",
+        }
     }
     fn subtitle(self) -> &'static str {
         match self {
@@ -253,36 +262,46 @@ impl App {
         let frame = egui::Frame {
             fill: PANEL,
             stroke: Stroke::new(1.0_f32, BORDER),
-            inner_margin: egui::Margin::symmetric(14, 16),
+            inner_margin: egui::Margin {
+                left: 14,
+                right: 14,
+                top: 18,
+                bottom: 14,
+            },
             ..Default::default()
         };
         egui::SidePanel::left("nav")
             .resizable(false)
-            .exact_width(224.0)
+            .exact_width(236.0)
             .frame(frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, CornerRadius::same(8), ACCENT_SOFT);
-                    ui.painter()
-                        .circle_stroke(rect.center(), 5.0, Stroke::new(1.6_f32, ACCENT));
+                        ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, CornerRadius::same(9), ACCENT);
+                    painter.circle_stroke(
+                        rect.center(),
+                        6.5,
+                        Stroke::new(1.5_f32, Color32::from_white_alpha(210)),
+                    );
+                    painter.circle_filled(rect.center(), 2.0, Color32::from_white_alpha(230));
+                    ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.label(
-                            RichText::new("HARDWARE HUB")
-                                .size(13.5)
+                            RichText::new("Hardware Hub")
+                                .size(14.0)
                                 .strong()
                                 .color(TEXT),
                         );
                         ui.label(
-                            RichText::new(format!("local · v{}", env!("CARGO_PKG_VERSION")))
+                            RichText::new(format!("Local · v{}", env!("CARGO_PKG_VERSION")))
                                 .size(10.5)
                                 .color(MUTED),
                         );
                     });
                 });
-                ui.add_space(22.0);
+                ui.add_space(20.0);
                 let check_active = self.state.lock().map(|s| s.running).unwrap_or(false);
                 let log_visible = self.recorder.as_ref().is_some_and(|r| {
                     r.active() || !r.status().closed || r.status().error.is_some()
@@ -296,9 +315,9 @@ impl App {
                     .max_height(max_nav_height)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new("HARDWARE").size(10.0).strong().color(MUTED));
-                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.label(RichText::new("HARDWARE").size(10.5).strong().color(MUTED));
+                        ui.add_space(6.0);
                         for page in [
                             Page::Overview,
                             Page::Cpu,
@@ -310,13 +329,13 @@ impl App {
                             Page::Network,
                             Page::Bluetooth,
                         ] {
-                            if nav_item(ui, self.page == page, "", page.label()).clicked() {
+                            if nav_item(ui, self.page == page, page, page.label()).clicked() {
                                 self.page = page;
                             }
                         }
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("WORKSPACE").size(10.0).strong().color(MUTED));
-                        ui.add_space(4.0);
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("WORKSPACE").size(10.5).strong().color(MUTED));
+                        ui.add_space(6.0);
                         for page in [
                             Page::Details,
                             Page::Processes,
@@ -324,7 +343,7 @@ impl App {
                             Page::Tests,
                             Page::Reports,
                         ] {
-                            if nav_item(ui, self.page == page, "", page.label()).clicked() {
+                            if nav_item(ui, self.page == page, page, page.label()).clicked() {
                                 self.page = page;
                             }
                         }
@@ -1972,7 +1991,7 @@ impl App {
         let frame = egui::Frame {
             fill: PANEL,
             stroke: Stroke::new(1.0_f32, BORDER),
-            inner_margin: egui::Margin::symmetric(16, 8),
+            inner_margin: egui::Margin::symmetric(20, 10),
             ..Default::default()
         };
         egui::TopBottomPanel::bottom("status")
@@ -2090,19 +2109,32 @@ impl eframe::App for App {
 
         let frame = egui::Frame {
             fill: BG,
-            inner_margin: egui::Margin::symmetric(20, 16),
+            inner_margin: egui::Margin {
+                left: 28,
+                right: 28,
+                top: 24,
+                bottom: 20,
+            },
             ..Default::default()
         };
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
+                        RichText::new(self.page.group())
+                            .size(10.5)
+                            .strong()
+                            .color(ACCENT),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
                         RichText::new(self.page.title())
-                            .size(21.0)
+                            .size(26.0)
                             .strong()
                             .color(TEXT),
                     );
-                    ui.label(RichText::new(self.page.subtitle()).size(11.5).color(MUTED));
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(self.page.subtitle()).size(12.0).color(MUTED));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if matches!(
@@ -2129,9 +2161,9 @@ impl eframe::App for App {
                     }
                 });
             });
-            ui.add_space(14.0);
+            ui.add_space(18.0);
             page_rule(ui);
-            ui.add_space(14.0);
+            ui.add_space(18.0);
             egui::ScrollArea::vertical()
                 .id_salt(self.page.label())
                 .auto_shrink([false, false])
@@ -2224,11 +2256,12 @@ fn install_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     let visuals = &mut style.visuals;
     *visuals = egui::Visuals::dark();
-    visuals.panel_fill = BG;
+    visuals.panel_fill = PANEL;
     visuals.window_fill = CARD;
-    visuals.extreme_bg_color = Color32::from_rgb(9, 12, 18);
-    visuals.faint_bg_color = Color32::from_rgb(24, 31, 43);
+    visuals.extreme_bg_color = Color32::from_rgb(20, 20, 22);
+    visuals.faint_bg_color = CARD_HI;
     visuals.override_text_color = Some(TEXT);
+    visuals.hyperlink_color = ACCENT;
     visuals.selection.bg_fill = ACCENT_SOFT;
     visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
@@ -2237,15 +2270,18 @@ fn install_theme(ctx: &egui::Context) {
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
     visuals.widgets.hovered.weak_bg_fill = CARD_HI;
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(42, 54, 72);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(72, 72, 74);
+    visuals.widgets.hovered.bg_stroke =
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 42));
     visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
     visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
+    visuals.widgets.active.bg_fill = ACCENT;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.active.corner_radius = CornerRadius::same(8);
-    style.spacing.item_spacing = egui::vec2(9.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.slider_width = 168.0;
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.slider_width = 180.0;
+    style.animation_time = 0.12;
     ctx.set_style(style);
 }
 
@@ -2253,8 +2289,19 @@ fn card_frame() -> egui::Frame {
     egui::Frame {
         fill: CARD,
         stroke: Stroke::new(1.0_f32, BORDER),
-        corner_radius: CornerRadius::same(12),
-        inner_margin: egui::Margin::symmetric(16, 14),
+        corner_radius: CornerRadius::same(14),
+        inner_margin: egui::Margin {
+            left: 18,
+            right: 18,
+            top: 16,
+            bottom: 16,
+        },
+        shadow: egui::epaint::Shadow {
+            offset: [0, 4],
+            blur: 14,
+            spread: 0,
+            color: Color32::from_black_alpha(28),
+        },
         ..Default::default()
     }
 }
@@ -2385,11 +2432,12 @@ fn decimal_bytes(v: u64) -> String {
 
 fn section_title(ui: &mut egui::Ui, title: &str, hint: Option<&str>) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(12.5).strong().color(TEXT));
+        ui.label(RichText::new(title).size(13.0).strong().color(TEXT));
         if let Some(hint) = hint {
             ui.label(RichText::new(hint).size(10.5).color(MUTED));
         }
     });
+    ui.add_space(2.0);
 }
 
 fn empty_note(ui: &mut egui::Ui, text: &str) {
@@ -2402,45 +2450,260 @@ fn page_rule(ui: &mut egui::Ui) {
     ui.painter().rect_filled(rect, CornerRadius::ZERO, BORDER);
 }
 
-fn nav_item(ui: &mut egui::Ui, active: bool, index: &str, label: &str) -> egui::Response {
+/// Small line-art icons keep the sidebar scannable without external assets.
+fn draw_nav_icon(painter: &egui::Painter, center: egui::Pos2, page: Page, color: Color32) {
+    let stroke = Stroke::new(1.35_f32, color);
+    let faint = Stroke::new(
+        1.0_f32,
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 130),
+    );
+    let line = |a: egui::Pos2, b: egui::Pos2, stroke: Stroke| {
+        painter.line_segment([a, b], stroke);
+    };
+    let box_rect = egui::Rect::from_center_size(center, egui::vec2(13.0, 13.0));
+    match page {
+        Page::Overview => {
+            for (dx, dy) in [(-3.2, -3.2), (3.2, -3.2), (-3.2, 3.2), (3.2, 3.2)] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center + egui::vec2(dx, dy), egui::vec2(4.6, 4.6)),
+                    CornerRadius::same(2),
+                    color,
+                );
+            }
+        }
+        Page::Cpu => {
+            painter.rect_stroke(
+                box_rect.shrink(0.5),
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(5.5, 5.5)),
+                CornerRadius::same(1),
+                faint,
+                egui::StrokeKind::Inside,
+            );
+            for offset in [-4.0, 0.0, 4.0] {
+                line(
+                    center + egui::vec2(offset, -8.0),
+                    center + egui::vec2(offset, -7.0),
+                    faint,
+                );
+                line(
+                    center + egui::vec2(offset, 7.0),
+                    center + egui::vec2(offset, 8.0),
+                    faint,
+                );
+            }
+        }
+        Page::Gpu => {
+            painter.rect_stroke(
+                box_rect,
+                CornerRadius::same(3),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.circle_stroke(center, 3.4, faint);
+            for end in [
+                egui::vec2(2.8, -1.4),
+                egui::vec2(-1.4, 2.8),
+                egui::vec2(-2.4, -2.4),
+            ] {
+                line(center, center + end, faint);
+            }
+        }
+        Page::Memory => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(15.0, 9.0)),
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for dx in [-4.0, 0.0, 4.0] {
+                line(
+                    center + egui::vec2(dx, 4.5),
+                    center + egui::vec2(dx, 7.0),
+                    faint,
+                );
+            }
+        }
+        Page::Storage => {
+            for dy in [-4.0, 0.0, 4.0] {
+                painter.rect_stroke(
+                    egui::Rect::from_center_size(
+                        center + egui::vec2(0.0, dy),
+                        egui::vec2(14.0, 3.0),
+                    ),
+                    CornerRadius::same(2),
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+        Page::Thermal => {
+            line(
+                center + egui::vec2(-2.0, -7.0),
+                center + egui::vec2(-2.0, 1.5),
+                stroke,
+            );
+            painter.circle_filled(center + egui::vec2(-2.0, 4.0), 3.3, color);
+            for dy in [-4.0, 0.0] {
+                line(
+                    center + egui::vec2(2.0, dy),
+                    center + egui::vec2(5.0, dy),
+                    faint,
+                );
+            }
+        }
+        Page::Motherboard => {
+            painter.rect_stroke(
+                box_rect,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for (dx, dy) in [(-3.0, -3.0), (3.0, -3.0), (-3.0, 3.0)] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center + egui::vec2(dx, dy), egui::vec2(3.0, 3.0)),
+                    CornerRadius::same(1),
+                    color,
+                );
+            }
+            line(
+                center + egui::vec2(1.0, 3.0),
+                center + egui::vec2(4.0, 3.0),
+                faint,
+            );
+        }
+        Page::Network => {
+            painter.circle_filled(center, 1.8, color);
+            for radius in [4.5, 7.5] {
+                painter.circle_stroke(center, radius, faint);
+            }
+        }
+        Page::Bluetooth => {
+            for (a, b) in [
+                (egui::vec2(-2.0, -6.0), egui::vec2(-2.0, 6.0)),
+                (egui::vec2(-2.0, -6.0), egui::vec2(3.0, -1.0)),
+                (egui::vec2(-2.0, 0.0), egui::vec2(3.0, -5.0)),
+                (egui::vec2(-2.0, 0.0), egui::vec2(3.0, 5.0)),
+                (egui::vec2(-2.0, 6.0), egui::vec2(3.0, 1.0)),
+            ] {
+                line(center + a, center + b, stroke);
+            }
+        }
+        Page::Details => {
+            painter.circle_stroke(center, 6.5, stroke);
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "i",
+                egui::FontId::proportional(10.0),
+                color,
+            );
+        }
+        Page::Processes => {
+            for dy in [-4.0, 0.0, 4.0] {
+                painter.circle_filled(center + egui::vec2(-4.0, dy), 1.4, color);
+                line(
+                    center + egui::vec2(-1.0, dy),
+                    center + egui::vec2(6.0, dy),
+                    faint,
+                );
+            }
+        }
+        Page::Frames => {
+            for (dx, height) in [(-4.0, 5.0), (0.0, 8.0), (4.0, 11.0)] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(
+                        center + egui::vec2(dx, 5.5 - height / 2.0),
+                        egui::vec2(3.0, height),
+                    ),
+                    CornerRadius::same(1),
+                    color,
+                );
+            }
+        }
+        Page::Tests => {
+            line(
+                center + egui::vec2(-3.0, -7.0),
+                center + egui::vec2(-3.0, -2.0),
+                stroke,
+            );
+            line(
+                center + egui::vec2(3.0, -7.0),
+                center + egui::vec2(3.0, -2.0),
+                stroke,
+            );
+            line(
+                center + egui::vec2(-4.0, -7.0),
+                center + egui::vec2(4.0, -7.0),
+                stroke,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center + egui::vec2(0.0, 3.0), egui::vec2(12.0, 9.0)),
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for (dx, dy) in [(-2.0, 2.0), (2.0, 4.0), (0.0, 6.0)] {
+                painter.circle_filled(center + egui::vec2(dx, dy), 1.1, color);
+            }
+        }
+        Page::Reports => {
+            painter.rect_stroke(
+                box_rect,
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for dy in [-3.0, 0.0, 3.0] {
+                line(
+                    center + egui::vec2(-3.0, dy),
+                    center + egui::vec2(4.0, dy),
+                    faint,
+                );
+            }
+        }
+    }
+}
+
+fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 36.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if active {
-            painter.rect_filled(rect, CornerRadius::same(9), ACCENT_SOFT);
+            painter.rect_filled(rect, CornerRadius::same(10), ACCENT_SOFT);
             let accent = egui::Rect::from_min_size(
                 rect.left_center() + egui::vec2(0.0, -9.0),
                 egui::vec2(3.0, 18.0),
             );
             painter.rect_filled(accent, CornerRadius::same(2), ACCENT);
         } else if response.hovered() {
-            painter.rect_filled(rect, CornerRadius::same(9), CARD_HI);
+            painter.rect_filled(rect, CornerRadius::same(10), CARD_HI);
         }
-        painter.text(
-            rect.left_center() + egui::vec2(20.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            index,
-            egui::FontId::proportional(10.5),
+        draw_nav_icon(
+            painter,
+            rect.left_center() + egui::vec2(19.0, 0.0),
+            page,
             if active { ACCENT } else { MUTED },
         );
         painter.text(
-            rect.left_center() + egui::vec2(if index.is_empty() { 16.0 } else { 46.0 }, 0.0),
+            rect.left_center() + egui::vec2(39.0, 0.0),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(13.5),
             if active { TEXT } else { TEXT_DIM },
         );
     }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 52.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let fill = if selected {
@@ -2448,12 +2711,12 @@ fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui
         } else if response.hovered() {
             CARD_HI
         } else {
-            Color32::from_rgb(18, 24, 34)
+            CARD
         };
-        painter.rect_filled(rect, CornerRadius::same(9), fill);
+        painter.rect_filled(rect, CornerRadius::same(12), fill);
         painter.rect_stroke(
             rect,
-            CornerRadius::same(9),
+            CornerRadius::same(12),
             Stroke::new(
                 if selected { 1.4 } else { 1.0_f32 },
                 if selected { ACCENT } else { BORDER },
@@ -2461,24 +2724,21 @@ fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui
             egui::StrokeKind::Inside,
         );
         painter.text(
-            rect.left_top() + egui::vec2(11.0, 10.0),
+            rect.left_top() + egui::vec2(13.0, 11.0),
             egui::Align2::LEFT_TOP,
             title,
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(12.5),
             if selected { TEXT } else { TEXT_DIM },
         );
         painter.text(
-            rect.left_top() + egui::vec2(11.0, 28.0),
+            rect.left_top() + egui::vec2(13.0, 30.0),
             egui::Align2::LEFT_TOP,
             hint,
-            egui::FontId::proportional(9.5),
+            egui::FontId::proportional(10.0),
             MUTED,
         );
     }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn metric(
@@ -2491,16 +2751,16 @@ fn metric(
 ) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.set_min_height(92.0);
-        ui.label(RichText::new(label).size(9.5).strong().color(MUTED));
-        ui.add_space(2.0);
-        ui.label(RichText::new(value).size(24.0).strong().color(TEXT));
+        ui.set_min_height(104.0);
+        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
+        ui.add_space(6.0);
+        ui.label(RichText::new(value).size(26.0).strong().color(TEXT));
         if let Some(f) = fraction {
-            ui.add_space(4.0);
-            bar(ui, f, accent, 5.0);
+            ui.add_space(10.0);
+            bar(ui, f, accent, 6.0);
         } else if !empty_hint.is_empty() {
-            ui.add_space(4.0);
-            ui.label(RichText::new(empty_hint).size(10.0).color(MUTED));
+            ui.add_space(6.0);
+            ui.label(RichText::new(empty_hint).size(10.5).color(MUTED));
         }
     });
 }
@@ -2565,17 +2825,21 @@ fn core_meter(ui: &mut egui::Ui, index: usize, usage: f32) {
 fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     let galley =
         ui.painter()
-            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(10.0), color);
-    let size = galley.size() + egui::vec2(26.0, 8.0);
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(10.5), color);
+    let size = galley.size() + egui::vec2(28.0, 10.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(10), tint(color));
-    painter.circle_filled(rect.left_center() + egui::vec2(10.0, 0.0), 3.2, color);
+    painter.rect_filled(
+        rect,
+        CornerRadius::same((rect.height() / 2.0) as u8),
+        tint(color),
+    );
+    painter.circle_filled(rect.left_center() + egui::vec2(11.0, 0.0), 3.0, color);
     painter.galley(
-        rect.left_center() + egui::vec2(18.0, -galley.size().y / 2.0),
+        rect.left_center() + egui::vec2(19.0, -galley.size().y / 2.0),
         galley,
         color,
     );
@@ -2584,19 +2848,19 @@ fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
 fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
     let galley =
         ui.painter()
-            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(9.5), color);
-    let size = galley.size() + egui::vec2(13.0, 5.0);
+            .layout_no_wrap(text.to_owned(), egui::FontId::proportional(10.0), color);
+    let size = galley.size() + egui::vec2(14.0, 7.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(5), tint(color));
-    painter.galley(rect.left_top() + egui::vec2(6.5, 2.5), galley, color);
+    painter.rect_filled(rect, CornerRadius::same(6), tint(color));
+    painter.galley(rect.left_top() + egui::vec2(7.0, 3.5), galley, color);
 }
 
 fn tint(color: Color32) -> Color32 {
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 32)
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 44)
 }
 
 fn load_color(fraction: f32) -> Color32 {
