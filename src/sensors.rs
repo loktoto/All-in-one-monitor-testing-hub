@@ -43,6 +43,8 @@ pub struct Reader {
     inner: mac::Smc,
     #[cfg(target_os = "macos")]
     keys: Vec<KeyEntry>,
+    #[cfg(target_os = "windows")]
+    inner: win::Wmi,
 }
 
 /// Opens the platform sensor provider, if one is available to an unprivileged app.
@@ -62,7 +64,11 @@ pub fn open() -> Option<Reader> {
         }
         Some(Reader { inner: smc, keys })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        win::Wmi::open().map(|inner| Reader { inner })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }
@@ -70,35 +76,169 @@ pub fn open() -> Option<Reader> {
 
 impl Reader {
     pub fn readings(&mut self) -> Readings {
-        let mut out = Readings::default();
-        #[cfg(target_os = "macos")]
+        #[cfg(target_os = "windows")]
         {
-            for entry in &self.keys {
-                let Some(value) = self.inner.read_number(&entry.key) else {
-                    continue;
-                };
-                let plausible = match entry.unit {
-                    Unit::Celsius => (-20.0..=150.0).contains(&value),
-                    Unit::Rpm => (0.0..=20_000.0).contains(&value),
-                };
-                if !plausible {
-                    continue;
+            self.inner.readings()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut out = Readings::default();
+            #[cfg(target_os = "macos")]
+            {
+                for entry in &self.keys {
+                    let Some(value) = self.inner.read_number(&entry.key) else {
+                        continue;
+                    };
+                    let plausible = match entry.unit {
+                        Unit::Celsius => (-20.0..=150.0).contains(&value),
+                        Unit::Rpm => (0.0..=20_000.0).contains(&value),
+                    };
+                    if !plausible {
+                        continue;
+                    }
+                    let sensor = Sensor {
+                        key: entry.key.clone(),
+                        label: entry.label.clone(),
+                        value: Some(value as f32),
+                        unit: entry.unit,
+                    };
+                    match entry.unit {
+                        Unit::Celsius => out.temps.push(sensor),
+                        Unit::Rpm => out.fans.push(sensor),
+                    }
                 }
-                let sensor = Sensor {
-                    key: entry.key.clone(),
-                    label: entry.label.clone(),
-                    value: Some(value as f32),
-                    unit: entry.unit,
-                };
-                match entry.unit {
-                    Unit::Celsius => out.temps.push(sensor),
-                    Unit::Rpm => out.fans.push(sensor),
+                out.temps.sort_by(|a, b| a.key.cmp(&b.key));
+                out.fans.sort_by(|a, b| a.key.cmp(&b.key));
+            }
+            out
+        }
+    }
+}
+
+/// `MSAcpi_ThermalZoneTemperature` reports tenths of a degree Kelvin.
+#[cfg(any(target_os = "windows", test))]
+fn tenths_kelvin_to_celsius(raw: u32) -> f32 {
+    raw as f32 / 10.0 - 273.15
+}
+
+/// The `Thermal Zone Information` performance counter's plain value is kelvin.
+#[cfg(any(target_os = "windows", test))]
+fn kelvin_to_celsius(raw: u32) -> f32 {
+    raw as f32 - 273.15
+}
+
+/// `ACPI\ThermalZone\TZ01_0` is shown as `ACPI zone TZ01`; the raw instance
+/// name stays as the tooltip key. Performance-counter instances are named
+/// `\_TZ.TZ01`, so both separators are handled.
+#[cfg(any(target_os = "windows", test))]
+fn thermal_zone_label(instance_name: &str) -> String {
+    let leaf = instance_name
+        .rsplit(['\\', '.'])
+        .next()
+        .unwrap_or(instance_name);
+    let zone = leaf.split('_').next().unwrap_or(leaf);
+    if zone.is_empty() {
+        instance_name.to_owned()
+    } else {
+        format!("ACPI zone {zone}")
+    }
+}
+
+/// Windows exposes no per-core CPU temperature to an unprivileged process, but
+/// the ACPI thermal zones are readable two ways: the `MSAcpi_ThermalZoneTemperature`
+/// WMI class (elevated only) and the `Thermal Zone Information` performance
+/// counters, which the OS publishes to standard users. The performance counter
+/// is what makes the sensor table useful without administrator rights.
+#[cfg(target_os = "windows")]
+mod win {
+    use super::{
+        kelvin_to_celsius, tenths_kelvin_to_celsius, thermal_zone_label, Readings, Sensor, Unit,
+    };
+    use serde::Deserialize;
+    use wmi::WMIConnection;
+
+    #[derive(Deserialize)]
+    #[serde(rename = "MSAcpi_ThermalZoneTemperature")]
+    #[serde(rename_all = "PascalCase")]
+    struct ThermalZone {
+        instance_name: String,
+        current_temperature: Option<u32>,
+    }
+
+    /// `Win32_PerfRawData_Counters_ThermalZoneInformation` in `ROOT\CIMV2`.
+    /// `HighPrecisionTemperature` is tenths of a kelvin; `Temperature` is whole
+    /// kelvin. Both are firmware thermal-zone readings, not per-core die values.
+    #[derive(Deserialize)]
+    #[serde(rename = "Win32_PerfRawData_Counters_ThermalZoneInformation")]
+    #[serde(rename_all = "PascalCase")]
+    struct PerfZone {
+        name: String,
+        temperature: Option<u32>,
+        high_precision_temperature: Option<u32>,
+    }
+
+    pub struct Wmi {
+        /// `ROOT\WMI`, present only when the ACPI class can actually be read.
+        acpi: Option<WMIConnection>,
+        /// `ROOT\CIMV2` performance class, readable without elevation.
+        perf: Option<WMIConnection>,
+    }
+
+    impl Wmi {
+        pub fn open() -> Option<Wmi> {
+            // Probe once: a denied class fails the query (access denied), so it
+            // is dropped here instead of retried on every refresh.
+            let acpi = WMIConnection::with_namespace_path("ROOT\\WMI")
+                .ok()
+                .filter(|c| matches!(c.query::<ThermalZone>(), Ok(z) if !z.is_empty()));
+            let perf = WMIConnection::new()
+                .ok()
+                .filter(|c| matches!(c.query::<PerfZone>(), Ok(z) if !z.is_empty()));
+            (acpi.is_some() || perf.is_some()).then_some(Wmi { acpi, perf })
+        }
+
+        pub fn readings(&mut self) -> Readings {
+            let mut out = Readings::default();
+            if let Some(connection) = &self.acpi {
+                if let Ok(zones) = connection.query::<ThermalZone>() {
+                    for zone in zones {
+                        let Some(raw) = zone.current_temperature else {
+                            continue;
+                        };
+                        push_temp(&mut out, zone.instance_name, tenths_kelvin_to_celsius(raw));
+                    }
+                }
+            }
+            if out.temps.is_empty() {
+                if let Some(connection) = &self.perf {
+                    if let Ok(zones) = connection.query::<PerfZone>() {
+                        for zone in zones {
+                            let celsius = match (zone.high_precision_temperature, zone.temperature)
+                            {
+                                (Some(tenths), _) if tenths > 0 => tenths_kelvin_to_celsius(tenths),
+                                (_, Some(kelvin)) if kelvin > 0 => kelvin_to_celsius(kelvin),
+                                _ => continue,
+                            };
+                            push_temp(&mut out, zone.name, celsius);
+                        }
+                    }
                 }
             }
             out.temps.sort_by(|a, b| a.key.cmp(&b.key));
-            out.fans.sort_by(|a, b| a.key.cmp(&b.key));
+            out
         }
-        out
+    }
+
+    fn push_temp(out: &mut Readings, instance_name: String, celsius: f32) {
+        if !(-20.0..=150.0).contains(&celsius) {
+            return;
+        }
+        out.temps.push(Sensor {
+            label: thermal_zone_label(&instance_name),
+            key: instance_name,
+            value: Some(celsius),
+            unit: Unit::Celsius,
+        });
     }
 }
 
@@ -407,6 +547,23 @@ mod tests {
         assert_eq!(label_for("F0Ac", Unit::Rpm), "Fan 0");
         assert_eq!(label_for("F1Ac", Unit::Rpm), "Fan 1");
         assert_eq!(label_for("ZZ1Z", Unit::Celsius), "ZZ1Z");
+    }
+
+    #[test]
+    fn windows_thermal_zones_are_converted_and_named() {
+        // 3331 tenths of a kelvin is 59.95 °C; 3031 is 29.95 °C.
+        assert!((tenths_kelvin_to_celsius(3331) - 59.95).abs() < 0.01);
+        assert!((tenths_kelvin_to_celsius(3031) - 29.95).abs() < 0.01);
+        assert_eq!(
+            thermal_zone_label("ACPI\\ThermalZone\\TZ01_0"),
+            "ACPI zone TZ01"
+        );
+        assert_eq!(thermal_zone_label("TZ00"), "ACPI zone TZ00");
+        // Performance-counter instances use `\_TZ.TZ01`.
+        assert_eq!(thermal_zone_label("\\_TZ.TZ00"), "ACPI zone TZ00");
+        assert_eq!(thermal_zone_label("\\_TZ.TZ01"), "ACPI zone TZ01");
+        assert!((kelvin_to_celsius(330) - 56.85).abs() < 0.01);
+        assert!((tenths_kelvin_to_celsius(3392) - 66.05).abs() < 0.01);
     }
 
     #[cfg(target_os = "macos")]

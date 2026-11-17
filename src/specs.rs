@@ -120,6 +120,10 @@ impl SystemSpecs {
 
 /// Read the Bluetooth report. Device addresses are discarded; connected names stay in memory.
 pub fn bluetooth_status() -> Option<BluetoothSpec> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::bluetooth()
+    }
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("system_profiler")
@@ -131,7 +135,7 @@ pub fn bluetooth_status() -> Option<BluetoothSpec> {
         }
         parse_bluetooth(&String::from_utf8_lossy(&output.stdout))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }
@@ -142,7 +146,11 @@ pub fn collect() -> SystemSpecs {
     {
         macos::collect()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::collect()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         portable::collect()
     }
@@ -321,11 +329,430 @@ mod portable {
         specs.cpu.physical_cores = system.physical_core_count().map(|n| n as u32);
         specs.cpu.logical_cores = Some(system.cpus().len() as u32);
         specs.memory.total_bytes = Some(system.total_memory());
+        #[cfg(not(target_os = "windows"))]
         specs.unavailable.push(
             "Cache sizes, memory module details, drive health and battery state are collected only on macOS in this build."
                 .into(),
         );
         specs
+    }
+}
+
+/// SMBIOS memory type codes, as reported by `Win32_PhysicalMemory`. Unknown
+/// codes stay numeric instead of being labelled with a guess.
+#[cfg(any(target_os = "windows", test))]
+fn smbios_memory_kind(code: u64) -> String {
+    match code {
+        20 => "DDR".into(),
+        21 => "DDR2".into(),
+        22 => "DDR2 FB-DIMM".into(),
+        24 => "DDR3".into(),
+        26 => "DDR4".into(),
+        27 => "LPDDR".into(),
+        28 => "LPDDR2".into(),
+        29 => "LPDDR3".into(),
+        30 => "LPDDR4".into(),
+        34 => "DDR5".into(),
+        35 => "LPDDR5".into(),
+        other => format!("SMBIOS type {other}"),
+    }
+}
+
+/// `Win32_Battery.BatteryStatus` codes.
+#[cfg(any(target_os = "windows", test))]
+fn battery_state(code: u64) -> &'static str {
+    match code {
+        1 => "discharging",
+        2 => "on AC",
+        3 => "fully charged",
+        4 => "low",
+        5 => "critical",
+        6 => "charging",
+        7 => "charging, high",
+        8 => "charging, low",
+        9 => "charging, critical",
+        11 => "partially charged",
+        _ => "state not reported",
+    }
+}
+
+/// CIM dates look like `20200101000000.000000+000`; the sheet shows the day.
+#[cfg(any(target_os = "windows", test))]
+fn cim_date(text: &str) -> String {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 8 {
+        return String::new();
+    }
+    format!("{}-{}-{}", &digits[0..4], &digits[4..6], &digits[6..8])
+}
+
+/// Windows exposes model, firmware, memory modules, drive health, battery,
+/// Wi-Fi and Bluetooth through CIM/WMI. `sysinfo` covers only the CPU, memory
+/// total, volumes and network counters, so one read-only PowerShell pass fills
+/// the rest of the specification sheet instead of leaving it blank.
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    use serde_json::Value;
+    use std::{os::windows::process::CommandExt, process::Command};
+
+    /// Keeps a console window from flashing up when the query runs at startup.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    const SCRIPT: &str = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'SilentlyContinue'
+$cs = Get-CimInstance Win32_ComputerSystem
+$bios = Get-CimInstance Win32_BIOS
+$board = Get-CimInstance Win32_BaseBoard
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$bat = Get-CimInstance Win32_Battery | Select-Object -First 1
+$mem = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object { [pscustomobject]@{ slot = [string]$_.DeviceLocator; size = [uint64]$_.Capacity; type = [uint64]$_.SMBIOSMemoryType; speed = [uint64]$_.Speed; manufacturer = [string]$_.Manufacturer; part = [string]$_.PartNumber } })
+$volumes = @(Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { [pscustomobject]@{ letter = [string]$_.DriveLetter; fs = [string]$_.FileSystem; health = [string]$_.HealthStatus; size = [uint64]$_.Size; free = [uint64]$_.SizeRemaining } })
+$disks = @(Get-PhysicalDisk | ForEach-Object { [pscustomobject]@{ model = [string]$_.FriendlyName; media = [string]$_.MediaType; bus = [string]$_.BusType; health = [string]$_.HealthStatus; size = [uint64]$_.Size } })
+$reliability = @(Get-PhysicalDisk | Get-StorageReliabilityCounter | ForEach-Object { [pscustomobject]@{ device = [string]$_.DeviceId; temperature = $_.Temperature; wear = $_.Wear; power_hours = $_.PowerOnHours; read_errors = $_.ReadErrorsTotal; write_errors = $_.WriteErrorsTotal } })
+$diskdrives = @(Get-CimInstance Win32_DiskDrive | ForEach-Object { [pscustomobject]@{ model = [string]$_.Model; firmware = [string]$_.FirmwareRevision; interface = [string]$_.InterfaceType; size = [uint64]$_.Size } })
+$network = @(Get-NetAdapter | ForEach-Object { [pscustomobject]@{ name = [string]$_.Name; description = [string]$_.InterfaceDescription; media = [string]$_.PhysicalMediaType; status = [string]$_.Status; speed = [string]$_.LinkSpeed } })
+$bluetooth = @(Get-PnpDevice -Class Bluetooth | ForEach-Object { [pscustomobject]@{ name = [string]$_.FriendlyName; status = [string]$_.Status } })
+$battery = if ($bat) { [pscustomobject]@{ name = [string]$bat.Name; charge = $bat.EstimatedChargeRemaining; status = $bat.BatteryStatus } } else { $null }
+[pscustomobject]@{
+  manufacturer = [string]$cs.Manufacturer
+  model = [string]$cs.Model
+  sku = [string]$cs.SystemSKUNumber
+  family = [string]$cs.SystemFamily
+  bios_vendor = [string]$bios.Manufacturer
+  bios_version = [string]$bios.SMBIOSBIOSVersion
+  bios_date = [string]$bios.ReleaseDate
+  board_manufacturer = [string]$board.Manufacturer
+  board_product = [string]$board.Product
+  cpu_max_clock = [uint64]$cpu.MaxClockSpeed
+  cpu_l2_kb = [uint64]$cpu.L2CacheSize
+  cpu_l3_kb = [uint64]$cpu.L3CacheSize
+  battery = $battery
+  memory = $mem
+  volumes = $volumes
+  disks = $disks
+  reliability = $reliability
+  diskdrives = $diskdrives
+  network = $network
+  bluetooth = $bluetooth
+} | ConvertTo-Json -Depth 6 -Compress
+"#;
+
+    const BLUETOOTH_SCRIPT: &str = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$ErrorActionPreference = 'SilentlyContinue'
+$devices = @(Get-PnpDevice -Class Bluetooth | ForEach-Object { [pscustomobject]@{ name = [string]$_.FriendlyName; status = [string]$_.Status } })
+ConvertTo-Json -InputObject $devices -Depth 3 -Compress
+"#;
+
+    pub fn collect() -> SystemSpecs {
+        let mut specs = super::portable::collect();
+        specs.sources = "sysinfo · Windows CIM/WMI (read-only)".into();
+        if !specs.kernel.is_empty() {
+            specs.kernel = format!("build {}", specs.kernel);
+        }
+        if let Some(value) = query(SCRIPT) {
+            apply(&mut specs, &value);
+        }
+        specs.unavailable.clear();
+        if specs.memory.modules.is_empty() {
+            specs
+                .unavailable
+                .push("Memory module records were not reported by the firmware.".into());
+        }
+        if specs.drives.is_empty() {
+            specs
+                .unavailable
+                .push("No physical drive was reported by the Windows storage provider.".into());
+        }
+        specs
+            .unavailable
+            .push("L1 cache and cache-line sizes are not read on Windows in this build.".into());
+        specs.unavailable.push(
+            "Temperature comes from the firmware's ACPI thermal zones (Thermal Zone Information performance counters, or the WMI class when elevated). Per-core CPU temperature needs a kernel driver and is not read."
+                .into(),
+        );
+        specs
+    }
+
+    pub fn bluetooth() -> Option<BluetoothSpec> {
+        let value = query(BLUETOOTH_SCRIPT)?;
+        bluetooth_from_value(&value)
+    }
+
+    fn query(script: &str) -> Option<Value> {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        serde_json::from_slice(&output.stdout).ok()
+    }
+
+    fn text(value: Option<&Value>) -> String {
+        value
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    }
+
+    fn joined(parts: [String; 2]) -> String {
+        parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn bluetooth_from_value(value: &Value) -> Option<BluetoothSpec> {
+        let devices = value.as_array()?;
+        let all: Vec<String> = devices
+            .iter()
+            .map(|device| text(device.get("name")))
+            .filter(|name| !name.is_empty())
+            .collect();
+        // The class also lists driver stacks (enumerators, RFCOMM/TDI services),
+        // which describe the transport rather than the controller.
+        let controllers: Vec<String> = all
+            .iter()
+            .filter(|name| {
+                let lower = name.to_lowercase();
+                !["enumer", "列舉", "rfcomm", "tdi", "protocol", "service"]
+                    .iter()
+                    .any(|noise| lower.contains(noise))
+            })
+            .cloned()
+            .collect();
+        let names = if controllers.is_empty() {
+            all
+        } else {
+            controllers
+        };
+        // Paired devices also appear in this class; only the controller names
+        // are reported, and no device is claimed to be connected.
+        let adapters: Vec<String> = names
+            .iter()
+            .filter(|name| name.to_lowercase().contains("bluetooth"))
+            .cloned()
+            .collect();
+        let names = if adapters.is_empty() { names } else { adapters };
+        if names.is_empty() {
+            return None;
+        }
+        let ready = devices
+            .iter()
+            .any(|device| text(device.get("status")).eq_ignore_ascii_case("OK"));
+        Some(BluetoothSpec {
+            state: Some(ready),
+            transport: String::new(),
+            chipset: names.join(", "),
+            connected_devices: None,
+        })
+    }
+
+    pub(super) fn apply(specs: &mut SystemSpecs, v: &Value) {
+        specs.model_name = joined([text(v.get("manufacturer")), text(v.get("model"))]);
+        // ODM firmwares commonly report an all-zero SKU, which identifies nothing.
+        specs.model_id = [text(v.get("sku")), text(v.get("family"))]
+            .into_iter()
+            .find(|part| !part.is_empty() && part.chars().any(|c| c != '0'))
+            .unwrap_or_default();
+        let firmware = joined([text(v.get("bios_vendor")), text(v.get("bios_version"))]);
+        let date = cim_date(&text(v.get("bios_date")));
+        specs.firmware = match (firmware.is_empty(), date.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => firmware,
+            (true, false) => date,
+            (false, false) => format!("{firmware} ({date})"),
+        };
+        let board = joined([
+            text(v.get("board_manufacturer")),
+            text(v.get("board_product")),
+        ]);
+        specs.board_id = (!board.is_empty()).then_some(board);
+
+        // `Win32_Processor` reports cache sizes in KiB and the rated clock.
+        let cache = |key: &str| {
+            v.get(key)
+                .and_then(Value::as_u64)
+                .filter(|kb| *kb > 0)
+                .map(|kb| kb * 1024)
+        };
+        if specs.cpu.l2_bytes.is_none() {
+            specs.cpu.l2_bytes = cache("cpu_l2_kb");
+        }
+        if specs.cpu.l3_bytes.is_none() {
+            specs.cpu.l3_bytes = cache("cpu_l3_kb");
+        }
+        // `sysinfo` reports the current clock, not the rated one, so the sheet
+        // uses the firmware's rated clock for the base row instead.
+        if let Some(mhz) = v
+            .get("cpu_max_clock")
+            .and_then(Value::as_u64)
+            .filter(|mhz| *mhz > 0)
+        {
+            specs.cpu.base_mhz = Some(mhz);
+            specs.cpu.max_mhz = None;
+        }
+
+        if let Some(modules) = v.get("memory").and_then(Value::as_array) {
+            for module in modules {
+                let Some(size) = module
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .filter(|size| *size > 0)
+                else {
+                    continue;
+                };
+                specs.memory.modules.push(MemoryModule {
+                    slot: text(module.get("slot")),
+                    size_bytes: Some(size),
+                    kind: module
+                        .get("type")
+                        .and_then(Value::as_u64)
+                        .map(smbios_memory_kind)
+                        .unwrap_or_default(),
+                    speed_mhz: module
+                        .get("speed")
+                        .and_then(Value::as_u64)
+                        .filter(|speed| *speed > 0),
+                    manufacturer: text(module.get("manufacturer")),
+                    part_number: text(module.get("part")),
+                });
+            }
+        }
+
+        if let Some(battery) = v.get("battery").filter(|battery| !battery.is_null()) {
+            let state = battery
+                .get("status")
+                .and_then(Value::as_u64)
+                .map(battery_state)
+                .unwrap_or("state not reported");
+            specs.battery = Some(match battery.get("charge").and_then(Value::as_u64) {
+                Some(charge) => format!("{charge}% · {state}"),
+                None => state.to_owned(),
+            });
+        }
+
+        let volume_rows = v.get("volumes").and_then(Value::as_array);
+        for volume in volume_rows.into_iter().flatten() {
+            let letter = text(volume.get("letter"));
+            if letter.is_empty() {
+                continue;
+            }
+            specs.volumes.push(VolumeHealth {
+                mount: format!("{letter}:\\"),
+                media: text(volume.get("fs")),
+                protocol: String::new(),
+                solid_state: None,
+                smart: text(volume.get("health")),
+            });
+        }
+
+        let reliability = v
+            .get("reliability")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let diskdrives = v
+            .get("diskdrives")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for (index, disk) in v
+            .get("disks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let model = text(disk.get("model"));
+            let mut smart = text(disk.get("health"));
+            if let Some(counter) = reliability
+                .iter()
+                .find(|counter| text(counter.get("device")) == index.to_string())
+                .or_else(|| reliability.get(index))
+            {
+                let mut extras = Vec::new();
+                if let Some(temperature) = counter.get("temperature").and_then(Value::as_u64) {
+                    if temperature > 0 {
+                        extras.push(format!("{temperature} °C"));
+                    }
+                }
+                if let Some(wear) = counter.get("wear").and_then(Value::as_u64) {
+                    if wear > 0 {
+                        extras.push(format!("wear {wear}%"));
+                    }
+                }
+                if let Some(hours) = counter.get("power_hours").and_then(Value::as_u64) {
+                    if hours > 0 {
+                        extras.push(format!("{hours} power-on hours"));
+                    }
+                }
+                for (key, label) in [
+                    ("read_errors", "read errors"),
+                    ("write_errors", "write errors"),
+                ] {
+                    if let Some(count) = counter.get(key).and_then(Value::as_u64) {
+                        if count > 0 {
+                            extras.push(format!("{count} {label}"));
+                        }
+                    }
+                }
+                if !extras.is_empty() {
+                    if !smart.is_empty() {
+                        smart.push_str(" · ");
+                    }
+                    smart.push_str(&extras.join(" · "));
+                }
+            }
+            let firmware = diskdrives
+                .iter()
+                .find(|drive| text(drive.get("model")) == model)
+                .map(|drive| text(drive.get("firmware")))
+                .unwrap_or_default();
+            specs.drives.push(DriveSpec {
+                model,
+                firmware,
+                protocol: text(disk.get("bus")),
+                link: text(disk.get("media")),
+                trim: None,
+                smart,
+                capacity_bytes: disk
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .filter(|size| *size > 0),
+            });
+        }
+
+        if let Some(adapters) = v.get("network").and_then(Value::as_array) {
+            specs.wifi_interface = adapters
+                .iter()
+                .find(|adapter| {
+                    let media = text(adapter.get("media")).to_lowercase();
+                    let description = text(adapter.get("description")).to_lowercase();
+                    media.contains("802.11")
+                        || description.contains("wi-fi")
+                        || description.contains("wireless")
+                        || description.contains("wlan")
+                })
+                .map(|adapter| text(adapter.get("name")))
+                .filter(|name| !name.is_empty());
+        }
+
+        specs.bluetooth = v.get("bluetooth").and_then(bluetooth_from_value);
     }
 }
 
@@ -852,6 +1279,68 @@ NVMExpress:
             specs.volumes.len(),
             specs.battery
         );
+    }
+
+    #[test]
+    fn smbios_and_battery_codes_are_labelled_not_invented() {
+        assert_eq!(smbios_memory_kind(26), "DDR4");
+        assert_eq!(smbios_memory_kind(34), "DDR5");
+        assert_eq!(smbios_memory_kind(99), "SMBIOS type 99");
+        assert_eq!(battery_state(1), "discharging");
+        assert_eq!(battery_state(2), "on AC");
+        assert_eq!(battery_state(0), "state not reported");
+        assert_eq!(cim_date("20190612000000.000000+000"), "2019-06-12");
+        assert_eq!(cim_date(""), "");
+    }
+
+    /// The Windows report is parsed from a captured shape, so the mapping is
+    /// tested without depending on the machine's own hardware.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cim_report_fills_the_specification_sheet() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{
+            "manufacturer":"Acer","model":"Swift","sku":"0000000000000000","family":"Swift 5",
+            "bios_vendor":"Insyde Corp.","bios_version":"V1.09","bios_date":"20190612000000.000000+000",
+            "board_manufacturer":"WL","board_product":"Carlsberg",
+            "battery":{"charge":97,"status":2},
+            "memory":[
+              {"slot":"DIMM0","size":8589934592,"type":26,"speed":2667,"manufacturer":"Micron","part":"X"},
+              {"slot":"DIMM1","size":0,"type":26,"speed":0,"manufacturer":"","part":""}
+            ],
+            "volumes":[{"letter":"C","fs":"NTFS","health":"Healthy"}],
+            "disks":[{"model":"WDC SN520","media":"SSD","bus":"NVMe","health":"Healthy","size":512110190592}],
+            "reliability":[{"device":"0","temperature":41,"wear":3,"power_hours":1200}],
+            "diskdrives":[{"model":"WDC SN520","firmware":"20110000"}],
+            "network":[{"name":"Wi-Fi","description":"Intel Wireless-AC","media":"Native 802.11","status":"Up"}],
+            "bluetooth":[
+              {"name":"Microsoft Bluetooth Enumerator","status":"OK"},
+              {"name":"Intel(R) Wireless Bluetooth(R)","status":"OK"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let mut specs = SystemSpecs::default();
+        windows::apply(&mut specs, &value);
+        assert_eq!(specs.model_name, "Acer Swift");
+        assert_eq!(specs.model_id, "Swift 5");
+        assert_eq!(specs.firmware, "Insyde Corp. V1.09 (2019-06-12)");
+        assert_eq!(specs.board_id.as_deref(), Some("WL Carlsberg"));
+        assert_eq!(specs.battery.as_deref(), Some("97% · on AC"));
+        assert_eq!(specs.memory.modules.len(), 1);
+        assert_eq!(specs.memory.modules[0].kind, "DDR4");
+        assert_eq!(specs.memory.modules[0].size_bytes, Some(8_589_934_592));
+        assert_eq!(specs.volumes[0].mount, "C:\\");
+        assert_eq!(specs.volumes[0].smart, "Healthy");
+        assert_eq!(specs.drives.len(), 1);
+        assert_eq!(specs.drives[0].firmware, "20110000");
+        assert_eq!(specs.drives[0].capacity_bytes, Some(512_110_190_592));
+        assert!(specs.drives[0].smart.contains("41 °C"));
+        assert!(specs.drives[0].smart.contains("wear 3%"));
+        assert_eq!(specs.wifi_interface.as_deref(), Some("Wi-Fi"));
+        let bluetooth = specs.bluetooth.expect("controller is reported");
+        assert_eq!(bluetooth.state, Some(true));
+        assert_eq!(bluetooth.chipset, "Intel(R) Wireless Bluetooth(R)");
     }
 
     #[test]

@@ -66,8 +66,11 @@ fn main() -> eframe::Result {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Hardware Hub")
-            .with_inner_size([1180.0, 800.0])
-            .with_min_inner_size([880.0, 600.0]),
+            // Open maximised: on a 1280x720 screen at 150% scaling only ~853x448
+            // logical points are available, so a fixed 1180x800 window was
+            // clipped and pushed the status bar off-screen.
+            .with_maximized(true)
+            .with_min_inner_size([720.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -156,6 +159,25 @@ struct BluetoothRefresh {
     value: Option<specs::BluetoothSpec>,
 }
 
+fn initial_page() -> Page {
+    match std::env::var("HH_START_PAGE").as_deref() {
+        Ok("cpu") => Page::Cpu,
+        Ok("gpu") => Page::Gpu,
+        Ok("memory") => Page::Memory,
+        Ok("storage") => Page::Storage,
+        Ok("thermal") => Page::Thermal,
+        Ok("motherboard") => Page::Motherboard,
+        Ok("network") => Page::Network,
+        Ok("bluetooth") => Page::Bluetooth,
+        Ok("details") => Page::Details,
+        Ok("processes") => Page::Processes,
+        Ok("frames") => Page::Frames,
+        Ok("tests") => Page::Tests,
+        Ok("reports") => Page::Reports,
+        _ => Page::Overview,
+    }
+}
+
 struct App {
     page: Page,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -215,7 +237,7 @@ impl App {
             }
         });
         Self {
-            page: Page::Overview,
+            page: initial_page(),
             snapshot,
             specs,
             stop,
@@ -261,36 +283,36 @@ impl App {
     fn navigation(&mut self, ctx: &egui::Context, s: &Snapshot) {
         let frame = egui::Frame {
             fill: PANEL,
-            stroke: Stroke::new(1.0_f32, BORDER),
+            stroke: Stroke::NONE,
             inner_margin: egui::Margin {
                 left: 14,
                 right: 14,
-                top: 18,
+                top: 20,
                 bottom: 14,
             },
             ..Default::default()
         };
         egui::SidePanel::left("nav")
             .resizable(false)
-            .exact_width(236.0)
+            .exact_width(248.0)
             .frame(frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
                     let painter = ui.painter();
-                    painter.rect_filled(rect, CornerRadius::same(9), ACCENT);
+                    painter.rect_filled(rect, CornerRadius::same(10), ACCENT);
                     painter.circle_stroke(
                         rect.center(),
-                        6.5,
-                        Stroke::new(1.5_f32, Color32::from_white_alpha(210)),
+                        7.5,
+                        Stroke::new(1.5_f32, Color32::from_white_alpha(215)),
                     );
-                    painter.circle_filled(rect.center(), 2.0, Color32::from_white_alpha(230));
-                    ui.add_space(4.0);
+                    painter.circle_filled(rect.center(), 2.4, Color32::from_white_alpha(235));
+                    ui.add_space(6.0);
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new("Hardware Hub")
-                                .size(14.0)
+                                .size(15.0)
                                 .strong()
                                 .color(TEXT),
                         );
@@ -301,23 +323,92 @@ impl App {
                         );
                     });
                 });
-                ui.add_space(20.0);
-                let check_active = self.state.lock().map(|s| s.running).unwrap_or(false);
-                let log_visible = self.recorder.as_ref().is_some_and(|r| {
-                    r.active() || !r.status().closed || r.status().error.is_some()
-                });
-                let reserved = 150.0
-                    + if check_active { 55.0 } else { 0.0 }
-                    + if log_visible { 55.0 } else { 0.0 };
-                let max_nav_height = (ui.available_height() - reserved).max(120.0);
+                ui.add_space(24.0);
+                // Pin the footer and the controls to the bottom first, so the
+                // page list receives exactly the remaining height. A fixed
+                // reserve previously pushed eight pages below the fold and let
+                // the toggle overlap the last visible item at high DPI.
+                egui::TopBottomPanel::bottom("nav-footer")
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("Readings are best effort and never leave this computer.")
+                                .size(10.5)
+                                .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        if !s.adapters.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "wgpu · {}  ·  {} adapter(s)",
+                                    s.gpu_backend,
+                                    s.adapters.len()
+                                ))
+                                .size(10.5)
+                                .color(MUTED),
+                            );
+                        }
+                    });
+                egui::TopBottomPanel::bottom("nav-controls")
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.show_widget, "Floating monitor")
+                            .on_hover_text("Desktop window; not an in-game FPS overlay.");
+                        if let Some(recorder) = &mut self.recorder {
+                            let status = recorder.status();
+                            if recorder.active() {
+                                ui.colored_label(
+                                    GREEN,
+                                    format!("Recording · {} batches", status.batches),
+                                );
+                                if ui.button("Stop recording").clicked() {
+                                    recorder.stop();
+                                }
+                            } else if !status.closed {
+                                ui.colored_label(AMBER, "Finishing recording…");
+                            }
+                            if let Some(error) = &status.error {
+                                ui.colored_label(AMBER, format!("Log error: {error}"));
+                            }
+                        }
+                        let running = self
+                            .state
+                            .lock()
+                            .map(|state| state.running)
+                            .unwrap_or(false);
+                        if running {
+                            ui.colored_label(
+                                ACCENT,
+                                if self.cancel.load(Ordering::Relaxed) {
+                                    "Stopping check…"
+                                } else {
+                                    "Check running"
+                                },
+                            );
+                            if !self.cancel.load(Ordering::Relaxed)
+                                && ui.button("Stop check").clicked()
+                            {
+                                self.cancel.store(true, Ordering::Relaxed);
+                                self.message =
+                                    "Stopping after the current work or I/O operation…".into();
+                            }
+                        }
+                    });
                 egui::ScrollArea::vertical()
                     .id_salt("navigation-pages")
-                    .max_height(max_nav_height)
-                    .auto_shrink([false, true])
+                    // Always show the bar: on a 1280x720 screen at 150% scaling
+                    // there is not enough height for all pages, and a fading
+                    // scrollbar left them looking absent.
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.label(RichText::new("HARDWARE").size(10.5).strong().color(MUTED));
-                        ui.add_space(6.0);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(RichText::new("HARDWARE").size(10.0).strong().color(MUTED));
+                        ui.add_space(7.0);
                         for page in [
                             Page::Overview,
                             Page::Cpu,
@@ -334,8 +425,8 @@ impl App {
                             }
                         }
                         ui.add_space(10.0);
-                        ui.label(RichText::new("WORKSPACE").size(10.5).strong().color(MUTED));
-                        ui.add_space(6.0);
+                        ui.label(RichText::new("WORKSPACE").size(10.0).strong().color(MUTED));
+                        ui.add_space(7.0);
                         for page in [
                             Page::Details,
                             Page::Processes,
@@ -348,62 +439,6 @@ impl App {
                             }
                         }
                     });
-                ui.add_space(12.0);
-                ui.checkbox(&mut self.show_widget, "Floating monitor")
-                    .on_hover_text("Desktop window; not an in-game FPS overlay.");
-                if let Some(recorder) = &mut self.recorder {
-                    let status = recorder.status();
-                    if recorder.active() {
-                        ui.colored_label(GREEN, format!("Recording · {} batches", status.batches));
-                        if ui.button("Stop recording").clicked() {
-                            recorder.stop();
-                        }
-                    } else if !status.closed {
-                        ui.colored_label(AMBER, "Finishing recording…");
-                    }
-                    if let Some(error) = &status.error {
-                        ui.colored_label(AMBER, format!("Log error: {error}"));
-                    }
-                }
-                let running = self
-                    .state
-                    .lock()
-                    .map(|state| state.running)
-                    .unwrap_or(false);
-                if running {
-                    ui.colored_label(
-                        ACCENT,
-                        if self.cancel.load(Ordering::Relaxed) {
-                            "Stopping check…"
-                        } else {
-                            "Check running"
-                        },
-                    );
-                    if !self.cancel.load(Ordering::Relaxed) && ui.button("Stop check").clicked() {
-                        self.cancel.store(true, Ordering::Relaxed);
-                        self.message = "Stopping after the current work or I/O operation…".into();
-                    }
-                }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new("Readings are best effort and never leave this computer.")
-                            .size(10.5)
-                            .color(MUTED),
-                    );
-                    ui.add_space(10.0);
-                    if !s.adapters.is_empty() {
-                        ui.label(
-                            RichText::new(format!(
-                                "wgpu · {}  ·  {} adapter(s)",
-                                s.gpu_backend,
-                                s.adapters.len()
-                            ))
-                            .size(10.5)
-                            .color(MUTED),
-                        );
-                    }
-                });
             });
     }
 
@@ -436,20 +471,38 @@ impl App {
         };
         let hardware_adapters = s.adapters.iter().filter(|a| !a.software).count();
 
+        let peak_celsius = s
+            .temperatures
+            .iter()
+            .filter_map(|t| t.celsius)
+            .fold(None::<f32>, |peak, value| {
+                Some(peak.map_or(value, |previous: f32| previous.max(value)))
+            });
+
         ui.columns(3, |cols| {
+            let cpu_footnote = if s.cores.is_empty() {
+                "No core data from the operating system".to_owned()
+            } else {
+                let mut text = format!(
+                    "{} · {} cores",
+                    truncate(&short_cpu_name(&s.cpu_name), 24),
+                    s.cores.len()
+                );
+                if let (Some(min), Some(max)) = (s.cpu_range.min, s.cpu_range.max) {
+                    text.push_str(&format!(" · {min:.0}–{max:.0}%"));
+                }
+                text
+            };
             metric(
                 &mut cols[0],
+                Page::Cpu,
                 "PROCESSOR",
                 &if s.cores.is_empty() || !s.cpu_usage.is_finite() {
                     "Unavailable".to_owned()
                 } else {
                     format!("{:.0}%", s.cpu_usage)
                 },
-                if s.cores.is_empty() {
-                    "No core data from the operating system"
-                } else {
-                    ""
-                },
+                &cpu_footnote,
                 if s.cores.is_empty() || !s.cpu_usage.is_finite() {
                     None
                 } else {
@@ -457,88 +510,118 @@ impl App {
                 },
                 load_color(s.cpu_usage / 100.0),
             );
-            cols[0]
-                .label(
-                    RichText::new(format!(
-                        "{} · {} logical cores",
-                        truncate(&s.cpu_name, 28),
-                        s.cores.len()
-                    ))
-                    .size(10.5)
-                    .color(MUTED),
-                )
-                .on_hover_text(if s.cpu_name.is_empty() {
-                    "CPU model unavailable".to_string()
-                } else {
-                    s.cpu_name.clone()
-                });
-            if let (Some(min), Some(max)) = (s.cpu_range.min, s.cpu_range.max) {
-                cols[0].label(
-                    RichText::new(format!("min {min:.0}% · max {max:.0}%"))
-                        .size(10.0)
-                        .color(MUTED),
-                );
-            }
 
+            let memory_footnote = if s.memory_total == 0 {
+                "No memory data from the operating system".to_owned()
+            } else {
+                let mut text = format!("{:.1} GiB free", gib(s.memory_available));
+                if let (Some(min), Some(max)) = (s.memory_range.min, s.memory_range.max) {
+                    text.push_str(&format!(" · {min:.0}–{max:.0}%"));
+                }
+                text
+            };
             metric(
                 &mut cols[1],
+                Page::Memory,
                 "MEMORY",
                 &if s.memory_total == 0 {
                     "Unavailable".to_string()
                 } else {
                     format!("{:.1} / {:.1} GiB", gib(s.memory_used), gib(s.memory_total))
                 },
-                if s.memory_total == 0 {
-                    "No memory data from the operating system"
-                } else {
-                    ""
-                },
+                &memory_footnote,
                 (s.memory_total > 0).then_some(memory_fraction),
                 VIOLET,
             );
-            cols[1].label(
-                RichText::new(if s.memory_total == 0 {
-                    "Available memory unknown".to_owned()
-                } else {
-                    format!("{:.1} GiB available", gib(s.memory_available))
-                })
-                .size(10.5)
-                .color(MUTED),
-            );
-            if let (Some(min), Some(max)) = (s.memory_range.min, s.memory_range.max) {
-                cols[1].label(
-                    RichText::new(format!("min {min:.0}% · max {max:.0}%"))
-                        .size(10.0)
-                        .color(MUTED),
-                );
-            }
 
+            let graphics_footnote = match s.adapters.first() {
+                None => "No adapter reported".to_string(),
+                Some(gpu) => {
+                    let mut text = truncate(&gpu.name, 30);
+                    if hardware_adapters == 0 {
+                        text.push_str(" · software");
+                    }
+                    text
+                }
+            };
             metric(
                 &mut cols[2],
+                Page::Gpu,
                 "GRAPHICS",
                 &if s.adapters.is_empty() {
                     "None".to_string()
                 } else {
                     s.adapters.len().to_string()
                 },
-                if s.adapters.is_empty() {
-                    "No adapter reported"
-                } else if hardware_adapters == 0 {
-                    "software adapters only"
-                } else {
-                    ""
-                },
+                &graphics_footnote,
                 None,
                 AMBER,
             );
-            cols[2].label(
-                RichText::new(match s.adapters.first() {
-                    Some(g) => truncate(&g.name, 34),
-                    None => "no adapter reported".to_string(),
-                })
-                .size(10.5)
-                .color(MUTED),
-            );
+        });
+
+        ui.add_space(10.0);
+        let smart = specs
+            .as_ref()
+            .and_then(|known| {
+                known
+                    .volumes
+                    .iter()
+                    .map(|volume| volume.smart.as_str())
+                    .find(|smart| !smart.is_empty())
+            })
+            .unwrap_or("");
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "At a glance", Some("session summary"));
+            ui.add_space(8.0);
+            ui.columns(4, |cols| {
+                stat(
+                    &mut cols[0],
+                    "PEAK TEMPERATURE",
+                    &peak_celsius
+                        .map(|value| format!("{value:.0} °C"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    peak_celsius.map(temperature_color).unwrap_or(MUTED),
+                    &format!("{} reported sensors", s.temperatures.len()),
+                );
+                stat(
+                    &mut cols[1],
+                    "FANS",
+                    &if s.fans.is_empty() {
+                        "—".to_string()
+                    } else {
+                        s.fans.len().to_string()
+                    },
+                    if s.fans.is_empty() { MUTED } else { TEXT },
+                    if s.fans.is_empty() {
+                        "not exposed by firmware"
+                    } else {
+                        "reported speeds"
+                    },
+                );
+                stat(
+                    &mut cols[2],
+                    "STORAGE HEALTH",
+                    &if smart.is_empty() {
+                        "—".to_string()
+                    } else {
+                        smart.to_uppercase()
+                    },
+                    smart_color(smart),
+                    if specs.is_some() {
+                        "drive-reported state"
+                    } else {
+                        "reading inventory…"
+                    },
+                );
+                stat(
+                    &mut cols[3],
+                    "UPTIME",
+                    &uptime_text(sysinfo::System::uptime()),
+                    TEXT_DIM,
+                    "since last boot",
+                );
+            });
         });
 
         ui.add_space(12.0);
@@ -696,10 +779,7 @@ impl App {
             });
             ui.add_space(8.0);
             if s.temperatures.is_empty() && s.fans.is_empty() {
-                empty_note(
-                    ui,
-                    "No sensor provider is available here. The Details page lists what this platform exposes.",
-                );
+                empty_note(ui, sensor_unavailable_note());
             }
             let temp_rows: Vec<RowView<'_>> = s
                 .temperatures
@@ -2047,6 +2127,27 @@ impl App {
                                 .size(10.0)
                                 .color(MUTED),
                         );
+                        ui.add_space(10.0);
+                        if s.ready {
+                            let memory = if s.memory_total > 0 {
+                                format!(
+                                    "RAM {:.0}%",
+                                    s.memory_used as f32 * 100.0 / s.memory_total as f32
+                                )
+                            } else {
+                                "RAM —".to_string()
+                            };
+                            let cpu = if s.cpu_usage.is_finite() && !s.cores.is_empty() {
+                                format!("CPU {:.0}%", s.cpu_usage)
+                            } else {
+                                "CPU —".to_string()
+                            };
+                            ui.label(
+                                RichText::new(format!("{cpu}   {memory}"))
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        }
                     });
                 });
             });
@@ -2126,15 +2227,15 @@ impl eframe::App for App {
                             .strong()
                             .color(ACCENT),
                     );
-                    ui.add_space(2.0);
+                    ui.add_space(3.0);
                     ui.label(
                         RichText::new(self.page.title())
-                            .size(26.0)
+                            .size(28.0)
                             .strong()
                             .color(TEXT),
                     );
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(self.page.subtitle()).size(12.0).color(MUTED));
+                    ui.add_space(3.0);
+                    ui.label(RichText::new(self.page.subtitle()).size(12.5).color(MUTED));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if matches!(
@@ -2259,7 +2360,7 @@ fn install_theme(ctx: &egui::Context) {
     visuals.panel_fill = PANEL;
     visuals.window_fill = CARD;
     visuals.extreme_bg_color = Color32::from_rgb(20, 20, 22);
-    visuals.faint_bg_color = CARD_HI;
+    visuals.faint_bg_color = Color32::from_rgb(50, 50, 52);
     visuals.override_text_color = Some(TEXT);
     visuals.hyperlink_color = ACCENT;
     visuals.selection.bg_fill = ACCENT_SOFT;
@@ -2278,10 +2379,36 @@ fn install_theme(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = ACCENT;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.widgets.active.corner_radius = CornerRadius::same(8);
+    // Apple-style type ramp: a 13 pt body, compact captions and one heading level.
+    style.text_styles = [
+        (egui::TextStyle::Heading, egui::FontId::proportional(21.0)),
+        (egui::TextStyle::Body, egui::FontId::proportional(13.0)),
+        (egui::TextStyle::Button, egui::FontId::proportional(12.5)),
+        (egui::TextStyle::Small, egui::FontId::proportional(11.0)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(11.5)),
+    ]
+    .into();
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.button_padding = egui::vec2(13.0, 6.5);
     style.spacing.slider_width = 180.0;
+    style.spacing.slider_rail_height = 4.0;
+    style.spacing.interact_size.y = 26.0;
+    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.scroll.bar_inner_margin = 3.0;
+    style.spacing.scroll.bar_outer_margin = 2.0;
+    style.spacing.menu_margin = egui::Margin::same(8);
     style.animation_time = 0.12;
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.menu_corner_radius = CornerRadius::same(10);
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 0,
+        color: Color32::from_black_alpha(70),
+    };
+    visuals.popup_shadow = visuals.window_shadow;
+    visuals.widgets.open.corner_radius = CornerRadius::same(8);
     ctx.set_style(style);
 }
 
@@ -2316,11 +2443,12 @@ fn spec_row(rows: &mut Vec<(String, String)>, label: impl Into<String>, value: i
 fn spec_grid(ui: &mut egui::Ui, id: &str, rows: &[(String, String)]) {
     egui::Grid::new(id)
         .num_columns(2)
-        .spacing([20.0, 7.0])
+        .spacing([28.0, 8.0])
+        .striped(true)
         .show(ui, |ui| {
             for (label, value) in rows {
-                ui.label(RichText::new(label).size(10.5).color(MUTED));
-                ui.label(RichText::new(value).size(11.5).color(TEXT_DIM));
+                ui.label(RichText::new(label).size(11.5).color(MUTED));
+                ui.label(RichText::new(value).size(12.0).color(TEXT_DIM));
                 ui.end_row();
             }
         });
@@ -2338,43 +2466,90 @@ struct RowView<'a> {
 
 fn sensor_table(ui: &mut egui::Ui, id: &str, heading: &str, rows: Vec<RowView<'_>>) {
     ui.label(RichText::new(heading).size(11.0).strong().color(TEXT_DIM));
-    ui.add_space(3.0);
-    egui::Grid::new(id)
-        .num_columns(4)
-        .spacing([22.0, 5.0])
-        .striped(true)
-        .show(ui, |ui| {
-            for header in ["Sensor", "Current", "Min", "Max"] {
-                ui.label(RichText::new(header).size(9.5).color(MUTED));
-            }
-            ui.end_row();
-            for row in rows {
-                ui.label(RichText::new(row.label).size(11.5).color(TEXT_DIM))
-                    .on_hover_text(row.key);
-                let current = row
-                    .current
-                    .map(|value| format!("{value:.0} {}", row.unit))
-                    .unwrap_or_else(|| "—".to_string());
-                let current_color = match row.current {
-                    Some(value) if row.unit == "°C" => temperature_color(value),
-                    Some(_) => TEXT,
-                    None => MUTED,
-                };
-                ui.label(
-                    RichText::new(current)
-                        .size(11.5)
-                        .strong()
-                        .color(current_color),
+    ui.add_space(4.0);
+    ui.push_id(id, |ui| {
+        let width = ui.available_width().max(260.0);
+        let (header, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+        let right = header.right();
+        {
+            let painter = ui.painter();
+            let font = egui::FontId::proportional(9.5);
+            painter.text(
+                egui::pos2(header.left() + 6.0, header.center().y),
+                egui::Align2::LEFT_CENTER,
+                "SENSOR",
+                font.clone(),
+                MUTED,
+            );
+            for (offset, text) in [(112.0, "CURRENT"), (60.0, "MIN"), (6.0, "MAX")] {
+                painter.text(
+                    egui::pos2(right - offset, header.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    text,
+                    font.clone(),
+                    MUTED,
                 );
-                for value in [row.min, row.max] {
-                    let text = value
-                        .map(|value| format!("{value:.0}"))
-                        .unwrap_or_else(|| "—".to_string());
-                    ui.label(RichText::new(text).size(11.0).color(MUTED));
-                }
-                ui.end_row();
             }
-        });
+        }
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for (index, row) in rows.iter().enumerate() {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
+            let painter = ui.painter();
+            if response.hovered() {
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::same(6),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 9),
+                );
+            }
+            painter.text(
+                egui::pos2(rect.left() + 6.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                truncate(row.label, 36),
+                egui::FontId::proportional(11.5),
+                TEXT_DIM,
+            );
+            let current = row
+                .current
+                .map(|value| format!("{value:.0} {}", row.unit))
+                .unwrap_or_else(|| "—".to_string());
+            let current_color = match row.current {
+                Some(value) if row.unit == "°C" => temperature_color(value),
+                Some(_) => TEXT,
+                None => MUTED,
+            };
+            painter.text(
+                egui::pos2(right - 112.0, rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                current,
+                egui::FontId::monospace(11.5),
+                current_color,
+            );
+            for (offset, value) in [(60.0, row.min), (6.0, row.max)] {
+                painter.text(
+                    egui::pos2(right - offset, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    value
+                        .map(|value| format!("{value:.0}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                    egui::FontId::monospace(11.0),
+                    MUTED,
+                );
+            }
+            if index + 1 < rows.len() {
+                painter.hline(
+                    egui::Rangef::new(rect.left() + 6.0, rect.right() - 6.0),
+                    rect.bottom(),
+                    Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 11)),
+                );
+            }
+            response.on_hover_text(row.key);
+        }
+    });
 }
 
 fn uptime_text(seconds: u64) -> String {
@@ -2396,6 +2571,21 @@ fn clock_text(mhz: u64) -> String {
     } else {
         format!("{mhz} MHz")
     }
+}
+
+/// Vendor prefixes and clock suffixes add noise to a one-line caption.
+fn short_cpu_name(name: &str) -> String {
+    let mut text = name.trim().to_string();
+    for prefix in ["Intel(R) Core(TM) ", "Intel(R) ", "AMD ", "Apple "] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.to_string();
+            break;
+        }
+    }
+    if let Some((head, _)) = text.split_once(" CPU @") {
+        text = head.to_string();
+    }
+    text
 }
 
 fn vendor_text(vendor: &str) -> &str {
@@ -2442,6 +2632,18 @@ fn section_title(ui: &mut egui::Ui, title: &str, hint: Option<&str>) {
 
 fn empty_note(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).color(MUTED).italics());
+}
+
+/// Why the sensor table has no rows, stated as the platform actually behaves.
+fn sensor_unavailable_note() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "This firmware reported no ACPI thermal zone. Windows exposes temperature only through ACPI thermal zones (the Thermal Zone Information counters, or the WMI class when elevated), and states no per-core die temperature without a kernel driver."
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "No sensor provider is available here. The Details page lists what this platform exposes."
+    }
 }
 
 fn page_rule(ui: &mut egui::Ui) {
@@ -2671,30 +2873,39 @@ fn draw_nav_icon(painter: &egui::Painter, center: egui::Pos2, page: Page, color:
 
 fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 36.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 33.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if active {
-            painter.rect_filled(rect, CornerRadius::same(10), ACCENT_SOFT);
+            // macOS sidebars use a translucent neutral selection, not a filled accent row.
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(9),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+            );
             let accent = egui::Rect::from_min_size(
-                rect.left_center() + egui::vec2(0.0, -9.0),
-                egui::vec2(3.0, 18.0),
+                rect.left_center() + egui::vec2(0.0, -8.0),
+                egui::vec2(3.0, 16.0),
             );
             painter.rect_filled(accent, CornerRadius::same(2), ACCENT);
         } else if response.hovered() {
-            painter.rect_filled(rect, CornerRadius::same(10), CARD_HI);
+            painter.rect_filled(
+                rect,
+                CornerRadius::same(9),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+            );
         }
         draw_nav_icon(
             painter,
-            rect.left_center() + egui::vec2(19.0, 0.0),
+            rect.left_center() + egui::vec2(20.0, 0.0),
             page,
             if active { ACCENT } else { MUTED },
         );
         painter.text(
-            rect.left_center() + egui::vec2(39.0, 0.0),
+            rect.left_center() + egui::vec2(40.0, 0.0),
             egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::proportional(13.5),
+            egui::FontId::proportional(13.0),
             if active { TEXT } else { TEXT_DIM },
         );
     }
@@ -2743,25 +2954,36 @@ fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui
 
 fn metric(
     ui: &mut egui::Ui,
+    icon: Page,
     label: &str,
     value: &str,
-    empty_hint: &str,
+    footnote: &str,
     fraction: Option<f32>,
     accent: Color32,
 ) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.set_min_height(104.0);
-        ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
-        ui.add_space(6.0);
-        ui.label(RichText::new(value).size(26.0).strong().color(TEXT));
-        if let Some(f) = fraction {
-            ui.add_space(10.0);
-            bar(ui, f, accent, 6.0);
-        } else if !empty_hint.is_empty() {
-            ui.add_space(6.0);
-            ui.label(RichText::new(empty_hint).size(10.5).color(MUTED));
+        ui.set_min_height(142.0);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter();
+                painter.rect_filled(rect, CornerRadius::same(8), tint(accent));
+                draw_nav_icon(painter, rect.center(), icon, accent);
+            }
+            ui.add_space(2.0);
+            ui.label(RichText::new(label).size(10.5).strong().color(MUTED));
+        });
+        ui.add_space(10.0);
+        ui.label(RichText::new(value).size(27.0).strong().color(TEXT));
+        ui.add_space(9.0);
+        match fraction {
+            Some(f) => bar(ui, f, accent, 6.0),
+            // No meaningful ratio: keep the caption baseline without faking 0%.
+            None => ui.add_space(6.0),
         }
+        ui.add_space(9.0);
+        ui.add(egui::Label::new(RichText::new(footnote).size(10.5).color(MUTED)).truncate());
     });
 }
 
@@ -2861,6 +3083,15 @@ fn chip(ui: &mut egui::Ui, text: &str, color: Color32) {
 
 fn tint(color: Color32) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 44)
+}
+
+/// Compact label/value pair used by the overview status band.
+fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, hint: &str) {
+    ui.label(RichText::new(label).size(9.5).strong().color(MUTED));
+    ui.add_space(4.0);
+    ui.add(egui::Label::new(RichText::new(value).size(15.0).strong().color(color)).truncate());
+    ui.add_space(2.0);
+    ui.label(RichText::new(hint).size(9.5).color(MUTED));
 }
 
 fn load_color(fraction: f32) -> Color32 {
@@ -2989,6 +3220,16 @@ mod tests {
         assert_eq!(bytes(2048), "2 KiB");
         assert_eq!(bytes(5 * 1024 * 1024), "5.0 MiB");
         assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn cpu_captions_drop_vendor_noise() {
+        assert_eq!(
+            short_cpu_name("Intel(R) Core(TM) i7-8565U CPU @ 1.80GHz"),
+            "i7-8565U"
+        );
+        assert_eq!(short_cpu_name("Apple M2 Pro"), "M2 Pro");
+        assert_eq!(short_cpu_name("Unknown CPU"), "Unknown CPU");
     }
 
     #[test]

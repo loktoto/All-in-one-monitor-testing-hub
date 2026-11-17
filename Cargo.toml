@@ -23,6 +23,13 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 
+# Windows reports temperature through the ACPI thermal zones: the WMI class in
+# ROOT\WMI (elevated only) and the "Thermal Zone Information" performance
+# counters in ROOT\CIMV2 (readable as a standard user). `sysinfo` has no
+# component provider on Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+wmi = "0.18"
+
 [profile.release]
 opt-level = 2
 lto = "thin"
