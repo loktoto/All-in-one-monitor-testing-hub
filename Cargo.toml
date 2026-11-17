@@ -17,11 +17,13 @@ csv = "1.3"
 
 # X11 is only needed on Linux. On macOS (CGL) and Windows the window is created
 # natively, so requesting the X11 backend there pulls unused system libraries.
+# Render through wgpu (DX12 on Windows): the OpenGL path fails to start on
+# machines whose only display driver is the Microsoft Basic Render Driver.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu"] }
 
 # Windows reports temperature through the ACPI thermal zones: the WMI class in
 # ROOT\WMI (elevated only) and the "Thermal Zone Information" performance

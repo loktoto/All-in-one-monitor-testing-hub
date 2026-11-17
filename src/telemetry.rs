@@ -408,6 +408,18 @@ pub fn spawn(
                 })
                 .collect();
             let cpu_usage = system.global_cpu_usage();
+            if std::env::var("HH_CPU_LOG").is_ok() {
+                let cores: Vec<String> = system
+                    .cpus()
+                    .iter()
+                    .map(|c| format!("{:.0}", c.cpu_usage()))
+                    .collect();
+                eprintln!(
+                    "[telemetry] global {:.1}% | cores {}",
+                    cpu_usage,
+                    cores.join(" ")
+                );
+            }
             let memory_total = system.total_memory();
             let memory_used = system.used_memory();
             let cores: Vec<f32> = system.cpus().iter().map(|c| c.cpu_usage()).collect();

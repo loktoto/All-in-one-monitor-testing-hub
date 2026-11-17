@@ -71,6 +71,7 @@ fn main() -> eframe::Result {
             // clipped and pushed the status bar off-screen.
             .with_maximized(true)
             .with_min_inner_size([720.0, 420.0]),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(

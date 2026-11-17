@@ -1,6 +1,6 @@
 // Temporary probe: compare sysinfo CPU numbers with the OS counters.
 
-use sysinfo::System;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -9,6 +9,11 @@ fn main() {
     for round in 0..6 {
         sleep(Duration::from_secs(1));
         system.refresh_cpu_all();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
         let cores: Vec<String> = system
             .cpus()
             .iter()
