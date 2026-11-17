@@ -22,7 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir(&root)?;
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
     let stop = Arc::new(AtomicBool::new(false));
-    let telemetry = telemetry::spawn(snapshot.clone(), stop.clone());
+    let reset = Arc::new(AtomicBool::new(false));
+    let telemetry = telemetry::spawn(snapshot.clone(), stop.clone(), reset.clone());
     let until = Instant::now() + Duration::from_secs(20);
     while !snapshot.lock().unwrap().ready && Instant::now() < until {
         thread::sleep(Duration::from_millis(50));
@@ -31,7 +32,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !sample.ready {
         return Err("No telemetry sample within 20 seconds".into());
     }
-    println!("Telemetry: CPU {}, {} logical CPUs, {} bytes RAM, {} volumes, {} adapters, {} temperature sensors",sample.cpu_name,sample.cores.len(),sample.memory_total,sample.disks.len(),sample.adapters.len(),sample.temperatures.len());
+    println!("Telemetry: CPU {}, {} logical CPUs, {} bytes RAM, {} volumes, {} adapters, {} temperature sensors, {} fans",sample.cpu_name,sample.cores.len(),sample.memory_total,sample.disks.len(),sample.adapters.len(),sample.temperatures.len(),sample.fans.len());
+    println!(
+        "Graphics sources: {} total, {} IORegistry utilization sources",
+        sample.gpus.len(),
+        sample
+            .gpus
+            .iter()
+            .filter(|g| g.name.starts_with("IORegistry source:"))
+            .count()
+    );
+    if !sample.processes.iter().any(|p| p.pid == std::process::id()) {
+        return Err("The telemetry process list did not include the smoke process".into());
+    }
+    println!(
+        "Process telemetry: own PID found among {} reported processes",
+        sample.processes.len()
+    );
+    println!(
+        "CPU range: {:?}-{:?}% · memory range: {:?}-{:?}%",
+        sample.cpu_range.min,
+        sample.cpu_range.max,
+        sample.memory_range.min,
+        sample.memory_range.max
+    );
     let state = Arc::new(Mutex::new(State::default()));
     let cancel = Arc::new(AtomicBool::new(false));
     let context = ReportContext {

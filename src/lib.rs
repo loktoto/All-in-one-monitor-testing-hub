@@ -1,3 +1,10 @@
+pub mod frames;
+pub mod history;
+pub mod logging;
+pub mod netcheck;
 pub mod report;
+pub mod sensors;
+pub mod smart;
+pub mod specs;
 pub mod stress;
 pub mod telemetry;
