@@ -2,6 +2,7 @@
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use hardware_hub::{
+    alerts::{self, Severity, Threshold},
     frames::{self, FrameSummary},
     history::{self, History},
     logging::Recorder,
@@ -10,12 +11,13 @@ use hardware_hub::{
     smart::{self, SmartReport},
     specs::{self, SystemSpecs},
     stress::{self, Config, Kind, ReportContext, State, Status},
+    system_report,
     telemetry::{self, Snapshot},
 };
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -40,26 +42,10 @@ const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const VIOLET: Color32 = Color32::from_rgb(191, 90, 242);
 
 const KINDS: [(Kind, &str, &str); 4] = [
-    (
-        Kind::Cpu,
-        "CPU compute",
-        "Integer rounds against a fixed answer",
-    ),
-    (
-        Kind::Gpu,
-        "GPU check",
-        "Shader dispatch verified by readback",
-    ),
-    (
-        Kind::Memory,
-        "Memory patterns",
-        "Alternating bytes written and read back",
-    ),
-    (
-        Kind::Disk,
-        "File I/O",
-        "Owned scratch file written and verified",
-    ),
+    (Kind::Cpu, "CPU compute", "Integer rounds, fixed answer"),
+    (Kind::Gpu, "GPU check", "Shader dispatch, read back"),
+    (Kind::Memory, "Memory patterns", "Alternating byte patterns"),
+    (Kind::Disk, "File I/O", "Owned scratch file verified"),
 ];
 
 fn main() -> eframe::Result {
@@ -71,7 +57,7 @@ fn main() -> eframe::Result {
             // clipped and pushed the status bar off-screen.
             .with_maximized(true)
             .with_min_inner_size([720.0, 420.0]),
-        renderer: eframe::Renderer::Wgpu,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
@@ -137,7 +123,7 @@ impl Page {
             Page::Memory => "Memory usage, modules and a bounded pattern check.",
             Page::Storage => "Mounted volumes, reported drives and a bounded file check.",
             Page::Thermal => {
-                "Available temperature and fan sensors with observed minimum and maximum."
+                "Available sensors, live temperature history, sampling and advisory alerts."
             }
             Page::Motherboard => "System identification and available board-related information.",
             Page::Network => "Network interfaces and operating-system traffic counters.",
@@ -162,27 +148,19 @@ struct BluetoothRefresh {
 
 fn initial_page() -> Page {
     match std::env::var("HH_START_PAGE").as_deref() {
-        Ok("cpu") => Page::Cpu,
-        Ok("gpu") => Page::Gpu,
-        Ok("memory") => Page::Memory,
-        Ok("storage") => Page::Storage,
-        Ok("thermal") => Page::Thermal,
-        Ok("motherboard") => Page::Motherboard,
-        Ok("network") => Page::Network,
-        Ok("bluetooth") => Page::Bluetooth,
         Ok("details") => Page::Details,
-        Ok("processes") => Page::Processes,
-        Ok("frames") => Page::Frames,
+        Ok("cpu") => Page::Cpu,
         Ok("tests") => Page::Tests,
-        Ok("reports") => Page::Reports,
         _ => Page::Overview,
     }
 }
 
 struct App {
     page: Page,
-    snapshot: Arc<Mutex<Snapshot>>,
-    specs: Arc<Mutex<Option<SystemSpecs>>>,
+    snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    specs: Arc<Mutex<Option<Arc<SystemSpecs>>>>,
+    /// Desired telemetry period in milliseconds; the worker clamps it to 250–5000.
+    poll_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     /// Set to ask the telemetry thread to clear its min/max history.
     stats_reset: Arc<AtomicBool>,
@@ -216,6 +194,18 @@ struct App {
     frame_path: String,
     frame_summary: Option<FrameSummary>,
     frame_message: String,
+    // Optional advisory temperature alert (never changes hardware behaviour).
+    alert: alerts::Monitor,
+    alert_celsius: f32,
+    alert_hold_secs: u64,
+    alert_severity: Severity,
+    // One selectable temperature series in the thermal history graph.
+    selected_temp_key: String,
+    sensor_log_path: String,
+    // CPU-Z style, exportable system inventory.
+    system_report_path: String,
+    system_report_format: Format,
+    system_report_redact: bool,
     show_widget: bool,
     started: Instant,
 }
@@ -223,10 +213,16 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_theme(&cc.egui_ctx);
-        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
         let stop = Arc::new(AtomicBool::new(false));
         let stats_reset = Arc::new(AtomicBool::new(false));
-        telemetry::spawn(snapshot.clone(), stop.clone(), stats_reset.clone());
+        let poll_ms = Arc::new(AtomicU64::new(1000));
+        telemetry::spawn(
+            snapshot.clone(),
+            stop.clone(),
+            stats_reset.clone(),
+            poll_ms.clone(),
+        );
         // The inventory shells out to local tools once, so it must not block the
         // first frame; the Details page shows a placeholder until it lands.
         let specs = Arc::new(Mutex::new(None));
@@ -234,13 +230,14 @@ impl App {
         std::thread::spawn(move || {
             let collected = specs::collect();
             if let Ok(mut slot) = specs_slot.lock() {
-                *slot = Some(collected);
+                *slot = Some(Arc::new(collected));
             }
         });
         Self {
             page: initial_page(),
             snapshot,
             specs,
+            poll_ms,
             stop,
             stats_reset,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -275,6 +272,15 @@ impl App {
             frame_path: String::new(),
             frame_summary: None,
             frame_message: String::new(),
+            alert: alerts::Monitor::default(),
+            alert_celsius: 85.0,
+            alert_hold_secs: 5,
+            alert_severity: Severity::Warning,
+            selected_temp_key: String::new(),
+            sensor_log_path: "hardware-hub-sensor.csv".into(),
+            system_report_path: "hardware-hub-system.txt".into(),
+            system_report_format: Format::Text,
+            system_report_redact: true,
             show_widget: false,
             started: Instant::now(),
         }
@@ -334,8 +340,15 @@ impl App {
                     .show_inside(ui, |ui| {
                         ui.add_space(2.0);
                         ui.label(
-                            RichText::new("Readings are best effort and never leave this computer.")
-                                .size(10.5)
+                            RichText::new(
+                                "Readings are best effort and never leave this computer.",
+                            )
+                            .size(10.5)
+                            .color(MUTED),
+                        );
+                        ui.label(
+                            RichText::new("⌘/Ctrl 1–9: pages · Esc: stop check")
+                                .size(10.0)
                                 .color(MUTED),
                         );
                         ui.add_space(8.0);
@@ -402,9 +415,7 @@ impl App {
                     // Always show the bar: on a 1280x720 screen at 150% scaling
                     // there is not enough height for all pages, and a fading
                     // scrollbar left them looking absent.
-                    .scroll_bar_visibility(
-                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                    )
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
@@ -991,6 +1002,23 @@ impl App {
                     if snapshot.gpus.is_empty() { ui.weak("No graphics source reported."); }
                     for gpu in &snapshot.gpus { ui.strong(&gpu.name); ui.label(&gpu.detail); ui.add_space(4.0); }
                     ui.weak("Sources may overlap; IORegistry and name-based matches do not prove adapter identity.");
+                    if !snapshot.adapters.is_empty() {
+                        ui.add_space(12.0);
+                        section_title(ui, "Adapter capabilities", Some("GPU-Z style device limits"));
+                        let mut rows: Vec<(String, String)> = Vec::new();
+                        for (index, adapter) in snapshot.adapters.iter().enumerate() {
+                            let limits = adapter.handle.limits();
+                            spec_row(&mut rows, format!("Adapter {index}"), &adapter.name);
+                            spec_row(&mut rows, "Backend", &adapter.backend);
+                            spec_row(&mut rows, "Vendor / device ID", &format!("{:#06x} / {:#06x}", adapter.vendor_id, adapter.device_id));
+                            spec_row(&mut rows, "Max texture (2D)", &format!("{} px", limits.max_texture_dimension_2d));
+                            spec_row(&mut rows, "Max compute workgroup", &format!("{} × {} × {}", limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z));
+                            spec_row(&mut rows, "Max storage buffer binding", &format!("{} MiB", limits.max_storage_buffer_binding_size / (1024 * 1024)));
+                            spec_row(&mut rows, "Optional features", &adapter.handle.features().bits().count_ones().to_string());
+                        }
+                        spec_grid(ui, "gpu-capabilities", &rows);
+                        ui.weak("Limits come from the graphics API and describe capability, not current clocks or temperature.");
+                    }
                     if ui.button("Open frame analysis").clicked() { self.page = Page::Frames; }
                 }
                 Page::Memory => {
@@ -1025,6 +1053,102 @@ impl App {
                     let fans = snapshot.fans.iter().map(|f| RowView { label: &f.label, key: &f.key, current: f.rpm, min: f.min, max: f.max, unit: "RPM" }).collect::<Vec<_>>();
                     if !fans.is_empty() { ui.add_space(8.0); sensor_table(ui, "thermal-page-fans", "Fans", fans); }
                     ui.weak("Sensor labels and device mappings may be ambiguous. No automatic thermal shutdown or fan control is provided; a thermal stress test is unavailable.");
+
+                    // A dedicated sensor graph, like the real-time graphs in HWMonitor.
+                    ui.add_space(14.0);
+                    section_title(ui, "Temperature history", Some("up to 60 recent batches"));
+                    let keys = history::temperature_keys(&self.history);
+                    if keys.is_empty() {
+                        ui.weak("Waiting for temperature samples…");
+                    } else {
+                        if !keys.iter().any(|key| key == &self.selected_temp_key) {
+                            self.selected_temp_key = keys[0].clone();
+                        }
+                        let selected = self.selected_temp_key.clone();
+                        ui.horizontal_wrapped(|ui| {
+                            egui::ComboBox::from_id_salt("thermal-series")
+                                .selected_text(&selected)
+                                .show_ui(ui, |ui| {
+                                    for key in &keys {
+                                        ui.selectable_value(&mut self.selected_temp_key, key.clone(), key);
+                                    }
+                                });
+                            if let Some((low, high, mean)) = history::range(&self.history, |sample| history::temperature_value(sample, &selected)) {
+                                ui.label(RichText::new(format!("{low:.1}–{high:.1} °C · avg {mean:.1}")).size(11.0).color(TEXT_DIM));
+                            }
+                        });
+                        Plot::new("thermal-history")
+                            .height(150.0)
+                            .include_y(0.0)
+                            .auto_bounds([true, true])
+                            .allow_drag(false)
+                            .allow_zoom(false)
+                            .allow_scroll(false)
+                            .show_x(false)
+                            .show(ui, |plot| {
+                                for points in history::segments(&self.history, self.started, |sample| history::temperature_value(sample, &selected)) {
+                                    plot.line(Line::new(PlotPoints::from(points)).color(AMBER).width(1.8_f32));
+                                }
+                            });
+                        ui.weak("A gap means the sensor was missing or the sample was delayed; gaps are never drawn as a line.");
+                        egui::CollapsingHeader::new("Export this sensor to CSV").show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut self.sensor_log_path);
+                                if ui.button("Export CSV").clicked() {
+                                    self.message = match history::export_sensor_csv(
+                                        std::path::Path::new(&self.sensor_log_path),
+                                        &self.history,
+                                        &selected,
+                                        self.started,
+                                    ) {
+                                        Ok(()) => format!("Saved {}", self.sensor_log_path),
+                                        Err(error) => format!("Export failed: {error}"),
+                                    };
+                                }
+                            });
+                        });
+                    }
+
+                    // Advisory threshold: a sustained breach of a fresh reading.
+                    ui.add_space(14.0);
+                    section_title(ui, "Temperature alert", Some("advisory only · no automatic stop"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Warn when any sensor reaches");
+                        ui.add(egui::DragValue::new(&mut self.alert_celsius).range(30.0..=125.0).speed(0.5).suffix(" °C"));
+                        ui.label("for");
+                        ui.add(egui::DragValue::new(&mut self.alert_hold_secs).range(1..=120).speed(1).suffix(" s"));
+                        ui.selectable_value(&mut self.alert_severity, Severity::Warning, "Warning");
+                        ui.selectable_value(&mut self.alert_severity, Severity::Critical, "Critical");
+                    });
+                    let rule = Threshold {
+                        celsius: self.alert_celsius,
+                        hold: Duration::from_secs(self.alert_hold_secs),
+                        severity: self.alert_severity,
+                    };
+                    if !rule.is_valid() {
+                        ui.colored_label(AMBER, "Choose a threshold between 30 and 125 °C, held for 1–120 seconds.");
+                    } else if let Some(since) = self.alert.active_since() {
+                        let color = if rule.severity == Severity::Critical { RED } else { AMBER };
+                        ui.horizontal_wrapped(|ui| {
+                            pill(ui, rule.severity.label(), color);
+                            ui.colored_label(color, format!("Temperature has been at or above {:.0} °C for {:.0}s.", rule.celsius, since.elapsed().as_secs_f32()));
+                            if ui.button("Acknowledge").clicked() { self.alert.clear(); }
+                        });
+                    } else {
+                        ui.weak(format!("No active alert. Highest observation this session: {}.", self.alert.peak_celsius().map(|v| format!("{v:.1} °C")).unwrap_or_else(|| "unavailable".into())));
+                    }
+                    if ui.button("Reset alert state").clicked() { self.alert.clear(); }
+
+                    // Polling cost is user-controlled; slower sampling reduces CPU work.
+                    ui.add_space(14.0);
+                    section_title(ui, "Sampling", Some("applies to all readings and logs"));
+                    let mut period_ms = self.poll_ms.load(Ordering::Relaxed) as f64;
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(egui::Slider::new(&mut period_ms, 250.0..=5000.0).step_by(250.0).suffix(" ms")).changed() {
+                            self.poll_ms.store(period_ms.round() as u64, Ordering::Relaxed);
+                        }
+                        ui.weak("Slower sampling lowers background CPU usage; faster sampling gives a denser chart.");
+                    });
                 }
                 Page::Motherboard => {
                     section_title(ui, "Motherboard", Some("availability depends on the platform"));
@@ -1526,6 +1650,8 @@ impl App {
             "Architecture",
             specs.cpu.architecture.as_str(),
         );
+        spec_row(&mut cpu_rows, "Socket", specs.cpu.socket.as_str());
+        spec_row(&mut cpu_rows, "Stepping", specs.cpu.stepping.as_str());
         match (specs.cpu.physical_cores, specs.cpu.logical_cores) {
             (Some(physical), Some(logical)) => spec_row(
                 &mut cpu_rows,
@@ -1606,11 +1732,22 @@ impl App {
             if let Some(speed) = module.speed_mhz {
                 detail.push_str(&format!(" · {speed} MHz"));
             }
+            if let Some(configured) = module.configured_mhz {
+                if Some(configured) != module.speed_mhz {
+                    detail.push_str(&format!(" (running {configured} MHz)"));
+                }
+            }
+            if !module.form_factor.is_empty() {
+                detail.push_str(&format!(" · {}", module.form_factor));
+            }
             if !module.manufacturer.is_empty() {
                 detail.push_str(&format!(" · {}", module.manufacturer));
             }
             if !module.part_number.is_empty() {
                 detail.push_str(&format!(" · {}", module.part_number));
+            }
+            if !module.serial.is_empty() {
+                detail.push_str(&format!(" · serial {}", module.serial));
             }
             let slot = if module.slot.is_empty() {
                 "Module".to_string()
@@ -1656,6 +1793,15 @@ impl App {
             spec_row(&mut graphics_rows, "Bus", gpu.bus.as_str());
             spec_row(&mut graphics_rows, "Device ID", gpu.device_id.as_str());
         }
+        if !specs.gpu_driver.is_empty() {
+            let detail = if specs.gpu_driver_date.is_empty() {
+                specs.gpu_driver.clone()
+            } else {
+                format!("{} ({})", specs.gpu_driver, specs.gpu_driver_date)
+            };
+            spec_row(&mut graphics_rows, "OS driver", detail);
+        }
+        spec_row(&mut graphics_rows, "Display", specs.display.as_str());
 
         let mut storage_rows: Vec<(String, String)> = Vec::new();
         for volume in &specs.volumes {
@@ -1681,6 +1827,9 @@ impl App {
             let mut detail = drive.model.clone();
             if !drive.firmware.is_empty() {
                 detail.push_str(&format!(" · firmware {}", drive.firmware));
+            }
+            if !drive.serial.is_empty() {
+                detail.push_str(&format!(" · serial {}", drive.serial));
             }
             if !drive.link.is_empty() {
                 detail.push_str(&format!(" · link {}", drive.link));
@@ -1908,12 +2057,46 @@ impl App {
         });
     }
 
-    fn reports(&mut self, ui: &mut egui::Ui) {
+    fn reports(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let records = self
             .state
             .lock()
             .map(|s| s.results.clone())
             .unwrap_or_default();
+
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "System report", Some("CPU-Z / GPU-Z style inventory"));
+            ui.weak("Exports the Details inventory and current sensor readings to a new text or JSON file. Nothing is uploaded.");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.system_report_format, Format::Text, "Text");
+                ui.selectable_value(&mut self.system_report_format, Format::Json, "JSON");
+                ui.checkbox(&mut self.system_report_redact, "Redact identifiers");
+            });
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.system_report_path);
+                if ui.button("Export system report").clicked() {
+                    let specs = self.specs.lock().ok().and_then(|held| held.clone());
+                    self.message = match specs {
+                        Some(specs) => match system_report::export(
+                            std::path::Path::new(&self.system_report_path),
+                            &specs,
+                            snapshot,
+                            self.system_report_format,
+                            self.system_report_redact,
+                        ) {
+                            Ok(()) => format!("Saved {}", self.system_report_path),
+                            Err(error) => format!("Export failed: {error}"),
+                        },
+                        None => "The specification sheet is still being collected.".into(),
+                    };
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Redaction removes serial numbers, volume paths, interface names and connected-device names. Review the file before sharing.").size(10.0).color(MUTED));
+        });
+
+        ui.add_space(12.0);
 
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2079,6 +2262,10 @@ impl App {
             .frame(frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if self.alert.active_since().is_some() {
+                        pill(ui, "TEMP ALERT", RED);
+                        ui.add_space(8.0);
+                    }
                     if self.message.is_empty() {
                         let (dot, text) = if !s.ready {
                             (MUTED, "Collecting readings…".to_string())
@@ -2192,7 +2379,81 @@ impl eframe::App for App {
             self.page = Page::Tests;
             self.message = "Stopping test before closing. Close again when it has stopped.".into();
         }
-        let snapshot = self.snapshot.lock().map(|s| s.clone()).unwrap_or_default();
+        let snapshot = self
+            .snapshot
+            .lock()
+            .map(|guard| Arc::clone(&guard))
+            .unwrap_or_default();
+        let now = Instant::now();
+        // The alert only sees a fresh provider sample. A stale snapshot pauses
+        // the streak instead of pretending the machine has cooled down.
+        let fresh = snapshot
+            .updated_at
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(3));
+        let hottest = fresh
+            .then(|| {
+                snapshot
+                    .temperatures
+                    .iter()
+                    .filter_map(|t| t.celsius.filter(|v| v.is_finite()))
+                    .fold(None::<f32>, |peak, value| {
+                        Some(peak.map_or(value, |previous: f32| previous.max(value)))
+                    })
+            })
+            .flatten();
+        let rule = Threshold {
+            celsius: self.alert_celsius,
+            hold: Duration::from_secs(self.alert_hold_secs),
+            severity: self.alert_severity,
+        };
+        if self.alert.observe(hottest, now, rule) {
+            self.message = format!(
+                "{} temperature alert: at or above {:.0} °C for {}s. Advisory only.",
+                rule.severity.label(),
+                rule.celsius,
+                self.alert_hold_secs
+            );
+        }
+        // Apple-like keyboard navigation: Cmd/Ctrl+1…9 jumps between the main
+        // pages, Escape requests cancellation of the current bounded check.
+        let jump = ctx.input(|input| {
+            if !input.modifiers.command && !input.modifiers.ctrl {
+                return None;
+            }
+            [
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ]
+            .iter()
+            .position(|key| input.key_pressed(*key))
+        });
+        if let Some(index) = jump {
+            self.page = match index {
+                0 => Page::Overview,
+                1 => Page::Cpu,
+                2 => Page::Gpu,
+                3 => Page::Memory,
+                4 => Page::Storage,
+                5 => Page::Thermal,
+                6 => Page::Details,
+                7 => Page::Processes,
+                _ => Page::Reports,
+            };
+        }
+        if running
+            && !self.cancel.load(Ordering::Relaxed)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.message = "Stopping after the current work or I/O operation…".into();
+        }
         if snapshot.ready && !self.gpu_initialized {
             self.gpu_index = snapshot
                 .adapters
@@ -2283,7 +2544,7 @@ impl eframe::App for App {
                     Page::Processes => self.processes(ui, &snapshot),
                     Page::Frames => self.frames(ui),
                     Page::Tests => self.tests(ui, &snapshot, None),
-                    Page::Reports => self.reports(ui),
+                    Page::Reports => self.reports(ui, &snapshot),
                 });
         });
         if self.show_widget {
@@ -2915,9 +3176,11 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
 
 fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
+        // Clip to the tile: a long hint used to spill over the card edge and
+        // overlap the next tile and the description below.
+        let painter = ui.painter().with_clip_rect(rect.shrink(1.0));
         let fill = if selected {
             ACCENT_SOFT
         } else if response.hovered() {

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -303,10 +303,14 @@ fn mac_gpu_sources() -> Vec<Gpu> {
     Vec::new()
 }
 
+/// Publish through an `Arc` so the UI can read a batch with one atomic refcount
+/// increment instead of rebuilding a full snapshot (processes, adapters, disks)
+/// on every rendered frame.
 pub fn spawn(
-    shared: Arc<Mutex<Snapshot>>,
+    shared: Arc<Mutex<Arc<Snapshot>>>,
     stop: Arc<AtomicBool>,
     reset: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU64>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = System::new_all();
@@ -325,6 +329,7 @@ pub fn spawn(
         thread::sleep(Duration::from_millis(250));
         let nvml = init_nvml();
         while !stop.load(Ordering::Relaxed) {
+            let batch_started = Instant::now();
             // Min/max survive for the session until the user clears them.
             if reset.swap(false, Ordering::Relaxed) {
                 temp_bounds.clear();
@@ -346,8 +351,10 @@ pub fn spawn(
                 .duration_since(network_refreshed_at)
                 .as_secs_f64();
             network_refreshed_at = network_now;
-            // Recreate the list so a failed read cannot retain a prior value.
-            let components = Components::new_with_refreshed_list();
+            // Built only when the platform sensor provider is missing: on
+            // Windows this list costs a per-second WMI query and never supplies
+            // a reading anyway.
+            let mut components: Option<Components> = None;
             let mut nvidia = Vec::new();
             if let Some(nvml) = &nvml {
                 if let Ok(count) = nvml.device_count() {
@@ -408,18 +415,6 @@ pub fn spawn(
                 })
                 .collect();
             let cpu_usage = system.global_cpu_usage();
-            if std::env::var("HH_CPU_LOG").is_ok() {
-                let cores: Vec<String> = system
-                    .cpus()
-                    .iter()
-                    .map(|c| format!("{:.0}", c.cpu_usage()))
-                    .collect();
-                eprintln!(
-                    "[telemetry] global {:.1}% | cores {}",
-                    cpu_usage,
-                    cores.join(" ")
-                );
-            }
             let memory_total = system.total_memory();
             let memory_used = system.used_memory();
             let cores: Vec<f32> = system.cpus().iter().map(|c| c.cpu_usage()).collect();
@@ -465,11 +460,13 @@ pub fn spawn(
                 _ => {
                     // sysinfo reports at most a comparison temperature; a sensor
                     // reporting 0 is treated as unavailable rather than cold.
+                    let fallback =
+                        components.get_or_insert_with(Components::new_with_refreshed_list);
                     let mut counts = HashMap::<String, usize>::new();
-                    for component in components.list() {
+                    for component in fallback.list() {
                         *counts.entry(component.label().to_owned()).or_default() += 1;
                     }
-                    for (index, component) in components.list().iter().enumerate() {
+                    for (index, component) in fallback.list().iter().enumerate() {
                         let celsius = component
                             .temperature()
                             .filter(|value| value.is_finite() && *value > 0.0);
@@ -556,13 +553,18 @@ pub fn spawn(
                 ready: true,
             };
             if let Ok(mut out) = shared.lock() {
-                *out = snapshot;
+                *out = Arc::new(snapshot);
             }
-            for _ in 0..10 {
-                if stop.load(Ordering::Relaxed) {
-                    return;
+            // Measure the whole collection and sleep only for the remainder, so
+            // a slow provider cannot turn into two stacked one-second polls.
+            let period =
+                Duration::from_millis(interval_ms.load(Ordering::Relaxed).clamp(250, 5000));
+            while !stop.load(Ordering::Relaxed) {
+                let remaining = period.saturating_sub(batch_started.elapsed());
+                if remaining.is_zero() {
+                    break;
                 }
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(remaining.min(Duration::from_millis(25)));
             }
         }
     })

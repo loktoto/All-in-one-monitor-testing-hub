@@ -24,6 +24,8 @@ Linux is supported for development where an X11/graphics stack is available (the
 
 **Overview** — CPU model and load with a recent-activity chart, memory used/available, per-core load, a HWMonitor-style sensor table (**current / min / max** for every temperature sensor and fan), graphics adapters, and volume capacity with S.M.A.R.T. state and I/O counters where available. Min/max are the observed extremes since launch and can be cleared with **Reset min/max**.
 
+**Thermals / fans** — the sensor table plus a selectable temperature-history graph (min / max / average, gap-aware line segments, one-sensor CSV export), an advisory temperature alert with warning/critical severity and a configurable hold time, and a sampling-interval slider (250–5000 ms). Alerts never change fan speed, clocks or tests. **GPU** also shows wgpu adapter capabilities (backend, PCI IDs, texture/workgroup/buffer limits and optional feature count). **Reports** can export a CPU-Z/GPU-Z-style system report as text or JSON, with optional redaction of serial numbers, paths and device names. Cmd/Ctrl+1–9 switch pages and Esc cancels the current check.
+
 **Processes** — filter by process name or PID and sort by CPU or memory; per-interface network rates use received/sent byte deltas divided by the measured refresh interval. CPU percentage is relative to one logical core and can exceed 100%. Process and interface availability depend on OS permissions, and virtual interfaces can appear. No process control or GPU attribution is provided.
 
 **Frame analysis** reads a previously saved PresentMon CSV (up to 32 MiB / 500,000 rows) for exactly one process and one swap chain. It uses `DisplayedTime` or `MsBetweenDisplayChange` where available, skips missing or invalid displayed intervals, and reports average displayed FPS, slowest 1% FPS and the 99th percentile frame time. The slowest 1% is the reciprocal of the mean of the longest 1% of valid intervals, rounded up. Optional mean CPU/GPU busy times use only rows that provide values. PresentMon capture is Windows-specific; Hardware Hub does not run it or capture game performance itself. See [PresentMon CSV definitions](https://github.com/GameTechDev/PresentMon/blob/main/README-ConsoleApplication.md#csv-columns).
@@ -39,10 +41,10 @@ The chart keeps at most 60 distinct, recent collection batches; missing or delay
 | Area | macOS source | Windows / Linux source |
 | --- | --- | --- |
 | System (model, OS, kernel, firmware, uptime, battery, board ID) | `sysctl`, `system_profiler SPHardwareDataType`, `pmset` | Windows: CIM (`Win32_ComputerSystem`, `Win32_BIOS`, `Win32_BaseBoard`, `Win32_Battery`). Linux: `sysinfo`, these fields unavailable |
-| Processor (vendor, architecture, physical/logical cores, P/E cores, clocks, L1/L2/L3, cache line, SMT) | `sysctl` (`hw.*`, `machdep.cpu.*`) | Windows: `sysinfo` + `Win32_Processor` (rated clock, L2/L3; no L1). Linux: `sysinfo`, caches unavailable |
-| Memory (modules with size, type, speed, manufacturer, part number, ECC, upgradability) | `system_profiler SPMemoryDataType` | Windows: `Win32_PhysicalMemory`. Linux: total only |
-| Graphics (adapter, backend, driver, vendor/device ID, reported VRAM and API) | `wgpu` + `system_profiler SPDisplaysDataType` | `wgpu` |
-| Storage health (protocol, solid state, S.M.A.R.T. state per volume, drive model, firmware, link, TRIM) | `diskutil info`, `system_profiler SPNVMeDataType` | Windows: `Get-PhysicalDisk`, `Get-StorageReliabilityCounter` and `Get-Volume` report model, firmware, bus, OS health, temperature and wear. Linux: unavailable |
+| Processor (vendor, architecture, socket, stepping, physical/logical cores, P/E cores, clocks, L1/L2/L3, cache line, SMT) | `sysctl` (`hw.*`, `machdep.cpu.*`) | Windows: `sysinfo` + `Win32_Processor` (socket, stepping, rated clock, L2/L3; no L1). Linux: `sysinfo`, caches unavailable |
+| Memory (modules with slot, size, type, rated and configured speed, form factor, manufacturer, part number, serial, ECC, upgradability) | `system_profiler SPMemoryDataType` | Windows: `Win32_PhysicalMemory`. Linux: total only |
+| Graphics (adapter, backend, driver and driver date, vendor/device ID, reported VRAM, API, current display mode) | `wgpu` + `system_profiler SPDisplaysDataType` | `wgpu`; Windows also reads `Win32_VideoController` for the OS driver and display mode |
+| Storage health (protocol, solid state, S.M.A.R.T. state per volume, drive model, firmware, serial, link, TRIM) | `diskutil info`, `system_profiler SPNVMeDataType` | Windows: the `MSFT_PhysicalDisk` CIM class, `Win32_DiskDrive` and `Get-Volume` report model, firmware, bus, solid state, OS health and volume state; drive temperature and wear counters are refused to a standard user and are not read. Linux: unavailable |
 
 Anything the platform does not expose is listed under **Not available** rather than estimated.
 
@@ -73,6 +75,7 @@ Reports contain test type, status, verified work when known, settings, system co
 cargo fmt --check
 cargo test
 cargo run --example smoke  # bounded local CPU / 1 MiB RAM / 1 MiB file checks
+cargo run --release --example perf  # micro-profile of the UI read path
 cargo run
 ```
 
@@ -84,7 +87,7 @@ CI builds and tests on Windows and macOS and publishes each release executable a
 
 macOS 的顯示卡使用 Metal；磁碟健康、記憶體模組與電池資訊來自 `diskutil`、`system_profiler`、`sysctl` 與 `pmset`，全部為唯讀指令且不連網。平台未提供的項目會列在 **Not available**，不會以估計值取代。
 
-感測器表直接讀取 AppleSMC（同 HWMonitor 類工具的做法），因此可取得 CPU、GPU、電池、記憶體、散熱器等 16 個左右溫度感測器，每個都顯示**目前 / 最低 / 最高**，並可隨時按 **Reset min/max** 清除。最低／最高只是程式執行期間觀察到的極值，不是規格值，也不會跨次啟動保留。風扇只在韌體提供 `F0Ac` 類 key 時顯示；本機只提供風扇數量而無單一風扇 key，因此不會顯示 0 RPM。電壓與瓦數雖然 SMC 有 key，但各機型定義不同，故不顯示而不亂填。NVIDIA NVML 僅在 Windows／Linux 載入，且**沒有過熱自動停止**功能。
+感測器表直接讀取 AppleSMC（同 HWMonitor 類工具的做法），因此可取得 CPU、GPU、電池、記憶體、散熱器等 16 個左右溫度感測器，每個都顯示**目前 / 最低 / 最高**，並可隨時按 **Reset min/max** 清除。**Thermals / fans** 頁面另有可切換的溫度歷史圖、單一感測器 CSV 匯出、持續高溫警告（只提示，不會自動停機或改風速），以及 250–5000 ms 取樣間隔。**Reports** 可滙出 CPU-Z／GPU-Z 風格的系統報告（文字或 JSON，可遮蔽序號與路徑）。最低／最高只是程式執行期間觀察到的極值，不是規格值，也不會跨次啟動保留。風扇只在韌體提供 `F0Ac` 類 key 時顯示；本機只提供風扇數量而無單一風扇 key，因此不會顯示 0 RPM。電壓與瓦數雖然 SMC 有 key，但各機型定義不同，故不顯示而不亂填。NVIDIA NVML 僅在 Windows／Linux 載入，且**沒有過熱自動停止**功能。
 
 測試有時間與資源上限。磁碟測試只建立獨立暫存檔並驗證讀回資料，可設定總寫入上限（預設 64 MiB，最多 1 GiB），但仍會造成 SSD 耗損；異常斷電可能留下暫存檔。停止可能需等待目前的磁碟或 GPU 操作完成。結果可從 Reports 匯出，未匯出的結果會在程式結束時消失。
 
@@ -96,3 +99,4 @@ macOS 的顯示卡使用 Metal；磁碟健康、記憶體模組與電池資訊�
 - [去重能力目錄與現有版本落差](docs/research/02-capability-catalog.zh-Hant.md)
 - [優先路線圖、可行性及介面規格](docs/research/03-roadmap-and-ux.zh-Hant.md)
 - [監控軟件優點彙整：HWiNFO／HWMonitor／CAM／Afterburner／PresentMon／CPU-Z／GPU-Z／CrystalDiskInfo／工作管理員／PowerToys](docs/research/04-monitor-app-advantages.zh-Hant.md)
+- [2026 mainstream monitor study and implemented gap analysis](docs/research/05-mainstream-2026-gap-analysis.md)

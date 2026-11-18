@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod frames;
 pub mod history;
 pub mod logging;
@@ -7,4 +8,5 @@ pub mod sensors;
 pub mod smart;
 pub mod specs;
 pub mod stress;
+pub mod system_report;
 pub mod telemetry;

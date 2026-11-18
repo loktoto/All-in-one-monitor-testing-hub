@@ -17,6 +17,8 @@ pub struct Sample {
     pub cpu: Option<f64>,
     pub memory: Option<f64>,
     pub cores: Vec<Option<f64>>,
+    /// Provider key and value for each temperature seen in this batch.
+    pub temperatures: Vec<(String, Option<f64>)>,
 }
 
 #[derive(Default)]
@@ -49,6 +51,16 @@ impl History {
                 .cores
                 .iter()
                 .map(|v| v.is_finite().then_some(*v as f64))
+                .collect(),
+            temperatures: snapshot
+                .temperatures
+                .iter()
+                .map(|t| {
+                    (
+                        t.key.clone(),
+                        t.celsius.filter(|v| v.is_finite()).map(f64::from),
+                    )
+                })
                 .collect(),
         });
         if self.samples.len() > LIMIT {
@@ -132,9 +144,70 @@ pub fn range(history: &History, value: impl Fn(&Sample) -> Option<f64>) -> Optio
     ))
 }
 
+/// Sensor keys in first-seen order, so a graph appears without configuration.
+pub fn temperature_keys(history: &History) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for sample in history.samples() {
+        for (key, _) in &sample.temperatures {
+            if !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    keys
+}
+
+pub fn temperature_value<'a>(sample: &'a Sample, key: &str) -> Option<f64> {
+    sample
+        .temperatures
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .and_then(|(_, value)| *value)
+}
+
+/// CSV for one selected sensor. Sensor keys are quoted when required; a gap is
+/// left blank rather than connected or filled with zero.
+pub fn export_sensor_csv(
+    path: &Path,
+    history: &History,
+    key: &str,
+    origin: Instant,
+) -> Result<(), String> {
+    if history.is_empty() {
+        return Err("No history samples to export.".into());
+    }
+    let mut data = String::from("elapsed_seconds,sensor,celsius\n");
+    for sample in history.samples() {
+        let value = temperature_value(sample, key)
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_default();
+        data.push_str(&format!(
+            "{:.3},{},{value}\n",
+            sample.at.saturating_duration_since(origin).as_secs_f64(),
+            csv_field(key),
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("Cannot create sensor history file: {e}"))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("Sensor history write failed; a partial file may remain: {e}"))
+}
+
+fn csv_field(text: &str) -> String {
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::Temperature;
     fn snapshot(at: Instant) -> Snapshot {
         Snapshot {
             ready: true,
@@ -206,6 +279,61 @@ mod tests {
         );
         assert!(export_csv(&path, &history, now).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sensor_history_keeps_missing_values_and_exports_one_sensor() {
+        let now = Instant::now();
+        let mut history = History::default();
+        let mut sample = snapshot(now);
+        sample.temperatures.push(Temperature {
+            key: "TC0P".into(),
+            label: "CPU".into(),
+            celsius: Some(61.5),
+            min: None,
+            max: None,
+        });
+        sample.temperatures.push(Temperature {
+            key: "TCSF".into(),
+            label: "Skin".into(),
+            celsius: Some(40.0),
+            min: None,
+            max: None,
+        });
+        history.record(&sample, now);
+        let mut later = snapshot(now + Duration::from_secs(1));
+        later.temperatures.push(Temperature {
+            key: "TC0P".into(),
+            label: "CPU".into(),
+            celsius: None,
+            min: None,
+            max: None,
+        });
+        history.record(&later, now + Duration::from_secs(1));
+        assert_eq!(temperature_keys(&history), vec!["TC0P", "TCSF"]);
+        assert_eq!(
+            segments(&history, now, |s| temperature_value(s, "TC0P")).len(),
+            1
+        );
+        assert_eq!(
+            range(&history, |s| temperature_value(s, "TC0P")),
+            Some((61.5, 61.5, 61.5))
+        );
+        let path = std::env::temp_dir().join(format!(
+            "hardware-hub-sensor-history-{}-{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        export_sensor_csv(&path, &history, "TC0P", now).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap(),
+            "elapsed_seconds,sensor,celsius\n0.000,TC0P,61.500\n1.000,TC0P,\n"
+        );
+        assert!(export_sensor_csv(&path, &history, "TC0P", now).is_err());
         std::fs::remove_file(path).unwrap();
     }
 

@@ -23,6 +23,9 @@ pub struct CpuSpec {
     pub efficiency_cores: Option<u32>,
     pub base_mhz: Option<u64>,
     pub max_mhz: Option<u64>,
+    /// Package and stepping identifiers, CPU-Z style.
+    pub socket: String,
+    pub stepping: String,
     pub l1_instruction_bytes: Option<u64>,
     pub l1_data_bytes: Option<u64>,
     pub l2_bytes: Option<u64>,
@@ -38,6 +41,10 @@ pub struct MemoryModule {
     pub speed_mhz: Option<u64>,
     pub manufacturer: String,
     pub part_number: String,
+    pub serial: String,
+    /// Speed the firmware actually configured, which can differ from the rating.
+    pub configured_mhz: Option<u64>,
+    pub form_factor: String,
 }
 
 #[derive(Clone, Default)]
@@ -68,6 +75,7 @@ pub struct DriveSpec {
     pub link: String,
     pub trim: Option<bool>,
     pub smart: String,
+    pub serial: String,
     pub capacity_bytes: Option<u64>,
 }
 
@@ -104,6 +112,10 @@ pub struct SystemSpecs {
     pub drives: Vec<DriveSpec>,
     pub volumes: Vec<VolumeHealth>,
     pub battery: Option<String>,
+    /// OS-reported graphics driver build and current display mode.
+    pub gpu_driver: String,
+    pub gpu_driver_date: String,
+    pub display: String,
     pub bluetooth: Option<BluetoothSpec>,
     pub wifi_interface: Option<String>,
     /// Where these values came from, shown so nothing looks authoritative by default.
@@ -406,12 +418,32 @@ $cs = Get-CimInstance Win32_ComputerSystem
 $bios = Get-CimInstance Win32_BIOS
 $board = Get-CimInstance Win32_BaseBoard
 $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$gpu = Get-CimInstance Win32_VideoController | Select-Object -First 1
 $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
-$mem = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object { [pscustomobject]@{ slot = [string]$_.DeviceLocator; size = [uint64]$_.Capacity; type = [uint64]$_.SMBIOSMemoryType; speed = [uint64]$_.Speed; manufacturer = [string]$_.Manufacturer; part = [string]$_.PartNumber } })
+$mem = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+  $form = switch ("$($_.FormFactor)") { '8' { 'DIMM' } '12' { 'SODIMM' } '13' { 'SRIMM' } '14' { 'SMDIMM' } default { '' } }
+  [pscustomobject]@{ slot = [string]$_.DeviceLocator; size = [uint64]$_.Capacity; type = [uint64]$_.SMBIOSMemoryType; speed = [uint64]$_.Speed; configured = [uint64]$_.ConfiguredClockSpeed; manufacturer = [string]$_.Manufacturer; part = [string]$_.PartNumber; serial = [string]$_.SerialNumber; form = $form }
+})
 $volumes = @(Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { [pscustomobject]@{ letter = [string]$_.DriveLetter; fs = [string]$_.FileSystem; health = [string]$_.HealthStatus; size = [uint64]$_.Size; free = [uint64]$_.SizeRemaining } })
-$disks = @(Get-PhysicalDisk | ForEach-Object { [pscustomobject]@{ model = [string]$_.FriendlyName; media = [string]$_.MediaType; bus = [string]$_.BusType; health = [string]$_.HealthStatus; size = [uint64]$_.Size } })
-$reliability = @(Get-PhysicalDisk | Get-StorageReliabilityCounter | ForEach-Object { [pscustomobject]@{ device = [string]$_.DeviceId; temperature = $_.Temperature; wear = $_.Wear; power_hours = $_.PowerOnHours; read_errors = $_.ReadErrorsTotal; write_errors = $_.WriteErrorsTotal } })
-$diskdrives = @(Get-CimInstance Win32_DiskDrive | ForEach-Object { [pscustomobject]@{ model = [string]$_.Model; firmware = [string]$_.FirmwareRevision; interface = [string]$_.InterfaceType; size = [uint64]$_.Size } })
+# The Storage cmdlets (Get-PhysicalDisk, Get-StorageReliabilityCounter) take
+# about 12 s on a typical laptop and the reliability counters are refused to
+# standard users, so the same inventory comes from the CIM class directly.
+$phys = @(Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_PhysicalDisk)
+# Loading the Storage module (Get-Volume above) rewrites these as friendly
+# strings, while a bare CIM query returns the numeric codes; accept both.
+$disks = @($phys | ForEach-Object {
+  $name = [string]$_.FriendlyName
+  $size = [uint64]$_.Size
+  $media = "$($_.MediaType)"
+  switch ($media) { '3' { $media = 'HDD' } '4' { $media = 'SSD' } '5' { $media = 'SCM' } }
+  $bus = "$($_.BusType)"
+  switch ($bus) { '3' { $bus = 'ATA' } '7' { $bus = 'USB' } '8' { $bus = 'RAID' } '10' { $bus = 'SAS' } '11' { $bus = 'SATA' } '12' { $bus = 'SD' } '17' { $bus = 'NVMe' } }
+  $health = "$($_.HealthStatus)"
+  switch ($health) { '0' { $health = 'Healthy' } '1' { $health = 'Warning' } '2' { $health = 'Unhealthy' } }
+  [pscustomobject]@{ model = $name; media = $media; bus = $bus; health = $health; size = $size }
+})
+$reliability = @()
+$diskdrives = @(Get-CimInstance Win32_DiskDrive | ForEach-Object { [pscustomobject]@{ model = [string]$_.Model; firmware = [string]$_.FirmwareRevision; serial = [string]$_.SerialNumber; interface = [string]$_.InterfaceType; size = [uint64]$_.Size } })
 $network = @(Get-NetAdapter | ForEach-Object { [pscustomobject]@{ name = [string]$_.Name; description = [string]$_.InterfaceDescription; media = [string]$_.PhysicalMediaType; status = [string]$_.Status; speed = [string]$_.LinkSpeed } })
 $bluetooth = @(Get-PnpDevice -Class Bluetooth | ForEach-Object { [pscustomobject]@{ name = [string]$_.FriendlyName; status = [string]$_.Status } })
 $battery = if ($bat) { [pscustomobject]@{ name = [string]$bat.Name; charge = $bat.EstimatedChargeRemaining; status = $bat.BatteryStatus } } else { $null }
@@ -428,6 +460,11 @@ $battery = if ($bat) { [pscustomobject]@{ name = [string]$bat.Name; charge = $ba
   cpu_max_clock = [uint64]$cpu.MaxClockSpeed
   cpu_l2_kb = [uint64]$cpu.L2CacheSize
   cpu_l3_kb = [uint64]$cpu.L3CacheSize
+  cpu_socket = [string]$cpu.SocketDesignation
+  cpu_stepping = [string]$cpu.Stepping
+  gpu_driver = [string]$gpu.DriverVersion
+  gpu_driver_date = [string]$gpu.DriverDate
+  display = if ($gpu.CurrentHorizontalResolution -and $gpu.CurrentVerticalResolution) { "$($gpu.CurrentHorizontalResolution)x$($gpu.CurrentVerticalResolution)" + $(if ($gpu.CurrentRefreshRate) { " @ $($gpu.CurrentRefreshRate) Hz" } else { '' }) } else { '' }
   battery = $battery
   memory = $mem
   volumes = $volumes
@@ -447,12 +484,15 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
 "#;
 
     pub fn collect() -> SystemSpecs {
+        // PowerShell start-up alone costs a couple of seconds here, so the
+        // query overlaps the sysinfo pass instead of following it.
+        let pending = std::thread::spawn(|| query(SCRIPT));
         let mut specs = super::portable::collect();
         specs.sources = "sysinfo · Windows CIM/WMI (read-only)".into();
         if !specs.kernel.is_empty() {
             specs.kernel = format!("build {}", specs.kernel);
         }
-        if let Some(value) = query(SCRIPT) {
+        if let Some(value) = pending.join().ok().flatten() {
             apply(&mut specs, &value);
         }
         specs.unavailable.clear();
@@ -469,6 +509,10 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
         specs
             .unavailable
             .push("L1 cache and cache-line sizes are not read on Windows in this build.".into());
+        specs.unavailable.push(
+            "Drive temperature and wear counters are not read on Windows; the storage provider refuses them to a standard user."
+                .into(),
+        );
         specs.unavailable.push(
             "Temperature comes from the firmware's ACPI thermal zones (Thermal Zone Information performance counters, or the WMI class when elevated). Per-core CPU temperature needs a kernel driver and is not read."
                 .into(),
@@ -606,6 +650,16 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
             specs.cpu.base_mhz = Some(mhz);
             specs.cpu.max_mhz = None;
         }
+        specs.cpu.socket = text(v.get("cpu_socket"));
+        specs.cpu.stepping = text(v.get("cpu_stepping"));
+        specs.gpu_driver = text(v.get("gpu_driver"));
+        let driver_date = text(v.get("gpu_driver_date"));
+        specs.gpu_driver_date = if driver_date.is_empty() {
+            String::new()
+        } else {
+            cim_date(&driver_date)
+        };
+        specs.display = text(v.get("display"));
 
         if let Some(modules) = v.get("memory").and_then(Value::as_array) {
             for module in modules {
@@ -630,6 +684,17 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                         .filter(|speed| *speed > 0),
                     manufacturer: text(module.get("manufacturer")),
                     part_number: text(module.get("part")),
+                    // Firmware often reports an all-zero placeholder.
+                    serial: text(module.get("serial"))
+                        .chars()
+                        .any(|c| c.is_ascii_alphanumeric() && c != '0')
+                        .then(|| text(module.get("serial")))
+                        .unwrap_or_default(),
+                    configured_mhz: module
+                        .get("configured")
+                        .and_then(Value::as_u64)
+                        .filter(|speed| *speed > 0),
+                    form_factor: text(module.get("form")),
                 });
             }
         }
@@ -718,10 +783,14 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                     smart.push_str(&extras.join(" · "));
                 }
             }
-            let firmware = diskdrives
+            let matched = diskdrives
                 .iter()
-                .find(|drive| text(drive.get("model")) == model)
+                .find(|drive| text(drive.get("model")) == model);
+            let firmware = matched
                 .map(|drive| text(drive.get("firmware")))
+                .unwrap_or_default();
+            let serial = matched
+                .map(|drive| text(drive.get("serial")))
                 .unwrap_or_default();
             specs.drives.push(DriveSpec {
                 model,
@@ -730,6 +799,7 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                 link: text(disk.get("media")),
                 trim: None,
                 smart,
+                serial,
                 capacity_bytes: disk
                     .get("size")
                     .and_then(Value::as_u64)

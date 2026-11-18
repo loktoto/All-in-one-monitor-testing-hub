@@ -7,7 +7,7 @@ use hardware_hub::{
 use std::{
     fs,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -20,10 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
     fs::create_dir(&root)?;
-    let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+    let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
     let stop = Arc::new(AtomicBool::new(false));
     let reset = Arc::new(AtomicBool::new(false));
-    let telemetry = telemetry::spawn(snapshot.clone(), stop.clone(), reset.clone());
+    let interval = Arc::new(AtomicU64::new(1000));
+    let telemetry = telemetry::spawn(
+        snapshot.clone(),
+        stop.clone(),
+        reset.clone(),
+        interval.clone(),
+    );
     let until = Instant::now() + Duration::from_secs(20);
     while !snapshot.lock().unwrap().ready && Instant::now() < until {
         thread::sleep(Duration::from_millis(50));
