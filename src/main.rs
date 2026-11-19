@@ -376,30 +376,21 @@ impl App {
                     .frame(egui::Frame::NONE)
                     .show_inside(ui, |ui| {
                         ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(
-                                "Readings are best effort and never leave this computer.",
-                            )
-                            .size(10.5)
-                            .color(MUTED),
-                        );
+                        // One compact line: local-only reassurance plus the
+                        // graphics provider, so the footer never crowds the
+                        // taskbar when a run adds status rows above it.
+                        let backend = if s.adapters.is_empty() {
+                            "local readings only".to_string()
+                        } else {
+                            format!("local only · wgpu · {}", s.gpu_backend)
+                        };
+                        ui.label(RichText::new(backend).size(10.0).color(MUTED));
                         ui.label(
                             RichText::new("⌘/Ctrl 1–9: pages · Esc: stop check")
                                 .size(10.0)
                                 .color(MUTED),
                         );
-                        ui.add_space(8.0);
-                        if !s.adapters.is_empty() {
-                            ui.label(
-                                RichText::new(format!(
-                                    "wgpu · {}  ·  {} adapter(s)",
-                                    s.gpu_backend,
-                                    s.adapters.len()
-                                ))
-                                .size(10.5)
-                                .color(MUTED),
-                            );
-                        }
+                        ui.add_space(6.0);
                     });
                 egui::TopBottomPanel::bottom("nav-controls")
                     .frame(egui::Frame::NONE)
@@ -430,21 +421,22 @@ impl App {
                             .map(|state| state.running)
                             .unwrap_or(false);
                         if running {
-                            ui.colored_label(
-                                ACCENT,
-                                if self.cancel.load(Ordering::Relaxed) {
-                                    "Stopping check…"
-                                } else {
-                                    "Check running"
-                                },
-                            );
-                            if !self.cancel.load(Ordering::Relaxed)
-                                && ui.button("Stop check").clicked()
-                            {
-                                self.cancel.store(true, Ordering::Relaxed);
-                                self.message =
-                                    "Stopping after the current work or I/O operation…".into();
-                            }
+                            let stopping = self.cancel.load(Ordering::Relaxed);
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    ACCENT,
+                                    if stopping {
+                                        "Stopping…"
+                                    } else {
+                                        "Check running"
+                                    },
+                                );
+                                if !stopping && ui.small_button("Stop").clicked() {
+                                    self.cancel.store(true, Ordering::Relaxed);
+                                    self.message =
+                                        "Stopping after the current work or I/O operation…".into();
+                                }
+                            });
                         }
                     });
                 egui::ScrollArea::vertical()
@@ -4115,20 +4107,32 @@ fn error_details(ui: &mut egui::Ui, errors: &[ErrorDetail], total: u64) {
 /// enough that a person should notice it before starting a test.
 fn callout(ui: &mut egui::Ui, tone: Color32, title: &str, body: &str) {
     let frame = egui::Frame {
-        fill: Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 24),
+        fill: Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 22),
         stroke: Stroke::new(
             1.0_f32,
-            Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 84),
+            Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 78),
         ),
         corner_radius: CornerRadius::same(10),
-        inner_margin: egui::Margin::symmetric(12, 10),
+        inner_margin: egui::Margin {
+            left: 16,
+            right: 12,
+            top: 10,
+            bottom: 10,
+        },
         ..Default::default()
     };
-    frame.show(ui, |ui| {
+    // Draw a slim accent bar in the panel's tone; the label stays high-contrast
+    // so even a muted callout reads clearly against the tinted background.
+    let response = frame.show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new(title).size(11.5).strong().color(tone));
+        ui.label(RichText::new(title).size(11.5).strong().color(TEXT));
         ui.label(RichText::new(body).size(10.5).color(TEXT_DIM));
     });
+    let bar = egui::Rect::from_min_size(
+        response.response.rect.left_top() + egui::vec2(4.0, 10.0),
+        egui::vec2(2.5, (response.response.rect.height() - 20.0).max(8.0)),
+    );
+    ui.painter().rect_filled(bar, CornerRadius::same(2), tone);
 }
 
 fn status_color(status: &Status) -> Color32 {
