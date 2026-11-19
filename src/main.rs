@@ -76,6 +76,7 @@ enum Page {
     Storage,
     Thermal,
     Motherboard,
+    Drivers,
     Network,
     Bluetooth,
     Details,
@@ -94,7 +95,8 @@ impl Page {
             Page::Memory => "Memory",
             Page::Storage => "Storage",
             Page::Thermal => "Thermals / fans",
-            Page::Motherboard => "Motherboard",
+            Page::Motherboard => "Parts & board",
+            Page::Drivers => "Drivers",
             Page::Network => "Network / Wi-Fi",
             Page::Bluetooth => "Bluetooth",
             Page::Details => "Details",
@@ -125,7 +127,8 @@ impl Page {
             Page::Thermal => {
                 "Available sensors, live temperature history, sampling and advisory alerts."
             }
-            Page::Motherboard => "System identification and available board-related information.",
+            Page::Motherboard => "Mainboard, BIOS, attached displays and network adapters.",
+            Page::Drivers => "Installed hardware drivers as reported by the OS driver store.",
             Page::Network => "Network interfaces and operating-system traffic counters.",
             Page::Bluetooth => "Bluetooth availability and supported diagnostics.",
             Page::Details => "Specification sheet read once from local OS sources.",
@@ -133,7 +136,9 @@ impl Page {
             Page::Frames => {
                 "Inspect a saved PresentMon capture; no live game capture is performed."
             }
-            Page::Tests => "One bounded check at a time. These are not benchmarks.",
+            Page::Tests => {
+                "One bounded check at a time, with live load and peak temperature. Not benchmarks."
+            }
             Page::Reports => "Session results. Nothing leaves this window until you export.",
         }
     }
@@ -150,6 +155,9 @@ fn initial_page() -> Page {
     match std::env::var("HH_START_PAGE").as_deref() {
         Ok("details") => Page::Details,
         Ok("cpu") => Page::Cpu,
+        Ok("gpu") => Page::Gpu,
+        Ok("memory") => Page::Memory,
+        Ok("drivers") => Page::Drivers,
         Ok("tests") => Page::Tests,
         _ => Page::Overview,
     }
@@ -166,6 +174,9 @@ struct App {
     stats_reset: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<State>>,
+    /// Highest temperature observed during the current stress run, for the
+    /// live safety readout. Cleared whenever a new check starts.
+    run_peak_c: Option<f32>,
     kind: Kind,
     seconds: u64,
     workers: usize,
@@ -183,6 +194,8 @@ struct App {
     recorder: Option<Recorder>,
     process_query: String,
     process_sort_memory: bool,
+    driver_query: String,
+    driver_class: String,
     bluetooth_refresh: Arc<Mutex<BluetoothRefresh>>,
     network_target: String,
     network_message: String,
@@ -242,6 +255,7 @@ impl App {
             stats_reset,
             cancel: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(State::default())),
+            run_peak_c: None,
             kind: Kind::Cpu,
             seconds: 15,
             workers: std::thread::available_parallelism()
@@ -261,6 +275,8 @@ impl App {
             recorder: None,
             process_query: String::new(),
             process_sort_memory: false,
+            driver_query: String::new(),
+            driver_class: "All".into(),
             bluetooth_refresh: Arc::new(Mutex::new(BluetoothRefresh::default())),
             network_target: String::new(),
             network_message: String::new(),
@@ -429,6 +445,7 @@ impl App {
                             Page::Storage,
                             Page::Thermal,
                             Page::Motherboard,
+                            Page::Drivers,
                             Page::Network,
                             Page::Bluetooth,
                         ] {
@@ -745,13 +762,15 @@ impl App {
                 empty_note(ui, "This provider does not report per-core usage.");
             } else {
                 let width = ui.available_width();
-                let columns = ((width / 168.0).floor() as usize).clamp(1, 6);
+                let columns = ((width / 190.0).floor() as usize).clamp(1, 6);
+                let cell = ((width - 10.0 * columns.saturating_sub(1) as f32) / columns as f32)
+                    .clamp(120.0, 180.0);
                 egui::Grid::new("cores")
                     .num_columns(columns)
                     .spacing([10.0, 6.0])
                     .show(ui, |ui| {
                         for (i, usage) in s.cores.iter().enumerate() {
-                            core_meter(ui, i, *usage);
+                            core_meter(ui, i, *usage, cell);
                             if (i + 1) % columns == 0 {
                                 ui.end_row();
                             }
@@ -975,18 +994,81 @@ impl App {
                     else { ui.label(format!("Current: {:.0}% · {} logical cores", snapshot.cpu_usage, snapshot.cores.len())); }
                     if let (Some(min), Some(max)) = (snapshot.cpu_range.min, snapshot.cpu_range.max) { ui.weak(format!("Observed since reset: {min:.0}% min · {max:.0}% max")); }
                     ui.label(&snapshot.cpu_name);
-                    if let Some(specs) = &specs {
-                        ui.weak(format!("{} · {} · {} physical / {} logical cores", specs.cpu.vendor, specs.cpu.architecture, specs.cpu.physical_cores.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()), specs.cpu.logical_cores.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())));
-                        if let Some(cache) = specs.cpu.l3_bytes { ui.weak(format!("L3 cache: {}", bytes(cache))); }
+                    ui.add_space(8.0);
+                    if snapshot.cores.is_empty() {
+                        empty_note(ui, "This provider does not report per-core usage.");
+                    } else {
+                        let width = ui.available_width();
+                        let columns = ((width / 190.0).floor() as usize).clamp(1, 6);
+                        let cell = ((width - 10.0 * columns.saturating_sub(1) as f32)
+                            / columns as f32)
+                            .clamp(120.0, 180.0);
+                        egui::Grid::new("cpu-page-cores")
+                            .num_columns(columns)
+                            .spacing([10.0, 6.0])
+                            .show(ui, |ui| {
+                                for (i, usage) in snapshot.cores.iter().enumerate() {
+                                    core_meter(ui, i, *usage, cell);
+                                    if (i + 1) % columns == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
                     }
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| { for (i, v) in snapshot.cores.iter().enumerate() { ui.label(format!("Core {i}: {v:.0}%")); } });
                     egui::CollapsingHeader::new("Recent CPU activity").show(ui, |ui| {
                         Plot::new("cpu-page-history").height(120.0).include_y(0.0).include_y(100.0).allow_drag(false).allow_zoom(false).allow_scroll(false).show_x(false).show(ui, |plot| {
                             for points in history::segments(&self.history, self.started, |sample| sample.cpu) { plot.line(Line::new(PlotPoints::from(points)).color(ACCENT)); }
                         });
                         ui.weak("Up to 60 batches; gaps mean missing or delayed readings.");
                     });
+
+                    ui.add_space(14.0);
+                    section_title(ui, "Specifications", Some("CPU-Z style identity, clocks and caches"));
+                    match &specs {
+                        Some(specs) => {
+                            let cpu = &specs.cpu;
+                            let mut rows: Vec<(String, String)> = Vec::new();
+                            spec_row(&mut rows, "Name", cpu.name.as_str());
+                            spec_row(&mut rows, "Vendor", vendor_text(&cpu.vendor));
+                            spec_row(&mut rows, "Architecture", cpu.architecture.as_str());
+                            spec_row(&mut rows, "Family / description", cpu.description.as_str());
+                            spec_row(&mut rows, "Socket", cpu.socket.as_str());
+                            spec_row(&mut rows, "Stepping", cpu.stepping.as_str());
+                            match (cpu.physical_cores, cpu.logical_cores) {
+                                (Some(physical), Some(logical)) => spec_row(&mut rows, "Cores / threads", format!("{physical} cores · {logical} threads")),
+                                (None, Some(logical)) => spec_row(&mut rows, "Threads", logical.to_string()),
+                                (Some(physical), None) => spec_row(&mut rows, "Cores", physical.to_string()),
+                                (None, None) => {}
+                            }
+                            if cpu.logical_cores.is_some() && cpu.physical_cores.is_some_and(|physical| cpu.logical_cores.unwrap_or(0) > physical) {
+                                spec_row(&mut rows, "Simultaneous threading", "Enabled");
+                            }
+                            if let Some(cores) = cpu.performance_cores { spec_row(&mut rows, "Performance cores", cores.to_string()); }
+                            if let Some(cores) = cpu.efficiency_cores { spec_row(&mut rows, "Efficiency cores", cores.to_string()); }
+                            if let Some(mhz) = cpu.base_mhz { spec_row(&mut rows, "Base clock", clock_text(mhz)); }
+                            if let Some(mhz) = cpu.max_mhz { spec_row(&mut rows, "Max clock", clock_text(mhz)); }
+                            if let Some(mhz) = cpu.current_mhz { spec_row(&mut rows, "Clock at collection", clock_text(mhz)); }
+                            if let Some(value) = cpu.l1_data_bytes { spec_row(&mut rows, "L1 data cache", bytes(value)); }
+                            if let Some(value) = cpu.l1_instruction_bytes { spec_row(&mut rows, "L1 instruction cache", bytes(value)); }
+                            if let Some(value) = cpu.l2_bytes { spec_row(&mut rows, "L2 cache", bytes(value)); }
+                            if let Some(value) = cpu.l3_bytes { spec_row(&mut rows, "L3 cache", bytes(value)); }
+                            if let Some(value) = cpu.cache_line_bytes { spec_row(&mut rows, "Cache line", bytes(value)); }
+                            spec_row(&mut rows, "Instruction sets", cpu.instructions.as_str());
+                            if let Some(enabled) = cpu.virtualization {
+                                spec_row(&mut rows, "Virtualization", if enabled { "Enabled in firmware" } else { "Not enabled" });
+                            }
+                            spec_row(&mut rows, "Processor ID", cpu.processor_id.as_str());
+                            spec_grid(ui, "cpu-page-specs", &rows);
+                            ui.weak("Values are OS-reported. Clocks move with load; cache sizes and identifiers are static.");
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("Reading the processor inventory…").size(11.0).color(MUTED));
+                            });
+                        }
+                    }
+
                     let sensors: Vec<_> = snapshot.temperatures.iter().filter(|t| t.label.to_lowercase().contains("cpu")).collect();
                     if !sensors.is_empty() {
                         ui.add_space(8.0);
@@ -1002,38 +1084,125 @@ impl App {
                     if snapshot.gpus.is_empty() { ui.weak("No graphics source reported."); }
                     for gpu in &snapshot.gpus { ui.strong(&gpu.name); ui.label(&gpu.detail); ui.add_space(4.0); }
                     ui.weak("Sources may overlap; IORegistry and name-based matches do not prove adapter identity.");
+
+                    match &specs {
+                        Some(specs) if !specs.graphics.is_empty() => {
+                            for (index, gpu) in specs.graphics.iter().enumerate() {
+                                ui.add_space(14.0);
+                                section_title(ui, &format!("Adapter {} · {}", index + 1, gpu.name), Some("GPU-Z style · OS-reported"));
+                                let mut rows: Vec<(String, String)> = Vec::new();
+                                spec_row(&mut rows, "Vendor", gpu.vendor.as_str());
+                                spec_row(&mut rows, "Chipset", gpu.chipset.as_str());
+                                spec_row(&mut rows, "PCI vendor:device", gpu.device_id.as_str());
+                                spec_row(&mut rows, "Bus location", gpu.bus.as_str());
+                                if let Some(vram) = gpu.vram_bytes {
+                                    spec_row(&mut rows, "Dedicated memory (reported)", decimal_bytes(vram));
+                                }
+                                spec_row(&mut rows, "Driver", gpu.driver.as_str());
+                                spec_row(&mut rows, "Driver date", gpu.driver_date.as_str());
+                                spec_row(&mut rows, "Video BIOS", gpu.bios.as_str());
+                                spec_row(&mut rows, "BIOS date", gpu.bios_date.as_str());
+                                spec_row(&mut rows, "Display mode", gpu.current_mode.as_str());
+                                spec_row(&mut rows, "Refresh rate", gpu.refresh.as_str());
+                                spec_row(&mut rows, "Status", gpu.status.as_str());
+                                spec_grid(ui, &format!("gpu-page-spec-{index}"), &rows);
+                            }
+                            ui.weak("Video BIOS and dedicated memory come from the installed display driver. PCIe link width and GPU clocks need a vendor library.");
+                        }
+                        Some(_) => empty_note(ui, "The OS reported no display adapter. Add-in cards need an installed driver to appear here."),
+                        None => {
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("Reading the display adapter inventory…").size(11.0).color(MUTED));
+                            });
+                        }
+                    }
+
                     if !snapshot.adapters.is_empty() {
                         ui.add_space(12.0);
-                        section_title(ui, "Adapter capabilities", Some("GPU-Z style device limits"));
-                        let mut rows: Vec<(String, String)> = Vec::new();
-                        for (index, adapter) in snapshot.adapters.iter().enumerate() {
-                            let limits = adapter.handle.limits();
-                            spec_row(&mut rows, format!("Adapter {index}"), &adapter.name);
-                            spec_row(&mut rows, "Backend", &adapter.backend);
-                            spec_row(&mut rows, "Vendor / device ID", &format!("{:#06x} / {:#06x}", adapter.vendor_id, adapter.device_id));
-                            spec_row(&mut rows, "Max texture (2D)", &format!("{} px", limits.max_texture_dimension_2d));
-                            spec_row(&mut rows, "Max compute workgroup", &format!("{} × {} × {}", limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z));
-                            spec_row(&mut rows, "Max storage buffer binding", &format!("{} MiB", limits.max_storage_buffer_binding_size / (1024 * 1024)));
-                            spec_row(&mut rows, "Optional features", &adapter.handle.features().bits().count_ones().to_string());
-                        }
-                        spec_grid(ui, "gpu-capabilities", &rows);
-                        ui.weak("Limits come from the graphics API and describe capability, not current clocks or temperature.");
+                        egui::CollapsingHeader::new("Graphics API capabilities").default_open(true).show(ui, |ui| {
+                            section_title(ui, "Adapter capabilities", Some("wgpu device limits"));
+                            let mut rows: Vec<(String, String)> = Vec::new();
+                            for (index, adapter) in snapshot.adapters.iter().enumerate() {
+                                let limits = adapter.handle.limits();
+                                spec_row(&mut rows, format!("Adapter {index}"), &adapter.name);
+                                spec_row(&mut rows, "Backend", &adapter.backend);
+                                spec_row(&mut rows, "Vendor / device ID", &format!("{:#06x} / {:#06x}", adapter.vendor_id, adapter.device_id));
+                                spec_row(&mut rows, "Max texture (2D)", &format!("{} px", limits.max_texture_dimension_2d));
+                                spec_row(&mut rows, "Max compute workgroup", &format!("{} × {} × {}", limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z));
+                                spec_row(&mut rows, "Max storage buffer binding", &format!("{} MiB", limits.max_storage_buffer_binding_size / (1024 * 1024)));
+                                spec_row(&mut rows, "Optional features", &adapter.handle.features().bits().count_ones().to_string());
+                            }
+                            spec_grid(ui, "gpu-capabilities", &rows);
+                            ui.weak("Limits come from the graphics API and describe capability, not current clocks or temperature.");
+                        });
                     }
                     if ui.button("Open frame analysis").clicked() { self.page = Page::Frames; }
                 }
                 Page::Memory => {
-                    section_title(ui, "Memory", Some("OS-reported"));
+                    section_title(ui, "Memory", Some("OS-reported usage and installed modules"));
                     if snapshot.memory_total == 0 { ui.weak("Memory usage unavailable."); }
                     else { ui.label(format!("{:.1} / {:.1} GiB used · {:.1} GiB available", gib(snapshot.memory_used), gib(snapshot.memory_total), gib(snapshot.memory_available))); }
+                    ui.add_space(6.0);
+                    bar(ui, if snapshot.memory_total > 0 { snapshot.memory_used as f32 / snapshot.memory_total as f32 } else { 0.0 }, VIOLET, 6.0);
                     egui::CollapsingHeader::new("Recent memory activity").show(ui, |ui| {
                         Plot::new("memory-page-history").height(120.0).include_y(0.0).include_y(100.0).allow_drag(false).allow_zoom(false).allow_scroll(false).show_x(false).show(ui, |plot| {
                             for points in history::segments(&self.history, self.started, |sample| sample.memory) { plot.line(Line::new(PlotPoints::from(points)).color(VIOLET)); }
                         });
                         ui.weak("Up to 60 batches; gaps mean missing or delayed readings.");
                     });
-                    if let Some(specs) = &specs {
-                        if specs.memory.modules.is_empty() { ui.weak("Module details not reported."); }
-                        for module in &specs.memory.modules { ui.label(format!("{} · {} · {} · {}", module.slot, module.kind, module.speed_mhz.map(|n| format!("{n} MHz")).unwrap_or_else(|| "speed unavailable".into()), module.size_bytes.map(decimal_bytes).unwrap_or_else(|| "size unavailable".into()))); }
+
+                    ui.add_space(14.0);
+                    section_title(ui, "Installed modules", Some("CPU-Z style · per slot"));
+                    match &specs {
+                        Some(specs) => {
+                            let memory = &specs.memory;
+                            let mut rows: Vec<(String, String)> = Vec::new();
+                            if let Some(total) = memory.total_bytes { spec_row(&mut rows, "Installed memory", decimal_bytes(total)); }
+                            if let (Some(used), Some(total)) = (memory.slots_used, memory.slots_total) {
+                                spec_row(&mut rows, "Slots", format!("{used} used · {} free", total.saturating_sub(used)));
+                            } else if let Some(total) = memory.slots_total {
+                                spec_row(&mut rows, "Slots", total.to_string());
+                            }
+                            if let Some(max) = memory.max_capacity_bytes { spec_row(&mut rows, "Maximum capacity", decimal_bytes(max)); }
+                            if let Some(ecc) = memory.ecc { spec_row(&mut rows, "ECC", if ecc { "Enabled" } else { "Not enabled" }); }
+                            if let Some(upgradeable) = memory.upgradeable { spec_row(&mut rows, "Upgradeable", if upgradeable { "Yes" } else { "No" }); }
+                            spec_grid(ui, "memory-page-summary", &rows);
+                            if memory.modules.is_empty() {
+                                empty_note(ui, "No memory module records were reported. Unified or soldered memory has no removable modules.");
+                            }
+                            for (index, module) in memory.modules.iter().enumerate() {
+                                ui.add_space(12.0);
+                                let heading = if module.slot.is_empty() { format!("Module {}", index + 1) } else { module.slot.clone() };
+                                let size = module.size_bytes.map(decimal_bytes).unwrap_or_default();
+                                section_title(ui, &heading, if size.is_empty() { None } else { Some(&size) });
+                                let mut rows: Vec<(String, String)> = Vec::new();
+                                spec_row(&mut rows, "Type", module.kind.as_str());
+                                spec_row(&mut rows, "Form factor", module.form_factor.as_str());
+                                spec_row(&mut rows, "Bank", module.bank.as_str());
+                                if let Some(speed) = module.speed_mhz { spec_row(&mut rows, "Rated speed", format!("{speed} MT/s")); }
+                                if let Some(speed) = module.configured_mhz { spec_row(&mut rows, "Running speed", format!("{speed} MT/s")); }
+                                if let Some(mv) = module.configured_voltage_mv { spec_row(&mut rows, "Configured voltage", format!("{:.3} V", mv as f64 / 1000.0)); }
+                                if let (Some(min), Some(max)) = (module.min_voltage_mv, module.max_voltage_mv) {
+                                    if min != max { spec_row(&mut rows, "Voltage range", format!("{:.3}–{:.3} V", min as f64 / 1000.0, max as f64 / 1000.0)); }
+                                }
+                                if let (Some(data), Some(total)) = (module.data_width, module.total_width) {
+                                    spec_row(&mut rows, "Bus width", if total > data { format!("{data}-bit data · {total}-bit total (ECC)") } else { format!("{data}-bit") });
+                                }
+                                spec_row(&mut rows, "Manufacturer", module.manufacturer.as_str());
+                                spec_row(&mut rows, "Part number", module.part_number.as_str());
+                                spec_row(&mut rows, "Serial", module.serial.as_str());
+                                spec_grid(ui, &format!("memory-page-module-{index}"), &rows);
+                            }
+                            ui.weak("Timings (CL, tRCD, tRP, tRAS) and XMP/EXPO profiles need raw SPD reads and are not shown.");
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("Reading the memory inventory…").size(11.0).color(MUTED));
+                            });
+                        }
                     }
                 }
                 Page::Storage => {
@@ -1151,10 +1320,153 @@ impl App {
                     });
                 }
                 Page::Motherboard => {
-                    section_title(ui, "Motherboard", Some("availability depends on the platform"));
-                    if let Some(specs) = &specs { ui.label(format!("System model: {} · {}", specs.model_name, specs.model_id)); ui.weak(format!("System firmware: {}", if specs.firmware.is_empty() { "unavailable" } else { &specs.firmware })); ui.label(format!("OS-reported board ID: {}", specs.board_id.as_deref().unwrap_or("unavailable"))); }
-                    else { ui.weak("Collecting system information…"); }
-                    ui.weak("Motherboard model, chipset, voltage and board-specific stress tests are unavailable in this build. The board ID is an OS registry identifier, not a model name.");
+                    section_title(ui, "Mainboard and parts", Some("read-only system inventory"));
+                    match &specs {
+                        Some(specs) => {
+                            let mut system_rows: Vec<(String, String)> = Vec::new();
+                            spec_row(&mut system_rows, "System", specs.model_name.as_str());
+                            spec_row(&mut system_rows, "Model identifier", specs.model_id.as_str());
+                            spec_row(&mut system_rows, "Chassis", specs.chassis.as_str());
+                            spec_row(&mut system_rows, "System firmware", specs.firmware.as_str());
+                            spec_row(&mut system_rows, "Operating system", format!("{} {}", specs.os_name, specs.os_version).trim());
+                            spec_row(&mut system_rows, "Kernel", specs.kernel.as_str());
+                            if let Some(battery) = &specs.battery { spec_row(&mut system_rows, "Battery", battery.as_str()); }
+                            spec_row(&mut system_rows, "Uptime", uptime_text(sysinfo::System::uptime()));
+                            spec_grid(ui, "parts-system", &system_rows);
+
+                            ui.add_space(14.0);
+                            section_title(ui, "Board", Some("firmware-reported identity"));
+                            let mut board_rows: Vec<(String, String)> = Vec::new();
+                            spec_row(&mut board_rows, "Vendor", specs.board_vendor.as_str());
+                            spec_row(&mut board_rows, "Model", specs.board_model.as_str());
+                            spec_row(&mut board_rows, "Version / revision", specs.board_version.as_str());
+                            spec_row(&mut board_rows, "Board identifier", specs.board_id.as_deref().unwrap_or(""));
+                            spec_grid(ui, "parts-board", &board_rows);
+                            ui.weak("Chipset, VRM and per-board sensors need a kernel driver and are not read.");
+
+                            ui.add_space(14.0);
+                            section_title(ui, "Displays", Some("decoded from the monitor identity block"));
+                            if specs.monitors.is_empty() {
+                                empty_note(ui, "No display identity was reported. External monitors show up only when the OS reads their EDID.");
+                            } else {
+                                for (index, monitor) in specs.monitors.iter().enumerate() {
+                                    let mut rows: Vec<(String, String)> = Vec::new();
+                                    spec_row(&mut rows, "Manufacturer", monitor.manufacturer.as_str());
+                                    spec_row(&mut rows, "Model", monitor.model.as_str());
+                                    spec_row(&mut rows, "Serial", monitor.serial.as_str());
+                                    if let Some(year) = monitor.year {
+                                        let detail = match monitor.week {
+                                            Some(week) => format!("{year} · week {week}"),
+                                            None => year.to_string(),
+                                        };
+                                        spec_row(&mut rows, "Manufactured", detail);
+                                    }
+                                    spec_grid(ui, &format!("parts-monitor-{index}"), &rows);
+                                    if index + 1 < specs.monitors.len() { ui.add_space(8.0); }
+                                }
+                            }
+
+                            ui.add_space(14.0);
+                            section_title(ui, "Network adapters", Some("physical parts, not traffic counters"));
+                            if specs.network_adapters.is_empty() {
+                                empty_note(ui, "No network adapter was reported.");
+                            } else {
+                                for adapter in &specs.network_adapters {
+                                    let mut detail: Vec<String> = Vec::new();
+                                    if !adapter.description.is_empty() { detail.push(adapter.description.clone()); }
+                                    if !adapter.status.is_empty() { detail.push(adapter.status.clone()); }
+                                    if !adapter.speed.is_empty() { detail.push(adapter.speed.clone()); }
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(&adapter.name).size(12.0).color(TEXT));
+                                        if adapter.status.eq_ignore_ascii_case("up") { chip(ui, "UP", GREEN); }
+                                        ui.label(RichText::new(detail.join(" · ")).size(10.5).color(MUTED));
+                                    });
+                                }
+                            }
+                            ui.weak("The OS reports adapter names and link speeds; radio signal quality and antenna info are unavailable.");
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("Reading the system inventory…").size(11.0).color(MUTED));
+                            });
+                        }
+                    }
+                }
+                Page::Drivers => {
+                    section_title(ui, "Installed drivers", Some("OS driver store · read-only"));
+                    match &specs {
+                        Some(specs) if !specs.drivers.is_empty() => {
+                            let mut classes: Vec<&str> = specs.drivers.iter().map(|driver| driver.class_name.as_str()).collect();
+                            classes.sort_unstable();
+                            classes.dedup();
+                            if !classes.iter().any(|class| *class == self.driver_class) {
+                                self.driver_class = "All".into();
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Find:");
+                                ui.add(egui::TextEdit::singleline(&mut self.driver_query).hint_text("Driver or device name").desired_width(220.0));
+                                ui.add_space(6.0);
+                                ui.label("Class:");
+                                egui::ComboBox::from_id_salt("driver-class")
+                                    .selected_text(if self.driver_class == "All" { "All classes".to_owned() } else { driver_class_label(&self.driver_class).to_owned() })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.driver_class, "All".into(), "All classes");
+                                        for class in &classes {
+                                            ui.selectable_value(&mut self.driver_class, (*class).to_owned(), format!("{} ({})", driver_class_label(class), specs.drivers.iter().filter(|driver| driver.class_name == *class).count()));
+                                        }
+                                    });
+                            });
+                            let query = self.driver_query.to_lowercase();
+                            let filtered: Vec<_> = specs.drivers.iter().filter(|driver| {
+                                (self.driver_class == "All" || driver.class_name == self.driver_class)
+                                    && (query.is_empty()
+                                        || driver.name.to_lowercase().contains(&query)
+                                        || driver.provider.to_lowercase().contains(&query))
+                            }).collect();
+                            ui.add_space(4.0);
+                            ui.weak(format!("{} of {} driver records · {} classes", filtered.len(), specs.drivers.len(), classes.len()));
+                            if filtered.is_empty() {
+                                empty_note(ui, "No driver matches the current filter.");
+                            } else {
+                                egui::Grid::new("drivers-grid")
+                                    .num_columns(4)
+                                    .spacing([22.0, 7.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        for heading in ["Driver", "Class", "Version", "Signature"] {
+                                            ui.label(RichText::new(heading).size(10.5).strong().color(MUTED));
+                                        }
+                                        ui.end_row();
+                                        for driver in filtered {
+                                            ui.vertical(|ui| {
+                                                ui.label(RichText::new(&driver.name).size(11.5).color(TEXT));
+                                                let mut meta: Vec<String> = Vec::new();
+                                                if !driver.provider.is_empty() { meta.push(driver.provider.clone()); }
+                                                if !driver.date.is_empty() { meta.push(driver.date.clone()); }
+                                                ui.label(RichText::new(meta.join(" · ")).size(10.0).color(MUTED));
+                                            });
+                                            ui.label(RichText::new(driver_class_label(&driver.class_name)).size(11.0).color(TEXT_DIM));
+                                            ui.label(RichText::new(if driver.version.is_empty() { "—" } else { &driver.version }).size(11.0).color(TEXT_DIM));
+                                            match driver.signed {
+                                                Some(true) => { chip(ui, "SIGNED", GREEN); }
+                                                Some(false) => { chip(ui, "UNSIGNED", AMBER); }
+                                                None => { ui.label(RichText::new("—").color(MUTED)); }
+                                            }
+                                            ui.end_row();
+                                        }
+                                    });
+                            }
+                            ui.weak("Signature state is what the OS reports for the installed package. A signed driver is not a guarantee of stability.");
+                        }
+                        Some(_) => empty_note(ui, "The OS driver store reported no matching hardware drivers."),
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("Reading the OS driver store…").size(11.0).color(MUTED));
+                            });
+                        }
+                    }
                 }
                 Page::Network => {
                     section_title(ui, "Network interfaces", Some("OS counters · rates since the previous refresh"));
@@ -1415,6 +1727,8 @@ impl App {
                         }
                     }
                     ui.add_space(6.0);
+                    duration_presets(ui, &mut self.seconds);
+                    ui.add_space(4.0);
                     ui.add(egui::Slider::new(&mut self.seconds, 1..=600).text("max seconds"));
                     ui.add_space(10.0);
                     let start = ui.add_sized(
@@ -1424,6 +1738,7 @@ impl App {
                             .corner_radius(CornerRadius::same(9)),
                     );
                     if start.clicked() {
+                        self.run_peak_c = None;
                         let adapter = if self.kind == Kind::Gpu {
                             s.adapters.get(self.gpu_index)
                         } else {
@@ -1482,35 +1797,46 @@ impl App {
                         .and_then(|s| s.started)
                         .map(|t| t.elapsed().as_secs_f32())
                         .unwrap_or_default();
-                    let fraction = (elapsed / self.seconds as f32).min(1.0);
+                    let fraction = (elapsed / self.seconds as f32).clamp(0.0, 1.0);
+                    let remaining = (self.seconds as f32 - elapsed).max(0.0);
+                    let percent = (fraction * 100.0).round() as u32;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{elapsed:.1}s"))
+                                .size(30.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            chip(ui, &format!("{percent}%"), ACCENT);
+                        });
+                    });
                     ui.label(
-                        RichText::new(format!("{elapsed:.1}s"))
-                            .size(30.0)
-                            .strong()
-                            .color(TEXT),
-                    );
-                    ui.label(
-                        RichText::new(format!("of the {}s limit", self.seconds))
+                        RichText::new(format!("about {remaining:.0}s left of the {0}s limit", self.seconds))
                             .size(11.0)
                             .color(MUTED),
                     );
                     ui.add_space(6.0);
+                    // Keep the progress bar moving and let people estimate the
+                    // wait — both are Apple HIG guidance for determinate tasks.
                     ui.add(
                         egui::ProgressBar::new(fraction)
                             .fill(ACCENT)
                             .corner_radius(CornerRadius::same(6))
                             .desired_height(8.0),
                     );
-                    ui.add_space(12.0);
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("LIVE READINGS").size(9.5).strong().color(MUTED));
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Live CPU").size(11.0).color(MUTED));
+                        ui.label(RichText::new("CPU").size(11.0).color(MUTED));
                         ui.label(
                             RichText::new(format!("{:.0}%", s.cpu_usage))
-                                .size(12.0)
+                                .size(12.5)
                                 .strong()
                                 .color(load_color(s.cpu_usage / 100.0)),
                         );
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
                         ui.label(RichText::new("Memory").size(11.0).color(MUTED));
                         ui.label(
                             RichText::new(if s.memory_total > 0 {
@@ -1521,16 +1847,38 @@ impl App {
                             } else {
                                 "—".into()
                             })
-                            .size(12.0)
+                            .size(12.5)
                             .strong()
                             .color(VIOLET),
                         );
+                    });
+                    ui.add_space(8.0);
+                    // Peak temperature with an at-a-glance safety verdict is the
+                    // signal mainstream stress tools surface; it belongs beside
+                    // the Start/Stop controls, not buried on the Thermal page.
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Peak temp").size(11.0).color(MUTED));
+                        match self.run_peak_c {
+                            Some(peak) => {
+                                ui.label(
+                                    RichText::new(format!("{peak:.0} °C"))
+                                        .size(12.5)
+                                        .strong()
+                                        .color(temperature_color(peak)),
+                                );
+                                let (label, color) = thermal_safety(peak, self.alert_celsius);
+                                chip(ui, label, color);
+                            }
+                            None => {
+                                ui.label(RichText::new("no sensor").size(11.0).color(MUTED));
+                            }
+                        }
                     });
                     ui.add_space(12.0);
                     if ui
                         .add_sized(
                             [ui.available_width(), 32.0],
-                            egui::Button::new(RichText::new("Stop test").color(Color32::from_rgb(30, 18, 6)))
+                            egui::Button::new(RichText::new("Stop test · Esc").color(Color32::from_rgb(30, 18, 6)))
                                 .fill(AMBER)
                                 .corner_radius(CornerRadius::same(9)),
                         )
@@ -1539,6 +1887,9 @@ impl App {
                         self.cancel.store(true, Ordering::Relaxed);
                         self.message = "Stopping after the current work or I/O operation…".into();
                     }
+                    ui.add_space(10.0);
+                    callout(ui, AMBER, "No automatic shutdown",
+                        "Watch the peak temperature above. Stop the check yourself if it climbs; a blocked driver or disk operation can also delay stopping.");
                 } else {
                     let last = self
                         .state
@@ -1547,17 +1898,28 @@ impl App {
                         .and_then(|s| s.results.iter().rev().find(|r| fixed.is_none_or(|kind| r.kind == kind)).cloned());
                     match last {
                         Some(r) => {
+                            // A plain-language verdict confirms the outcome of a
+                            // significant action (Apple HIG: confirm completion).
+                            let verdict = match r.status {
+                                Status::Completed => "PASSED",
+                                Status::Stopped => "STOPPED",
+                                Status::Failed => "FAILED",
+                                Status::Inconclusive => "INCONCLUSIVE",
+                                Status::Unavailable => "UNAVAILABLE",
+                            };
+                            let tone = status_color(&r.status);
                             ui.horizontal(|ui| {
-                                chip(ui, &r.status.to_string().to_uppercase(), status_color(&r.status));
+                                chip(ui, verdict, tone);
                                 ui.label(
                                     RichText::new(kind_label(r.kind))
-                                        .size(12.0)
+                                        .size(12.5)
+                                        .strong()
                                         .color(TEXT),
                                 );
                             });
                             ui.add_space(8.0);
                             ui.label(RichText::new(&r.detail).size(11.5).color(TEXT_DIM));
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                             ui.label(
                                 RichText::new(format!(
                                     "{} verified {} · {:.1}s",
@@ -1570,6 +1932,19 @@ impl App {
                                 .size(10.5)
                                 .color(MUTED),
                             );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} · {}",
+                                    timestamp_text(r.timestamp),
+                                    config_summary(&r.config)
+                                ))
+                                .size(10.0)
+                                .color(MUTED),
+                            );
+                            ui.add_space(8.0);
+                            if ui.button("View all reports").clicked() {
+                                self.page = Page::Reports;
+                            }
                         }
                         None => {
                             empty_note(
@@ -1578,15 +1953,10 @@ impl App {
                             );
                         }
                     }
+                    ui.add_space(12.0);
+                    callout(ui, MUTED, "Read-only checks, never benchmarks",
+                        "These bounded checks verify correctness, not raw speed or full burn-in. There is no automatic temperature-based shutdown; supervise any stress run.");
                 }
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new(
-                        "There is no automatic temperature-based shutdown. A blocked driver or disk operation can delay stopping.",
-                    )
-                    .size(10.5)
-                    .color(MUTED),
-                );
             });
         });
         ui.add_space(8.0);
@@ -1652,6 +2022,11 @@ impl App {
         );
         spec_row(&mut cpu_rows, "Socket", specs.cpu.socket.as_str());
         spec_row(&mut cpu_rows, "Stepping", specs.cpu.stepping.as_str());
+        spec_row(
+            &mut cpu_rows,
+            "Family / description",
+            specs.cpu.description.as_str(),
+        );
         match (specs.cpu.physical_cores, specs.cpu.logical_cores) {
             (Some(physical), Some(logical)) => spec_row(
                 &mut cpu_rows,
@@ -1676,6 +2051,9 @@ impl App {
         if let Some(mhz) = specs.cpu.max_mhz {
             spec_row(&mut cpu_rows, "Max clock", clock_text(mhz));
         }
+        if let Some(mhz) = specs.cpu.current_mhz {
+            spec_row(&mut cpu_rows, "Clock at collection", clock_text(mhz));
+        }
         if let Some(value) = specs.cpu.l1_instruction_bytes {
             spec_row(&mut cpu_rows, "L1 instruction cache", bytes(value));
         }
@@ -1698,8 +2076,38 @@ impl App {
             (Some(_), Some(_)) => spec_row(&mut cpu_rows, "Simultaneous threads", "Not enabled"),
             _ => {}
         }
+        if let Some(enabled) = specs.cpu.virtualization {
+            spec_row(
+                &mut cpu_rows,
+                "Virtualization (firmware)",
+                if enabled { "Enabled" } else { "Not enabled" },
+            );
+        }
+        spec_row(
+            &mut cpu_rows,
+            "Instruction sets",
+            specs.cpu.instructions.as_str(),
+        );
+        spec_row(
+            &mut cpu_rows,
+            "Processor ID",
+            specs.cpu.processor_id.as_str(),
+        );
 
         let mut memory_rows: Vec<(String, String)> = Vec::new();
+        if let Some(total) = specs.memory.total_bytes {
+            spec_row(&mut memory_rows, "Installed", decimal_bytes(total));
+        }
+        if let (Some(used), Some(total)) = (specs.memory.slots_used, specs.memory.slots_total) {
+            spec_row(
+                &mut memory_rows,
+                "Slots",
+                format!("{used} used · {} free", total.saturating_sub(used)),
+            );
+        }
+        if let Some(max) = specs.memory.max_capacity_bytes {
+            spec_row(&mut memory_rows, "Maximum capacity", decimal_bytes(max));
+        }
         if let Some(ecc) = specs.memory.ecc {
             spec_row(
                 &mut memory_rows,
@@ -1792,6 +2200,8 @@ impl App {
             spec_row(&mut graphics_rows, "API", gpu.api.as_str());
             spec_row(&mut graphics_rows, "Bus", gpu.bus.as_str());
             spec_row(&mut graphics_rows, "Device ID", gpu.device_id.as_str());
+            spec_row(&mut graphics_rows, "Adapter driver", gpu.driver.as_str());
+            spec_row(&mut graphics_rows, "Video BIOS", gpu.bios.as_str());
         }
         if !specs.gpu_driver.is_empty() {
             let detail = if specs.gpu_driver_date.is_empty() {
@@ -2401,6 +2811,13 @@ impl eframe::App for App {
                     })
             })
             .flatten();
+        // Track the hottest reading seen while a check runs, for the live
+        // safety readout. A stale sample never raises the recorded peak.
+        if running {
+            if let Some(value) = hottest {
+                self.run_peak_c = Some(self.run_peak_c.map_or(value, |peak| peak.max(value)));
+            }
+        }
         let rule = Threshold {
             celsius: self.alert_celsius,
             hold: Duration::from_secs(self.alert_hold_secs),
@@ -2538,6 +2955,7 @@ impl eframe::App for App {
                     | Page::Storage
                     | Page::Thermal
                     | Page::Motherboard
+                    | Page::Drivers
                     | Page::Network
                     | Page::Bluetooth => self.hardware_page(ui, &snapshot),
                     Page::Details => self.details(ui, &snapshot),
@@ -2572,7 +2990,15 @@ impl eframe::App for App {
             );
             self.show_widget = keep_open;
         }
-        ctx.request_repaint_after(Duration::from_millis(250));
+        // While the window is focused the monitor needs a few redraws per second
+        // for fresh readings. In the background telemetry keeps sampling but the
+        // interface redraws once a second, which keeps idle CPU cost low.
+        let period = if ctx.input(|input| input.viewport().focused.unwrap_or(true)) {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(1000)
+        };
+        ctx.request_repaint_after(period);
     }
 }
 
@@ -3040,6 +3466,27 @@ fn draw_nav_icon(painter: &egui::Painter, center: egui::Pos2, page: Page, color:
                 faint,
             );
         }
+        Page::Drivers => {
+            // A driver chip: a small board with contact pins.
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(9.0, 9.0)),
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for dy in [-4.0, 0.0, 4.0] {
+                line(
+                    center + egui::vec2(-7.0, dy),
+                    center + egui::vec2(-4.8, dy),
+                    faint,
+                );
+                line(
+                    center + egui::vec2(4.8, dy),
+                    center + egui::vec2(7.0, dy),
+                    faint,
+                );
+            }
+        }
         Page::Network => {
             painter.circle_filled(center, 1.8, color);
             for radius in [4.5, 7.5] {
@@ -3174,6 +3621,39 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Apple-style segmented control for common test durations. The fine-grained
+/// slider remains below; presets just make the usual choices one tap away.
+fn duration_presets(ui: &mut egui::Ui, seconds: &mut u64) {
+    ui.label(RichText::new("Quick duration").size(10.0).color(MUTED));
+    ui.add_space(3.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        for (value, label) in [(15u64, "15s"), (60, "1 min"), (300, "5 min")] {
+            let selected = *seconds == value;
+            let fill = if selected {
+                ACCENT
+            } else {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+            };
+            let text_color = if selected {
+                Color32::from_rgb(9, 18, 30)
+            } else {
+                TEXT_DIM
+            };
+            if ui
+                .add(
+                    egui::Button::new(RichText::new(label).size(11.0).strong().color(text_color))
+                        .fill(fill)
+                        .corner_radius(CornerRadius::same(8)),
+                )
+                .clicked()
+            {
+                *seconds = value;
+            }
+        }
+    });
+}
+
 fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui::Response {
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::click());
@@ -3270,8 +3750,8 @@ fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32, height: f32) {
     }
 }
 
-fn core_meter(ui: &mut egui::Ui, index: usize, usage: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 20.0), egui::Sense::hover());
+fn core_meter(ui: &mut egui::Ui, index: usize, usage: f32, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -3284,9 +3764,10 @@ fn core_meter(ui: &mut egui::Ui, index: usize, usage: f32) {
         egui::FontId::proportional(10.0),
         MUTED,
     );
+    let value_width = 34.0;
     let track = egui::Rect::from_min_size(
         rect.left_center() + egui::vec2(24.0, -3.0),
-        egui::vec2(84.0, 6.0),
+        egui::vec2((width - 24.0 - value_width).max(24.0), 6.0),
     );
     painter.rect_filled(track, CornerRadius::same(3), TRACK);
     if fraction > 0.0 {
@@ -3380,6 +3861,40 @@ fn temperature_color(celsius: f32) -> Color32 {
     }
 }
 
+/// Thermal safety label relative to the person's advisory alert limit. Used
+/// during a stress run so peak temperature can be read at a glance and the
+/// decision to stop stays with the user (the app never changes hardware state).
+fn thermal_safety(celsius: f32, limit_celsius: f32) -> (&'static str, Color32) {
+    if celsius >= limit_celsius {
+        ("Above limit", RED)
+    } else if celsius >= limit_celsius - 12.0 {
+        ("Warming", AMBER)
+    } else {
+        ("Normal", GREEN)
+    }
+}
+
+/// Apple-style inline callout: a lightly tinted, rounded panel with a short
+/// title and supporting text. Replaces faint footnotes when guidance matters
+/// enough that a person should notice it before starting a test.
+fn callout(ui: &mut egui::Ui, tone: Color32, title: &str, body: &str) {
+    let frame = egui::Frame {
+        fill: Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 24),
+        stroke: Stroke::new(
+            1.0_f32,
+            Color32::from_rgba_unmultiplied(tone.r(), tone.g(), tone.b(), 84),
+        ),
+        corner_radius: CornerRadius::same(10),
+        inner_margin: egui::Margin::symmetric(12, 10),
+        ..Default::default()
+    };
+    frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(title).size(11.5).strong().color(tone));
+        ui.label(RichText::new(body).size(10.5).color(TEXT_DIM));
+    });
+}
+
 fn status_color(status: &Status) -> Color32 {
     match status {
         Status::Completed => GREEN,
@@ -3387,6 +3902,27 @@ fn status_color(status: &Status) -> Color32 {
         Status::Failed => RED,
         Status::Inconclusive => VIOLET,
         Status::Unavailable => MUTED,
+    }
+}
+
+fn driver_class_label(class: &str) -> &str {
+    match class {
+        "DISPLAY" => "Display",
+        "NET" => "Network",
+        "HDC" => "Storage controller",
+        "SCSIADAPTER" => "Storage adapter",
+        "USB" => "USB",
+        "BLUETOOTH" => "Bluetooth",
+        "BATTERY" => "Battery",
+        "MONITOR" => "Monitor",
+        "MEDIA" => "Audio",
+        "SYSTEM" => "System device",
+        "MOUSE" => "Mouse",
+        "KEYBOARD" => "Keyboard",
+        "FIRMWARE" => "Firmware",
+        "CAMERA" => "Camera",
+        "" => "Other",
+        other => other,
     }
 }
 

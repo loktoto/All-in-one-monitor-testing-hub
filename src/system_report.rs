@@ -55,6 +55,10 @@ fn text_rows(
         ),
         row("Kernel", value(&specs.kernel)),
         row("Firmware", value(&specs.firmware)),
+        row("Board vendor", value(&specs.board_vendor)),
+        row("Board model", value(&specs.board_model)),
+        row("Board version", value(&specs.board_version)),
+        row("Chassis", value(&specs.chassis)),
         row(
             "Board identifier",
             if redact {
@@ -70,6 +74,7 @@ fn text_rows(
         row("Name", value(&cpu.name)),
         row("Vendor", value(&cpu.vendor)),
         row("Architecture", value(&cpu.architecture)),
+        row("Family / description", value(&cpu.description)),
         row("Socket", value(&cpu.socket)),
         row("Stepping", value(&cpu.stepping)),
         row(
@@ -100,6 +105,25 @@ fn text_rows(
             .map(|size| available(*size))
             .collect::<Vec<_>>()
             .join(" / "),
+        ),
+        row(
+            "Clock at collection",
+            format!("{} MHz", available(cpu.current_mhz)),
+        ),
+        row("Instruction sets", value(&cpu.instructions)),
+        row(
+            "Virtualization (firmware)",
+            cpu.virtualization
+                .map(|enabled| if enabled { "enabled" } else { "not enabled" }.to_owned())
+                .unwrap_or_else(|| "unavailable".into()),
+        ),
+        row(
+            "Processor ID",
+            if redact {
+                "redacted".into()
+            } else {
+                value(&cpu.processor_id)
+            },
         ),
         row(
             "Live CPU load",
@@ -135,6 +159,18 @@ fn text_rows(
             },
         ),
         row(
+            "Slots (used / total)",
+            format!(
+                "{} / {}",
+                available(specs.memory.slots_used.map(u64::from)),
+                available(specs.memory.slots_total.map(u64::from))
+            ),
+        ),
+        row(
+            "Maximum capacity",
+            format!("{} bytes", available(specs.memory.max_capacity_bytes)),
+        ),
+        row(
             "ECC / upgradeable",
             format!(
                 "{} / {}",
@@ -165,6 +201,12 @@ fn text_rows(
         if !module.form_factor.is_empty() {
             detail.push_str(&format!(" · {}", module.form_factor));
         }
+        if let Some(mv) = module.configured_voltage_mv {
+            detail.push_str(&format!(" · {:.3} V", mv as f64 / 1000.0));
+        }
+        if let (Some(data), Some(total)) = (module.data_width, module.total_width) {
+            detail.push_str(&format!(" · {data}/{total}-bit bus"));
+        }
         if !module.manufacturer.is_empty() {
             detail.push_str(&format!(" · {}", module.manufacturer));
         }
@@ -181,17 +223,27 @@ fn text_rows(
         .graphics
         .iter()
         .map(|gpu| {
-            row(
-                "Adapter",
-                format!(
-                    "{} · {} · {} · VRAM {} · bus {}",
-                    value(&gpu.name),
-                    value(&gpu.chipset),
-                    value(&gpu.api),
-                    available(gpu.vram_bytes),
-                    value(&gpu.bus)
-                ),
-            )
+            let mut detail = format!(
+                "{} · {} · {} · VRAM {} · bus {}",
+                value(&gpu.name),
+                value(&gpu.chipset),
+                value(&gpu.device_id),
+                available(gpu.vram_bytes),
+                value(&gpu.bus)
+            );
+            if !gpu.driver.is_empty() {
+                detail.push_str(&format!(" · driver {}", gpu.driver));
+            }
+            if !gpu.driver_date.is_empty() {
+                detail.push_str(&format!(" ({})", gpu.driver_date));
+            }
+            if !gpu.bios.is_empty() {
+                detail.push_str(&format!(" · BIOS {}", gpu.bios));
+            }
+            if !gpu.status.is_empty() {
+                detail.push_str(&format!(" · {}", gpu.status));
+            }
+            row("Adapter", detail)
         })
         .collect();
     graphics.push(row("OS driver", value(&specs.gpu_driver)));
@@ -202,6 +254,61 @@ fn text_rows(
             "Sensor source",
             format!("{} · {}", gpu.name, gpu.detail),
         ));
+    }
+
+    let mut displays: Vec<Row> = specs
+        .monitors
+        .iter()
+        .map(|monitor| {
+            let mut detail = format!(
+                "{} · {}",
+                value(&monitor.manufacturer),
+                value(&monitor.model)
+            );
+            if !redact && !monitor.serial.is_empty() {
+                detail.push_str(&format!(" · serial {}", monitor.serial));
+            }
+            if let Some(year) = monitor.year {
+                detail.push_str(&format!(" · {year}"));
+                if let Some(week) = monitor.week {
+                    detail.push_str(&format!(" week {week}"));
+                }
+            }
+            row("Display", detail)
+        })
+        .collect();
+    if displays.is_empty() {
+        displays.push(row("Display", "unavailable"));
+    }
+
+    let mut drivers: Vec<Row> = specs
+        .drivers
+        .iter()
+        .map(|driver| {
+            let name = if redact {
+                "redacted".to_owned()
+            } else {
+                value(&driver.name)
+            };
+            row(
+                "Driver",
+                format!(
+                    "{} · {} · version {} · {} · {}",
+                    name,
+                    value(&driver.class_name),
+                    value(&driver.version),
+                    value(&driver.provider),
+                    match driver.signed {
+                        Some(true) => "signed",
+                        Some(false) => "unsigned",
+                        None => "signature unknown",
+                    }
+                ),
+            )
+        })
+        .collect();
+    if drivers.is_empty() {
+        drivers.push(row("Driver", "unavailable"));
     }
 
     let mut storage: Vec<Row> = specs
@@ -342,6 +449,8 @@ fn text_rows(
         ("Processor", processor),
         ("Memory", memory),
         ("Graphics", graphics),
+        ("Displays", displays),
+        ("Drivers", drivers),
         ("Storage", storage),
         ("Sensors", sensors),
         ("Connectivity", connectivity),

@@ -31,6 +31,16 @@ pub struct CpuSpec {
     pub l2_bytes: Option<u64>,
     pub l3_bytes: Option<u64>,
     pub cache_line_bytes: Option<u64>,
+    /// CPU-Z style family/model/stepping line, as described by the firmware.
+    pub description: String,
+    /// Vendor processor identifier (`ProcessorId`).
+    pub processor_id: String,
+    /// Clock the OS sampled at collection time, which moves with load.
+    pub current_mhz: Option<u64>,
+    /// Instruction-set extensions the OS reports (for example SSE2, AVX2).
+    pub instructions: String,
+    /// Firmware-enabled virtualization, when exposed.
+    pub virtualization: Option<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -45,6 +55,13 @@ pub struct MemoryModule {
     /// Speed the firmware actually configured, which can differ from the rating.
     pub configured_mhz: Option<u64>,
     pub form_factor: String,
+    pub bank: String,
+    /// Bus widths in bits. A 72-bit total width on a 64-bit data bus means ECC.
+    pub data_width: Option<u64>,
+    pub total_width: Option<u64>,
+    pub configured_voltage_mv: Option<u64>,
+    pub min_voltage_mv: Option<u64>,
+    pub max_voltage_mv: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -52,6 +69,9 @@ pub struct MemoryProfile {
     pub total_bytes: Option<u64>,
     pub ecc: Option<bool>,
     pub upgradeable: Option<bool>,
+    pub slots_total: Option<u32>,
+    pub slots_used: Option<u32>,
+    pub max_capacity_bytes: Option<u64>,
     pub modules: Vec<MemoryModule>,
 }
 
@@ -64,6 +84,47 @@ pub struct GraphicsSpec {
     pub vram_bytes: Option<u64>,
     pub api: String,
     pub bus: String,
+    /// Installed display driver version and release date, GPU-Z style.
+    pub driver: String,
+    pub driver_date: String,
+    /// PCI bus/device/function address parsed from the device instance path.
+    pub pci: String,
+    pub refresh: String,
+    pub status: String,
+    /// Video BIOS version and date when the display driver registered them.
+    pub bios: String,
+    pub bios_date: String,
+    pub current_mode: String,
+}
+
+/// One installed driver record, as listed by the OS driver store.
+#[derive(Clone, Default)]
+pub struct DriverSpec {
+    pub name: String,
+    pub class_name: String,
+    pub version: String,
+    pub date: String,
+    pub provider: String,
+    pub signed: Option<bool>,
+}
+
+/// A display attached to the machine, decoded from its EDID identity block.
+#[derive(Clone, Default)]
+pub struct MonitorSpec {
+    pub manufacturer: String,
+    pub model: String,
+    pub serial: String,
+    pub year: Option<u32>,
+    pub week: Option<u32>,
+}
+
+/// One network adapter, kept as a physical "part" rather than a traffic counter.
+#[derive(Clone, Default)]
+pub struct NetworkAdapterSpec {
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    pub speed: String,
 }
 
 /// A physical storage device, CrystalDiskInfo style.
@@ -118,6 +179,16 @@ pub struct SystemSpecs {
     pub display: String,
     pub bluetooth: Option<BluetoothSpec>,
     pub wifi_interface: Option<String>,
+    /// Drivers installed in the OS driver store, filtered to hardware classes.
+    pub drivers: Vec<DriverSpec>,
+    /// Attached displays, decoded from their EDID identity blocks.
+    pub monitors: Vec<MonitorSpec>,
+    /// Physical network adapters (not the live traffic counters).
+    pub network_adapters: Vec<NetworkAdapterSpec>,
+    pub board_vendor: String,
+    pub board_model: String,
+    pub board_version: String,
+    pub chassis: String,
     /// Where these values came from, shown so nothing looks authoritative by default.
     pub sources: String,
     pub unavailable: Vec<String>,
@@ -336,6 +407,7 @@ mod portable {
             specs.cpu.name = cpu.brand().to_owned();
             specs.cpu.vendor = cpu.vendor_id().to_owned();
             specs.cpu.base_mhz = Some(cpu.frequency()).filter(|v| *v > 0);
+            specs.cpu.current_mhz = Some(cpu.frequency()).filter(|v| *v > 0);
         }
         specs.cpu.architecture = std::env::consts::ARCH.into();
         specs.cpu.physical_cores = system.physical_core_count().map(|n| n as u32);
@@ -367,6 +439,24 @@ fn smbios_memory_kind(code: u64) -> String {
         34 => "DDR5".into(),
         35 => "LPDDR5".into(),
         other => format!("SMBIOS type {other}"),
+    }
+}
+
+/// PCI vendor/device identifiers from a Windows device instance path, such as
+/// `PCI\VEN_10DE&DEV_1F08&SUBSYS_...`. Unrecognised paths stay unchanged.
+#[cfg(any(target_os = "windows", test))]
+fn pci_ids(device_path: &str) -> String {
+    fn field(path: &str, key: &str) -> Option<String> {
+        let start = path.find(key)? + key.len();
+        let value: String = path[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        (value.len() == 4).then(|| value.to_uppercase())
+    }
+    match (field(device_path, "VEN_"), field(device_path, "DEV_")) {
+        (Some(vendor), Some(device)) => format!("{vendor}:{device}"),
+        _ => String::new(),
     }
 }
 
@@ -418,11 +508,41 @@ $cs = Get-CimInstance Win32_ComputerSystem
 $bios = Get-CimInstance Win32_BIOS
 $board = Get-CimInstance Win32_BaseBoard
 $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-$gpu = Get-CimInstance Win32_VideoController | Select-Object -First 1
+$caches = @(Get-CimInstance Win32_CacheMemory -ErrorAction SilentlyContinue)
+$memArray = Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue | Select-Object -First 1
+$cpuClock = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction SilentlyContinue).'~MHz'
+$l1dKb = [uint64]($caches | Where-Object { $_.Level -eq 3 } | Measure-Object -Property MaxCacheSize -Maximum).Maximum
+if (-not $l1dKb) { $l1dKb = [uint64]($caches | Where-Object { $_.Level -eq 3 } | Measure-Object -Property InstalledSize -Maximum).Maximum }
+$l1iKb = 0
+$gpuReg = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue | ForEach-Object {
+  $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+  if ($p.DriverDesc) { [pscustomobject]@{ name = [string]$p.DriverDesc; bios = [string]$p.BiosVersion; bios_date = [string]$p.BiosDate; memory = [uint64]$p.'HardwareInformation.qwMemorySize' } }
+})
+$pnpDisplay = @(Get-CimInstance Win32_PnPEntity -Filter "PNPClass='Display'" -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ id = [string]$_.PNPDeviceID; location = [string]$_.LocationInformation } })
+$gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object {
+  $pnp = [string]$_.PNPDeviceID
+  $location = ($pnpDisplay | Where-Object { $_.id -eq $pnp } | Select-Object -First 1).location
+  [pscustomobject]@{
+    name = [string]$_.Name
+    vendor = [string]$_.AdapterCompatibility
+    chipset = [string]$_.VideoProcessor
+    pnp = $pnp
+    pci = [string]$location
+    driver = [string]$_.DriverVersion
+    driver_date = [string]$_.DriverDate
+    vram = [uint64]$_.AdapterRAM
+    mode = if ($_.CurrentHorizontalResolution -and $_.CurrentVerticalResolution) { "$($_.CurrentHorizontalResolution) x $($_.CurrentVerticalResolution)" } else { [string]$_.VideoModeDescription }
+    refresh = [string]$_.CurrentRefreshRate
+    status = [string]$_.Status
+  }
+})
+$chassis = Get-CimInstance Win32_SystemEnclosure -ErrorAction SilentlyContinue | Select-Object -First 1
+$chassisCode = "$(@($chassis.ChassisTypes)[0])"
+$chassisName = switch ($chassisCode) { '3' {'Desktop'} '4' {'Low-profile desktop'} '5' {'Pizza box'} '6' {'Mini tower'} '7' {'Tower'} '8' {'Portable'} '9' {'Laptop'} '10' {'Notebook'} '11' {'Handheld'} '12' {'Docking station'} '13' {'All-in-one'} '14' {'Sub-notebook'} '15' {'Space-saving'} '16' {'Lunch box'} '17' {'Main system chassis'} '23' {'Rack mount'} '24' {'Sealed case'} '30' {'Tablet'} '31' {'Convertible'} '32' {'Detachable'} '35' {'Mini PC'} '36' {'Stick PC'} default {''} }
 $bat = Get-CimInstance Win32_Battery | Select-Object -First 1
 $mem = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
   $form = switch ("$($_.FormFactor)") { '8' { 'DIMM' } '12' { 'SODIMM' } '13' { 'SRIMM' } '14' { 'SMDIMM' } default { '' } }
-  [pscustomobject]@{ slot = [string]$_.DeviceLocator; size = [uint64]$_.Capacity; type = [uint64]$_.SMBIOSMemoryType; speed = [uint64]$_.Speed; configured = [uint64]$_.ConfiguredClockSpeed; manufacturer = [string]$_.Manufacturer; part = [string]$_.PartNumber; serial = [string]$_.SerialNumber; form = $form }
+  [pscustomobject]@{ slot = [string]$_.DeviceLocator; bank = [string]$_.BankLabel; size = [uint64]$_.Capacity; type = [uint64]$_.SMBIOSMemoryType; speed = [uint64]$_.Speed; configured = [uint64]$_.ConfiguredClockSpeed; manufacturer = [string]$_.Manufacturer; part = [string]$_.PartNumber; serial = [string]$_.SerialNumber; form = $form; data_width = [uint64]$_.DataWidth; total_width = [uint64]$_.TotalWidth; voltage = [uint64]$_.ConfiguredVoltage; min_voltage = [uint64]$_.MinVoltage; max_voltage = [uint64]$_.MaxVoltage }
 })
 $volumes = @(Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { [pscustomobject]@{ letter = [string]$_.DriveLetter; fs = [string]$_.FileSystem; health = [string]$_.HealthStatus; size = [uint64]$_.Size; free = [uint64]$_.SizeRemaining } })
 # The Storage cmdlets (Get-PhysicalDisk, Get-StorageReliabilityCounter) take
@@ -446,6 +566,14 @@ $reliability = @()
 $diskdrives = @(Get-CimInstance Win32_DiskDrive | ForEach-Object { [pscustomobject]@{ model = [string]$_.Model; firmware = [string]$_.FirmwareRevision; serial = [string]$_.SerialNumber; interface = [string]$_.InterfaceType; size = [uint64]$_.Size } })
 $network = @(Get-NetAdapter | ForEach-Object { [pscustomobject]@{ name = [string]$_.Name; description = [string]$_.InterfaceDescription; media = [string]$_.PhysicalMediaType; status = [string]$_.Status; speed = [string]$_.LinkSpeed } })
 $bluetooth = @(Get-PnpDevice -Class Bluetooth | ForEach-Object { [pscustomobject]@{ name = [string]$_.FriendlyName; status = [string]$_.Status } })
+$decode = { param($arr) (($arr | Where-Object { $_ -gt 0 } | ForEach-Object { [char]$_ }) -join '').Trim() }
+$monitors = @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue | ForEach-Object {
+  $m = $_
+  [pscustomobject]@{ manufacturer = (& $decode $m.ManufacturerName); model = (& $decode $m.UserFriendlyName); serial = (& $decode $m.SerialNumberID); year = [uint64]$m.YearOfManufacture; week = [uint64]$m.WeekOfManufacture }
+})
+$drivers = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { $_.DeviceClass -in @('DISPLAY','NET','HDC','SCSIADAPTER','USB','BLUETOOTH','BATTERY','MONITOR','MEDIA','MOUSE','KEYBOARD','FIRMWARE','CAMERA') } | Sort-Object DeviceClass, DeviceName | Select-Object -First 300 | ForEach-Object {
+  [pscustomobject]@{ name = [string]$_.DeviceName; class = [string]$_.DeviceClass; version = [string]$_.DriverVersion; date = [string]$_.DriverDate; provider = [string]$_.DriverProviderName; signed = [bool]$_.IsSigned }
+})
 $battery = if ($bat) { [pscustomobject]@{ name = [string]$bat.Name; charge = $bat.EstimatedChargeRemaining; status = $bat.BatteryStatus } } else { $null }
 [pscustomobject]@{
   manufacturer = [string]$cs.Manufacturer
@@ -457,14 +585,29 @@ $battery = if ($bat) { [pscustomobject]@{ name = [string]$bat.Name; charge = $ba
   bios_date = [string]$bios.ReleaseDate
   board_manufacturer = [string]$board.Manufacturer
   board_product = [string]$board.Product
+  board_version = [string]$board.Version
+  chassis = $chassisName
+  cpu_description = [string]$cpu.Description
+  cpu_id = [string]$cpu.ProcessorId
+  cpu_instructions = [string]$cpu.InstructionSet
+  cpu_virtualization = [bool]$cpu.VirtualizationFirmwareEnabled
+  cpu_current_clock = [uint64]$cpuClock
+  cpu_threads = [uint64]$cpu.ThreadCount
   cpu_max_clock = [uint64]$cpu.MaxClockSpeed
+  cpu_l1_data_kb = $l1dKb
+  cpu_l1_instruction_kb = $l1iKb
   cpu_l2_kb = [uint64]$cpu.L2CacheSize
   cpu_l3_kb = [uint64]$cpu.L3CacheSize
   cpu_socket = [string]$cpu.SocketDesignation
   cpu_stepping = [string]$cpu.Stepping
-  gpu_driver = [string]$gpu.DriverVersion
-  gpu_driver_date = [string]$gpu.DriverDate
-  display = if ($gpu.CurrentHorizontalResolution -and $gpu.CurrentVerticalResolution) { "$($gpu.CurrentHorizontalResolution)x$($gpu.CurrentVerticalResolution)" + $(if ($gpu.CurrentRefreshRate) { " @ $($gpu.CurrentRefreshRate) Hz" } else { '' }) } else { '' }
+  mem_slots = [uint64]$memArray.MemoryDevices
+  mem_max_capacity_kb = [uint64]$memArray.MaxCapacity
+  mem_ecc = [uint64]$memArray.MemoryErrorCorrection
+  gpus = $gpus
+  gpu_reg = $gpuReg
+  display = if (@($gpus).Count -gt 0) { $g0 = @($gpus)[0]; if ($g0.mode) { "$($g0.mode)" + $(if ($g0.refresh) { " @ $($g0.refresh) Hz" } else { '' }) } else { '' } } else { '' }
+  monitors = $monitors
+  drivers = $drivers
   battery = $battery
   memory = $mem
   volumes = $volumes
@@ -506,9 +649,24 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                 .unavailable
                 .push("No physical drive was reported by the Windows storage provider.".into());
         }
-        specs
-            .unavailable
-            .push("L1 cache and cache-line sizes are not read on Windows in this build.".into());
+        if specs.cpu.l1_data_bytes.is_none() && specs.cpu.l1_instruction_bytes.is_none() {
+            specs
+                .unavailable
+                .push("L1 cache sizes were not reported by the firmware.".into());
+        }
+        if specs.cpu.cache_line_bytes.is_none() {
+            specs.unavailable.push(
+                "Cache-line size is not exposed by the standard Windows processor class.".into(),
+            );
+        }
+        specs.unavailable.push(
+            "Memory timings (CL, tRCD, tRP, tRAS) and XMP/EXPO profiles need raw SPD reads, which are not available to a standard user."
+                .into(),
+        );
+        specs.unavailable.push(
+            "PCIe link width and generation per adapter are not exposed without a vendor library; the bus location is shown instead."
+                .into(),
+        );
         specs.unavailable.push(
             "Drive temperature and wear counters are not read on Windows; the storage provider refuses them to a standard user."
                 .into(),
@@ -626,6 +784,10 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
             text(v.get("board_product")),
         ]);
         specs.board_id = (!board.is_empty()).then_some(board);
+        specs.board_vendor = text(v.get("board_manufacturer"));
+        specs.board_model = text(v.get("board_product"));
+        specs.board_version = text(v.get("board_version"));
+        specs.chassis = text(v.get("chassis"));
 
         // `Win32_Processor` reports cache sizes in KiB and the rated clock.
         let cache = |key: &str| {
@@ -634,6 +796,12 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                 .filter(|kb| *kb > 0)
                 .map(|kb| kb * 1024)
         };
+        if specs.cpu.l1_data_bytes.is_none() {
+            specs.cpu.l1_data_bytes = cache("cpu_l1_data_kb");
+        }
+        if specs.cpu.l1_instruction_bytes.is_none() {
+            specs.cpu.l1_instruction_bytes = cache("cpu_l1_instruction_kb");
+        }
         if specs.cpu.l2_bytes.is_none() {
             specs.cpu.l2_bytes = cache("cpu_l2_kb");
         }
@@ -650,15 +818,82 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
             specs.cpu.base_mhz = Some(mhz);
             specs.cpu.max_mhz = None;
         }
+        specs.cpu.current_mhz = v
+            .get("cpu_current_clock")
+            .and_then(Value::as_u64)
+            .filter(|mhz| *mhz > 0);
         specs.cpu.socket = text(v.get("cpu_socket"));
         specs.cpu.stepping = text(v.get("cpu_stepping"));
-        specs.gpu_driver = text(v.get("gpu_driver"));
-        let driver_date = text(v.get("gpu_driver_date"));
-        specs.gpu_driver_date = if driver_date.is_empty() {
-            String::new()
-        } else {
-            cim_date(&driver_date)
-        };
+        specs.cpu.description = text(v.get("cpu_description"));
+        specs.cpu.processor_id = text(v.get("cpu_id"));
+        specs.cpu.instructions = text(v.get("cpu_instructions"));
+        specs.cpu.virtualization = v.get("cpu_virtualization").and_then(Value::as_bool);
+
+        let registry = v
+            .get("gpu_reg")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for gpu in v
+            .get("gpus")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = text(gpu.get("name"));
+            if name.is_empty() {
+                continue;
+            }
+            let matched = registry.iter().find(|entry| {
+                let entry_name = text(entry.get("name"));
+                !entry_name.is_empty()
+                    && (entry_name.eq_ignore_ascii_case(&name)
+                        || name.contains(&entry_name)
+                        || entry_name.contains(&name))
+            });
+            // The registry value is the adapter's dedicated memory; the CIM
+            // AdapterRAM field saturates on cards with more than 4 GiB.
+            let vram = matched
+                .and_then(|entry| entry.get("memory"))
+                .and_then(Value::as_u64)
+                .filter(|bytes| *bytes > 0)
+                .or_else(|| {
+                    gpu.get("vram")
+                        .and_then(Value::as_u64)
+                        .filter(|bytes| *bytes > 0)
+                });
+            let device_id = text(gpu.get("pnp"));
+            specs.graphics.push(GraphicsSpec {
+                name,
+                chipset: text(gpu.get("chipset")),
+                vendor: text(gpu.get("vendor")),
+                device_id: pci_ids(&device_id),
+                vram_bytes: vram,
+                api: String::new(),
+                bus: text(gpu.get("pci")),
+                driver: text(gpu.get("driver")),
+                driver_date: cim_date(&text(gpu.get("driver_date"))),
+                pci: text(gpu.get("pci")),
+                refresh: {
+                    let value = text(gpu.get("refresh"));
+                    (!value.is_empty())
+                        .then(|| format!("{value} Hz"))
+                        .unwrap_or_default()
+                },
+                status: text(gpu.get("status")),
+                bios: matched
+                    .map(|entry| text(entry.get("bios")))
+                    .unwrap_or_default(),
+                bios_date: matched
+                    .map(|entry| text(entry.get("bios_date")))
+                    .unwrap_or_default(),
+                current_mode: text(gpu.get("mode")),
+            });
+        }
+        if let Some(primary) = specs.graphics.first() {
+            specs.gpu_driver = primary.driver.clone();
+            specs.gpu_driver_date = primary.driver_date.clone();
+        }
         specs.display = text(v.get("display"));
 
         if let Some(modules) = v.get("memory").and_then(Value::as_array) {
@@ -695,6 +930,127 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                         .and_then(Value::as_u64)
                         .filter(|speed| *speed > 0),
                     form_factor: text(module.get("form")),
+                    bank: text(module.get("bank")),
+                    data_width: module
+                        .get("data_width")
+                        .and_then(Value::as_u64)
+                        .filter(|bits| *bits > 0),
+                    total_width: module
+                        .get("total_width")
+                        .and_then(Value::as_u64)
+                        .filter(|bits| *bits > 0),
+                    configured_voltage_mv: module
+                        .get("voltage")
+                        .and_then(Value::as_u64)
+                        .filter(|mv| *mv > 0),
+                    min_voltage_mv: module
+                        .get("min_voltage")
+                        .and_then(Value::as_u64)
+                        .filter(|mv| *mv > 0),
+                    max_voltage_mv: module
+                        .get("max_voltage")
+                        .and_then(Value::as_u64)
+                        .filter(|mv| *mv > 0),
+                });
+            }
+        }
+        specs.memory.slots_used = Some(specs.memory.modules.len() as u32);
+        specs.memory.slots_total = v
+            .get("mem_slots")
+            .and_then(Value::as_u64)
+            .filter(|slots| *slots > 0)
+            .map(|slots| slots as u32);
+        specs.memory.max_capacity_bytes = v
+            .get("mem_max_capacity_kb")
+            .and_then(Value::as_u64)
+            .filter(|kb| *kb > 0)
+            .map(|kb| kb * 1024);
+        // SMBIOS memory-array error correction: 5/6/7 are ECC schemes, 3 is none.
+        specs.memory.ecc = match v.get("mem_ecc").and_then(Value::as_u64) {
+            Some(5..=7) => Some(true),
+            Some(3) => Some(false),
+            _ => specs.memory.modules.iter().find_map(|module| {
+                match (module.data_width, module.total_width) {
+                    (Some(data), Some(total)) if total > data => Some(true),
+                    (Some(_), Some(_)) => Some(false),
+                    _ => None,
+                }
+            }),
+        };
+        // A module whose rating is the JEDEC default may already be correct.
+        for module in &mut specs.memory.modules {
+            if module.configured_mhz.is_none() {
+                module.configured_mhz = module.speed_mhz;
+            }
+        }
+
+        if let Some(monitors) = v.get("monitors").and_then(Value::as_array) {
+            for monitor in monitors {
+                let model = text(monitor.get("model"));
+                let manufacturer = text(monitor.get("manufacturer"));
+                if model.is_empty() && manufacturer.is_empty() {
+                    continue;
+                }
+                specs.monitors.push(MonitorSpec {
+                    manufacturer,
+                    model,
+                    serial: text(monitor.get("serial"))
+                        .chars()
+                        .any(|c| c.is_ascii_alphanumeric() && c != '0')
+                        .then(|| text(monitor.get("serial")))
+                        .unwrap_or_default(),
+                    year: monitor
+                        .get("year")
+                        .and_then(Value::as_u64)
+                        .filter(|year| *year > 0)
+                        .map(|year| year as u32),
+                    week: monitor
+                        .get("week")
+                        .and_then(Value::as_u64)
+                        .filter(|week| (1..=53).contains(week))
+                        .map(|week| week as u32),
+                });
+            }
+        }
+
+        if let Some(drivers) = v.get("drivers").and_then(Value::as_array) {
+            for driver in drivers {
+                let name = text(driver.get("name"));
+                if name.is_empty() {
+                    continue;
+                }
+                let class_name = text(driver.get("class"));
+                // The driver store repeats identical generic entries per device.
+                if specs
+                    .drivers
+                    .iter()
+                    .any(|known| known.name == name && known.class_name == class_name)
+                {
+                    continue;
+                }
+                specs.drivers.push(DriverSpec {
+                    name,
+                    class_name,
+                    version: text(driver.get("version")),
+                    date: cim_date(&text(driver.get("date"))),
+                    provider: text(driver.get("provider")),
+                    signed: driver.get("signed").and_then(Value::as_bool),
+                });
+            }
+        }
+
+        if let Some(adapters) = v.get("network").and_then(Value::as_array) {
+            for adapter in adapters {
+                let name = text(adapter.get("name"));
+                let description = text(adapter.get("description"));
+                if name.is_empty() && description.is_empty() {
+                    continue;
+                }
+                specs.network_adapters.push(NetworkAdapterSpec {
+                    name,
+                    description,
+                    status: text(adapter.get("status")),
+                    speed: text(adapter.get("speed")),
                 });
             }
         }
@@ -1154,6 +1510,7 @@ fn parse_battery(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const MEMORY: &str = r#"
 Memory:
@@ -1411,6 +1768,87 @@ NVMExpress:
         let bluetooth = specs.bluetooth.expect("controller is reported");
         assert_eq!(bluetooth.state, Some(true));
         assert_eq!(bluetooth.chipset, "Intel(R) Wireless Bluetooth(R)");
+    }
+
+    #[test]
+    fn pci_identifiers_are_extracted_from_device_paths() {
+        assert_eq!(
+            pci_ids(r"PCI\VEN_10DE&DEV_2786&SUBSYS_88881043&REV_A1\4&2D8B7C3&0&0008"),
+            "10DE:2786"
+        );
+        assert_eq!(pci_ids("ACPI\\PNP0A08\\0"), "");
+    }
+
+    #[test]
+    fn windows_inventory_reads_gpus_slots_monitors_and_drivers() {
+        let value: Value = serde_json::from_str(
+            r#"{
+              "gpus": [{
+                "name": "NVIDIA GeForce RTX 4070",
+                "vendor": "NVIDIA",
+                "chipset": "GeForce RTX 4070",
+                "pnp": "PCI\\VEN_10DE&DEV_2786&SUBSYS_88881043&REV_A1\\4&2D8B7C3&0&0008",
+                "pci": "PCI bus 1, device 0, function 0",
+                "driver": "31.0.15.5222",
+                "driver_date": "20240515000000.000000-000",
+                "vram": 4294967295,
+                "mode": "2560 x 1440 x 32",
+                "refresh": "165",
+                "status": "OK"
+              }],
+              "display": "2560 x 1440 x 32 @ 165 Hz",
+              "gpu_reg": [{
+                "name": "NVIDIA GeForce RTX 4070",
+                "bios": "95.04.3C.40.8C",
+                "bios_date": "2023-04-01",
+                "memory": 12884901888
+              }],
+              "mem_slots": 4,
+              "mem_max_capacity_kb": 67108864,
+              "mem_ecc": 3,
+              "memory": [{
+                "slot": "DIMM 1", "bank": "BANK 0", "size": 17179869184,
+                "type": 34, "speed": 6000, "configured": 5200,
+                "manufacturer": "G.Skill", "part": "F5-6000", "serial": "1234",
+                "form": "DIMM", "data_width": 64, "total_width": 64,
+                "voltage": 1350, "min_voltage": 1200, "max_voltage": 1350
+              }],
+              "monitors": [{
+                "manufacturer": "DEL", "model": "DELL U2720Q",
+                "serial": "ABC123", "year": 2021, "week": 14
+              }],
+              "drivers": [{
+                "name": "NVIDIA GeForce RTX 4070", "class": "DISPLAY",
+                "version": "31.0.15.5222",
+                "date": "20240515000000.000000-000",
+                "provider": "NVIDIA", "signed": true
+              }],
+              "network": [{
+                "name": "Ethernet", "description": "Intel I225-V",
+                "media": "802.3", "status": "Up", "speed": "2.5 Gbps"
+              }]
+            }"#,
+        )
+        .unwrap();
+        let mut specs = SystemSpecs::default();
+        windows::apply(&mut specs, &value);
+        assert_eq!(specs.graphics.len(), 1);
+        assert_eq!(specs.graphics[0].device_id, "10DE:2786");
+        assert_eq!(specs.graphics[0].vram_bytes, Some(12_884_901_888));
+        assert_eq!(specs.graphics[0].bios, "95.04.3C.40.8C");
+        assert_eq!(specs.graphics[0].bus, "PCI bus 1, device 0, function 0");
+        assert_eq!(specs.graphics[0].refresh, "165 Hz");
+        assert_eq!(specs.memory.slots_total, Some(4));
+        assert_eq!(specs.memory.slots_used, Some(1));
+        assert_eq!(specs.memory.modules[0].configured_mhz, Some(5200));
+        assert_eq!(specs.memory.modules[0].configured_voltage_mv, Some(1350));
+        assert_eq!(specs.memory.ecc, Some(false));
+        assert_eq!(specs.monitors[0].model, "DELL U2720Q");
+        assert_eq!(specs.monitors[0].week, Some(14));
+        assert_eq!(specs.drivers.len(), 1);
+        assert_eq!(specs.drivers[0].signed, Some(true));
+        assert_eq!(specs.network_adapters[0].speed, "2.5 Gbps");
+        assert_eq!(specs.display, "2560 x 1440 x 32 @ 165 Hz");
     }
 
     #[test]
