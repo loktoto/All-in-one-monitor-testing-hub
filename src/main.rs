@@ -44,11 +44,12 @@ const AMBER: Color32 = Color32::from_rgb(255, 159, 10);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const VIOLET: Color32 = Color32::from_rgb(191, 90, 242);
 
-const KINDS: [(Kind, &str, &str); 4] = [
+const KINDS: [(Kind, &str, &str); 5] = [
     (Kind::Cpu, "CPU compute", "Integer rounds, fixed answer"),
     (Kind::Gpu, "GPU check", "Shader dispatch, read back"),
     (Kind::Memory, "Memory patterns", "Alternating byte patterns"),
     (Kind::Disk, "File I/O", "Owned scratch file verified"),
+    (Kind::Combined, "Combined load", "CPU + memory together"),
 ];
 
 fn main() -> eframe::Result {
@@ -199,6 +200,9 @@ struct App {
     auto_stop_fired: bool,
     report: String,
     report_format: Format,
+    /// Indices into the session result list for the side-by-side comparison.
+    compare_a: usize,
+    compare_b: usize,
     gpu_index: usize,
     gpu_initialized: bool,
     message: String,
@@ -287,6 +291,8 @@ impl App {
             auto_stop_fired: false,
             report: "hardware-hub-report.txt".into(),
             report_format: Format::Text,
+            compare_a: 0,
+            compare_b: 0,
             gpu_index: 0,
             gpu_initialized: false,
             message: String::new(),
@@ -1630,6 +1636,14 @@ impl App {
                 section_title(ui, "Check", Some(if running { "locked while running" } else if fixed.is_some() { "selected for this device" } else { "choose one" }));
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!running, |ui| {
+                    // Keep the primary action visible: scroll the configuration,
+                    // not the Start button (Apple HIG: consistent action location).
+                    let config_height = (ui.available_height() - 62.0).max(150.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("stress-config")
+                        .max_height(config_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
                     if fixed.is_none() {
                     for pair in KINDS.chunks(2) {
                         ui.columns(2, |tiles| {
@@ -1646,7 +1660,7 @@ impl App {
                                 }
                             }
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(2.0);
                     }
                     } else {
                         ui.label(RichText::new(kind_label(self.kind)).strong().color(TEXT));
@@ -1747,12 +1761,28 @@ impl App {
                             picker(ui, "disk-pattern", "Pattern", &mut self.disk_pattern,
                                 &DiskPattern::ALL.map(|v| (v, v.label())));
                         }
+                        Kind::Combined => {
+                            ui.label(
+                                RichText::new(
+                                    "CPU integer rounds and memory write/read patterns run at the same time, in the style of a combined system load. Both checks stay within their usual limits.",
+                                )
+                                .size(11.0)
+                                .color(TEXT_DIM),
+                            );
+                            ui.add_space(4.0);
+                            ui.add(egui::Slider::new(&mut self.workers, 1..=8).text("CPU workers"));
+                            ui.add(egui::Slider::new(&mut self.mib, 1..=256).text("memory MiB"));
+                            ui.add_space(6.0);
+                            picker(ui, "combined-mem-pattern", "Memory pattern", &mut self.mem_pattern,
+                                &MemPattern::ALL.map(|v| (v, v.label())));
+                        }
                     }
                     ui.add_space(6.0);
                     duration_presets(ui, &mut self.seconds);
                     ui.add_space(4.0);
                     ui.add(egui::Slider::new(&mut self.seconds, 1..=600).text("max seconds"));
-                    ui.add_space(8.0);
+                        });
+                    ui.add_space(4.0);
                     let start = ui.add_sized(
                         [ui.available_width(), 34.0],
                         egui::Button::new(RichText::new("Start test").strong().color(Color32::from_rgb(9, 18, 30)))
@@ -2664,6 +2694,92 @@ impl App {
 
         ui.add_space(12.0);
 
+        // Side-by-side result comparison, in the style of a pro diagnostic
+        // report tool. Uses only results already collected this session.
+        if records.len() >= 2 {
+            card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                section_title(ui, "Compare runs", Some("this session only"));
+                ui.add_space(6.0);
+                let labels: Vec<String> = records
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        format!(
+                            "{} · {} · {}",
+                            i + 1,
+                            kind_label(r.kind),
+                            timestamp_text(r.timestamp)
+                        )
+                    })
+                    .collect();
+                self.compare_a = self.compare_a.min(records.len() - 1);
+                self.compare_b = self.compare_b.min(records.len() - 1);
+                ui.columns(2, |cols| {
+                    for (slot, selected) in [(&mut self.compare_a, "A"), (&mut self.compare_b, "B")]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let (value, label) = selected;
+                        let width = cols[slot].available_width() - 24.0;
+                        cols[slot].horizontal(|ui| {
+                            ui.label(RichText::new(label).size(11.0).strong().color(MUTED));
+                            egui::ComboBox::from_id_salt(format!("compare-{label}"))
+                                .width(width)
+                                .selected_text(RichText::new(labels[*value].clone()).size(11.0))
+                                .show_ui(ui, |ui| {
+                                    for (i, text) in labels.iter().enumerate() {
+                                        ui.selectable_value(value, i, text);
+                                    }
+                                });
+                        });
+                    }
+                });
+                let a = &records[self.compare_a];
+                let b = &records[self.compare_b];
+                ui.add_space(8.0);
+                comparison_row(ui, "Result", &a.status.to_string(), &b.status.to_string());
+                comparison_row(
+                    ui,
+                    "Verified",
+                    &format!(
+                        "{} {}",
+                        a.verified_units
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unknown".into()),
+                        a.verified_unit
+                    ),
+                    &format!(
+                        "{} {}",
+                        b.verified_units
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unknown".into()),
+                        b.verified_unit
+                    ),
+                );
+                comparison_row(
+                    ui,
+                    "Errors",
+                    &a.error_count.to_string(),
+                    &b.error_count.to_string(),
+                );
+                comparison_row(
+                    ui,
+                    "Elapsed",
+                    &format!("{:.1}s", a.elapsed),
+                    &format!("{:.1}s", b.elapsed),
+                );
+                comparison_row(ui, "Settings", &config_summary(&a.config), &config_summary(&b.config));
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Different settings or durations make raw unit counts non-comparable. No score is implied.")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            });
+            ui.add_space(12.0);
+        }
+
         if records.is_empty() {
             card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -2735,7 +2851,7 @@ impl App {
                         ui.strong("Test settings");
                         ui.label(format!("Time limit: {} seconds · {}", r.config.seconds, config_summary(&r.config)));
                         if r.kind == Kind::Disk { ui.label(format!("Directory: {} · write cap: {} MiB", r.config.directory.display(), r.config.disk_write_limit_mib)); }
-                        if r.kind == Kind::Memory { ui.label(format!("Pattern: {}", r.config.mem_pattern.label())); }
+                        if r.kind == Kind::Memory || r.kind == Kind::Combined { ui.label(format!("Pattern: {}", r.config.mem_pattern.label())); }
                         if r.kind == Kind::Disk { ui.label(format!("Pattern: {}", r.config.disk_pattern.label())); }
                         if r.kind == Kind::Gpu { ui.label(format!("Intensity: {}", r.config.gpu_intensity.label())); }
                         ui.strong("System context at start");
@@ -2749,6 +2865,7 @@ impl App {
                             Kind::Gpu => "A small compute readback is checked; it is not a full GPU or VRAM stress test.",
                             Kind::Memory => "Only the allocated region is checked; this is not a full-RAM or ECC test.",
                             Kind::Disk => "Only an owned temporary file is checked; readback may use cache and is not a physical-drive health test.",
+                            Kind::Combined => "CPU and memory checks run together to add combined load, but this is not a PSU/voltage certification or a full-RAM test.",
                         });
                         ui.weak("A completed check does not guarantee hardware health. No automatic thermal shutdown is available.");
                     });
@@ -3797,7 +3914,7 @@ fn duration_presets(ui: &mut egui::Ui, seconds: &mut u64) {
 
 fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 50.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         // Clip to the tile: a long hint used to spill over the card edge and
         // overlap the next tile and the description below.
@@ -4172,7 +4289,20 @@ fn kind_label(kind: Kind) -> &'static str {
         Kind::Gpu => "GPU check",
         Kind::Memory => "Memory patterns",
         Kind::Disk => "File I/O",
+        Kind::Combined => "Combined CPU + memory",
     }
+}
+
+fn comparison_row(ui: &mut egui::Ui, label: &str, a: &str, b: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(10.5).color(MUTED));
+        ui.add_space(4.0);
+        ui.label(RichText::new(a).size(11.0).strong().color(TEXT));
+        ui.add_space(8.0);
+        ui.label(RichText::new("vs").size(9.5).color(MUTED));
+        ui.add_space(8.0);
+        ui.label(RichText::new(b).size(11.0).strong().color(TEXT));
+    });
 }
 
 fn config_summary(config: &Config) -> String {
@@ -4187,6 +4317,7 @@ fn config_summary(config: &Config) -> String {
             "{} MiB file, {} MiB cap",
             config.mib, config.disk_write_limit_mib
         ),
+        Kind::Combined => format!("{} workers + {} MiB memory", config.workers, config.mib),
     }
 }
 

@@ -16,6 +16,9 @@ pub enum Kind {
     Gpu,
     Memory,
     Disk,
+    /// CPU and memory checks running at the same time, in the style of a
+    /// combined power-supply stability test. Still bounded correctness checks.
+    Combined,
 }
 impl Kind {
     pub fn unit(self) -> &'static str {
@@ -24,6 +27,16 @@ impl Kind {
             Self::Gpu => "compute dispatches",
             Self::Memory => "memory passes",
             Self::Disk => "file passes",
+            Self::Combined => "work units",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU compute",
+            Self::Gpu => "GPU check",
+            Self::Memory => "Memory patterns",
+            Self::Disk => "File I/O",
+            Self::Combined => "Combined CPU + memory",
         }
     }
 }
@@ -177,6 +190,11 @@ impl serde::Serialize for Config {
                 out.serialize_field("write_limit_mib", &self.disk_write_limit_mib)?;
                 out.serialize_field("pattern", &self.disk_pattern)?;
             }
+            Kind::Combined => {
+                out.serialize_field("workers", &self.workers)?;
+                out.serialize_field("memory_mib", &self.mib)?;
+                out.serialize_field("pattern", &self.mem_pattern)?;
+            }
         }
         out.end()
     }
@@ -328,6 +346,7 @@ pub fn start(
                     && (1..=1024).contains(&config.disk_write_limit_mib)
                     && config.disk_write_limit_mib >= config.mib as u64
             }
+            Kind::Combined => (1..=8).contains(&config.workers) && (1..=256).contains(&config.mib),
         };
     if !valid {
         return Err("Limits: 1–600 seconds; CPU 1–8 workers; memory/file 1–256 MiB; disk write limit must be at least file size and at most 1024 MiB.".into());
@@ -356,6 +375,7 @@ pub fn start(
             Kind::Gpu => gpu(&config, adapter.as_ref(), &cancel, deadline, &state),
             Kind::Memory => memory(&config, &cancel, deadline, &state),
             Kind::Disk => disk(&config, &cancel, deadline, &state),
+            Kind::Combined => combined(&config, &cancel, deadline, &state),
         }))
         .unwrap_or_else(|_| {
             Err(TestError::Failed(
@@ -717,6 +737,100 @@ fn disk_with_cap(
     ))
 }
 
+/// Run the CPU and memory correctness checks at the same time and present one
+/// combined result. Each subsystem keeps its own bounded limits and publishes
+/// into a private state; this function merges their counters for the live UI
+/// and keeps the first mismatches from either worker. This is a power-load
+/// analogue, not a voltage or PSU certification.
+fn combined(
+    c: &Config,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    live: &Mutex<State>,
+) -> Result<Outcome, TestError> {
+    let mut cpu_config = c.clone();
+    cpu_config.kind = Kind::Cpu;
+    let mut mem_config = c.clone();
+    mem_config.kind = Kind::Memory;
+
+    let cpu_live = Mutex::new(State::default());
+    let mem_live = Mutex::new(State::default());
+    let done = AtomicBool::new(false);
+    let merge = || {
+        let cpu = cpu_live.lock().map(|s| s.live.clone()).unwrap_or_default();
+        let mem = mem_live.lock().map(|s| s.live.clone()).unwrap_or_default();
+        publish(
+            live,
+            cpu.units + mem.units,
+            cpu.errors + mem.errors,
+            "CPU + memory",
+        );
+    };
+
+    let (cpu_result, mem_result) = thread::scope(|scope| {
+        let cpu_handle = scope.spawn(|| cpu(&cpu_config, cancel, deadline, &cpu_live));
+        let mem_handle = scope.spawn(|| memory(&mem_config, cancel, deadline, &mem_live));
+        let merger = scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+                merge();
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let cpu_result = cpu_handle.join().unwrap_or_else(|_| {
+            Err(TestError::Failed(
+                "CPU worker panicked during combined check".into(),
+            ))
+        });
+        let mem_result = mem_handle.join().unwrap_or_else(|_| {
+            Err(TestError::Failed(
+                "Memory worker panicked during combined check".into(),
+            ))
+        });
+        done.store(true, Ordering::Relaxed);
+        let _ = merger.join();
+        (cpu_result, mem_result)
+    });
+    merge();
+
+    let mut verified = 0u64;
+    let mut errors: Vec<ErrorDetail> = Vec::new();
+    let mut error_count = 0u64;
+    let mut details: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, result) in [("CPU", cpu_result), ("Memory", mem_result)] {
+        match result {
+            Ok(outcome) => {
+                verified += outcome.verified;
+                error_count += outcome.error_count;
+                for detail in outcome.errors {
+                    if errors.len() < MAX_STORED_ERRORS {
+                        errors.push(detail);
+                    }
+                }
+                details.push(format!("{name}: {}", outcome.detail));
+            }
+            Err(TestError::Failed(message)) => failures.push(format!("{name}: {message}")),
+            Err(TestError::Unavailable(message)) => {
+                return Err(TestError::Unavailable(format!("{name}: {message}")));
+            }
+        }
+    }
+    publish(live, verified, error_count, "CPU + memory");
+    if !failures.is_empty() {
+        return Err(TestError::Failed(failures.join(" · ")));
+    }
+    Ok(Outcome {
+        verified,
+        detail: format!(
+            "Combined CPU + memory load; {} · {} mismatch(es)",
+            details.join(" · "),
+            error_count
+        ),
+        errors,
+        error_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,6 +1084,42 @@ mod tests {
         assert_eq!(guard.live.errors, 0);
         assert!(!guard.live.phase.is_empty());
         assert!(result.error_count == 0);
+    }
+
+    #[test]
+    fn combined_runs_cpu_and_memory_with_merged_progress() {
+        let live = Arc::new(Mutex::new(State::default()));
+        let mut config = test_config(Kind::Combined);
+        config.workers = 2;
+        config.mib = 1;
+        let result = combined(
+            &config,
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_millis(400),
+            &live,
+        )
+        .unwrap();
+        assert!(result.detail.contains("CPU:"), "{result:?}");
+        assert!(result.detail.contains("Memory:"), "{result:?}");
+        assert!(result.verified > 0, "{result:?}");
+        assert_eq!(result.error_count, 0);
+        let guard = live.lock().unwrap();
+        assert_eq!(guard.live.units, result.verified);
+        assert_eq!(guard.live.phase, "CPU + memory");
+    }
+
+    #[test]
+    fn combined_stops_when_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        cancel.store(true, Ordering::Relaxed);
+        let result = combined(
+            &test_config(Kind::Combined),
+            &cancel,
+            Instant::now() + Duration::from_secs(1),
+            &dummy_live(),
+        )
+        .unwrap();
+        assert!(result.verified < 1000, "{result:?}");
     }
 
     #[test]

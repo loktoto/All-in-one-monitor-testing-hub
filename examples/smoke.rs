@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("CPU cancellation: Stopped; restarting");
-    for kind in [Kind::Cpu, Kind::Memory, Kind::Disk, Kind::Gpu] {
+    for kind in [Kind::Cpu, Kind::Memory, Kind::Disk, Kind::Gpu, Kind::Combined] {
         let cfg = Config {
             kind,
             seconds: 1,
@@ -154,8 +154,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report::export(&report_path, Format::Json, &records)?;
     let bytes = fs::read(&report_path)?;
     let report_json: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if report_json["results"].as_array().map(Vec::len) != Some(5) {
-        return Err("report did not contain five results".into());
+    if report_json["results"].as_array().map(Vec::len) != Some(6) {
+        return Err("report did not contain six results".into());
     }
     if report::export(&report_path, Format::Json, &records).is_ok()
         || fs::read(&report_path)? != bytes

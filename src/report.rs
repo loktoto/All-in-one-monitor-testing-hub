@@ -21,6 +21,7 @@ pub fn export(path: &Path, format: Format, records: &[ResultRecord]) -> Result<(
                     crate::stress::Kind::Gpu=>format!("GPU {}",r.config.gpu_adapter.as_deref().unwrap_or("not selected")),
                     crate::stress::Kind::Memory=>format!("memory {} MiB",r.config.mib),
                     crate::stress::Kind::Disk=>format!("file {} MiB, write cap {} MiB, directory {}",r.config.mib,r.config.disk_write_limit_mib,r.config.directory.display()),
+                    crate::stress::Kind::Combined=>format!("workers {}, memory {} MiB, pattern {}",r.config.workers,r.config.mib,r.config.mem_pattern.label()),
                 };
                 let age=r.context.snapshot_age_seconds.map(|v|format!("{v:.1} s")).unwrap_or_else(||"unavailable".into());
                 out.push_str(&format!("{:?} | {} | {:.1}s | Unix {}\n{}\nVerified {}: {}\nSettings: duration {}s, {}\nSystem: {}, {} logical CPUs, {} bytes RAM, OS {}, adapters: {}; snapshot age at start: {}\n\n",r.kind,r.status,r.elapsed,r.timestamp,r.detail,r.verified_unit,r.verified_units.map(|n|n.to_string()).unwrap_or_else(||"unknown".into()),r.config.seconds,settings,r.context.cpu,r.context.logical_cpus,r.context.memory_total,r.context.os,r.context.adapters.join(", "),age));

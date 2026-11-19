@@ -74,10 +74,28 @@ and disk (three), three GPU shader intensity levels, a live WORK PROGRESS block
 run, and mismatch records with location/expected/actual values in the result
 card and Reports. An opt-in checkbox stops only the running check at the
 advisory temperature limit. These are deliberately still **bounded correctness
-checks**, not exhaustive burn-in: no simultaneous subsystem load, no comparable
-score, no raw-disk or full-RAM coverage, and no hardware writes. Full MemTest86
-or Prime95 algorithm suites need boot-time or kernel-level access that conflicts
-with this app's read-only, always-reversible positioning.
+checks**, not exhaustive burn-in: no comparable score, no raw-disk or full-RAM
+coverage, and no hardware writes. Full MemTest86 or Prime95 algorithm suites need
+boot-time or kernel-level access that conflicts with this app's read-only,
+always-reversible positioning.
+
+## Combined load and report comparison (2026-11-19 follow-up 2)
+
+A fresh 2026 check of the OCCT site (v17 notes, May 2026) confirmed that its
+headline differentiators are combined CPU/GPU/RAM/PSU testing, integrated live
+HWiNFO telemetry, and a report comparison tool with shareable stability
+certificates. Comparing that with the current app left two safe, software-only
+gaps: a multi-subsystem load, and any way to compare two runs.
+
+Added: a **Combined CPU + memory** check that runs the existing bounded CPU and
+memory workers concurrently with one merged progress/error readout and a single
+combined result (including first mismatch detail from either worker). Added a
+**Compare runs** card in Reports that places any two session results side by side
+(status, verified units, errors, elapsed, settings) with a note that differing
+settings make raw counts non-comparable. GPU, disk and PSI/voltage remain outside
+the combined load: a GPU adapter cannot be safely shared with a second worker on
+every backend, and real PSU stability needs voltage/current sensors this app does
+not read. No certificate or score is implied by either addition.
 
 ## Remaining, deliberate boundaries
 
