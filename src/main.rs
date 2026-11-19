@@ -162,7 +162,15 @@ fn initial_page() -> Page {
         Ok("gpu") => Page::Gpu,
         Ok("memory") => Page::Memory,
         Ok("drivers") => Page::Drivers,
+        Ok("thermal") | Ok("thermals") => Page::Thermal,
+        Ok("motherboard") | Ok("board") => Page::Motherboard,
+        Ok("network") => Page::Network,
+        Ok("bluetooth") => Page::Bluetooth,
+        Ok("frames") => Page::Frames,
         Ok("tests") => Page::Tests,
+        Ok("reports") => Page::Reports,
+        Ok("processes") => Page::Processes,
+        Ok("overview") => Page::Overview,
         _ => Page::Overview,
     }
 }
@@ -200,6 +208,7 @@ struct App {
     auto_stop_fired: bool,
     report: String,
     report_format: Format,
+    certificate_path: String,
     /// Indices into the session result list for the side-by-side comparison.
     compare_a: usize,
     compare_b: usize,
@@ -209,6 +218,7 @@ struct App {
     history: History,
     history_path: String,
     log_path: String,
+    all_sensor_log_path: String,
     recorder: Option<Recorder>,
     process_query: String,
     process_sort_memory: bool,
@@ -291,6 +301,7 @@ impl App {
             auto_stop_fired: false,
             report: "hardware-hub-report.txt".into(),
             report_format: Format::Text,
+            certificate_path: "hardware-hub-run-summary.txt".into(),
             compare_a: 0,
             compare_b: 0,
             gpu_index: 0,
@@ -299,6 +310,7 @@ impl App {
             history: History::default(),
             history_path: "hardware-hub-history.csv".into(),
             log_path: "hardware-hub-session.csv".into(),
+            all_sensor_log_path: "hardware-hub-all-sensors.csv".into(),
             recorder: None,
             process_query: String::new(),
             process_sort_memory: false,
@@ -392,7 +404,7 @@ impl App {
                         };
                         ui.label(RichText::new(backend).size(10.0).color(MUTED));
                         ui.label(
-                            RichText::new("⌘/Ctrl 1–9: pages · Esc: stop check")
+                            RichText::new("⌘/Ctrl 1–9 pages · ⇧1–6 more · Esc stop")
                                 .size(10.0)
                                 .color(MUTED),
                         );
@@ -1279,7 +1291,8 @@ impl App {
                                 }
                             });
                         ui.weak("A gap means the sensor was missing or the sample was delayed; gaps are never drawn as a line.");
-                        egui::CollapsingHeader::new("Export this sensor to CSV").show(ui, |ui| {
+                        egui::CollapsingHeader::new("Export sensors to CSV").show(ui, |ui| {
+                            ui.label(RichText::new("One sensor").size(10.5).color(MUTED));
                             ui.horizontal(|ui| {
                                 ui.text_edit_singleline(&mut self.sensor_log_path);
                                 if ui.button("Export CSV").clicked() {
@@ -1290,6 +1303,21 @@ impl App {
                                         self.started,
                                     ) {
                                         Ok(()) => format!("Saved {}", self.sensor_log_path),
+                                        Err(error) => format!("Export failed: {error}"),
+                                    };
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("All sensors (one column each)").size(10.5).color(MUTED));
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut self.all_sensor_log_path);
+                                if ui.button("Export all").clicked() {
+                                    self.message = match history::export_all_sensors_csv(
+                                        std::path::Path::new(&self.all_sensor_log_path),
+                                        &self.history,
+                                        self.started,
+                                    ) {
+                                        Ok(()) => format!("Saved {}", self.all_sensor_log_path),
                                         Err(error) => format!("Export failed: {error}"),
                                     };
                                 }
@@ -2846,6 +2874,27 @@ impl App {
                     .color(MUTED),
                 );
                 error_details(ui, &r.errors, r.error_count);
+                ui.push_id(format!("certificate-{record_index}"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.certificate_path);
+                        if ui.button("Save run summary").clicked() {
+                            self.message = match report::export_certificate(
+                                std::path::Path::new(&self.certificate_path),
+                                r,
+                                self.run_peak_c,
+                            ) {
+                                Ok(()) => format!("Saved {}", self.certificate_path),
+                                Err(error) => format!("Export failed: {error}"),
+                            };
+                        }
+                    });
+                    ui.label(
+                        RichText::new("One-page, shareable summary with no paths or hardware identifiers. Not a benchmark score or certification.")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(4.0);
                 ui.push_id(record_index, |ui| {
                     egui::CollapsingHeader::new("Evidence and limits").show(ui, |ui| {
                         ui.strong("Test settings");
@@ -3061,12 +3110,13 @@ impl eframe::App for App {
             );
         }
         // Apple-like keyboard navigation: Cmd/Ctrl+1…9 jumps between the main
-        // pages, Escape requests cancellation of the current bounded check.
+        // pages, Cmd/Ctrl+Shift+1…6 reaches the remaining six, Escape requests
+        // cancellation of the current bounded check.
         let jump = ctx.input(|input| {
             if !input.modifiers.command && !input.modifiers.ctrl {
                 return None;
             }
-            [
+            let keys = [
                 egui::Key::Num1,
                 egui::Key::Num2,
                 egui::Key::Num3,
@@ -3076,9 +3126,13 @@ impl eframe::App for App {
                 egui::Key::Num7,
                 egui::Key::Num8,
                 egui::Key::Num9,
-            ]
-            .iter()
-            .position(|key| input.key_pressed(*key))
+            ];
+            let index = keys.iter().position(|key| input.key_pressed(*key))?;
+            if input.modifiers.shift {
+                Some(9 + index)
+            } else {
+                Some(index)
+            }
         });
         if let Some(index) = jump {
             self.page = match index {
@@ -3090,7 +3144,15 @@ impl eframe::App for App {
                 5 => Page::Thermal,
                 6 => Page::Details,
                 7 => Page::Processes,
-                _ => Page::Reports,
+                8 => Page::Reports,
+                // Shift+1…6 cover the pages that had no keyboard access.
+                9 => Page::Motherboard,
+                10 => Page::Drivers,
+                11 => Page::Network,
+                12 => Page::Bluetooth,
+                13 => Page::Frames,
+                14 => Page::Tests,
+                _ => self.page,
             };
         }
         if running

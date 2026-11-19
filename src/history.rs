@@ -196,6 +196,50 @@ pub fn export_sensor_csv(
         .map_err(|e| format!("Sensor history write failed; a partial file may remain: {e}"))
 }
 
+/// Wide CSV: one column per temperature sensor, so all series can be compared
+/// in a spreadsheet. Keys are quoted when needed; a missing sample is blank,
+/// never zero or interpolated.
+pub fn export_all_sensors_csv(
+    path: &Path,
+    history: &History,
+    origin: Instant,
+) -> Result<(), String> {
+    if history.is_empty() {
+        return Err("No history samples to export.".into());
+    }
+    let keys = temperature_keys(history);
+    if keys.is_empty() {
+        return Err("No temperature sensor was recorded yet.".into());
+    }
+    let mut data = String::from("elapsed_seconds");
+    for key in &keys {
+        data.push(',');
+        data.push_str(&csv_field(key));
+    }
+    data.push('\n');
+    for sample in history.samples() {
+        data.push_str(&format!(
+            "{:.3}",
+            sample.at.saturating_duration_since(origin).as_secs_f64()
+        ));
+        for key in &keys {
+            let value = temperature_value(sample, key)
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_default();
+            data.push(',');
+            data.push_str(&value);
+        }
+        data.push('\n');
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("Cannot create sensor history file: {e}"))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("Sensor history write failed; a partial file may remain: {e}"))
+}
+
 fn csv_field(text: &str) -> String {
     if text.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", text.replace('"', "\"\""))
@@ -334,6 +378,53 @@ mod tests {
             "elapsed_seconds,sensor,celsius\n0.000,TC0P,61.500\n1.000,TC0P,\n"
         );
         assert!(export_sensor_csv(&path, &history, "TC0P", now).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn all_sensor_csv_has_one_column_each_and_keeps_gaps_blank() {
+        let now = Instant::now();
+        let mut history = History::default();
+        let mut sample = snapshot(now);
+        sample.temperatures.push(Temperature {
+            key: "TC0P".into(),
+            label: "CPU".into(),
+            celsius: Some(61.5),
+            min: None,
+            max: None,
+        });
+        sample.temperatures.push(Temperature {
+            key: "TCSF".into(),
+            label: "Skin".into(),
+            celsius: Some(40.0),
+            min: None,
+            max: None,
+        });
+        history.record(&sample, now);
+        let mut later = snapshot(now + Duration::from_secs(1));
+        later.temperatures.push(Temperature {
+            key: "TC0P".into(),
+            label: "CPU".into(),
+            celsius: Some(63.0),
+            min: None,
+            max: None,
+        });
+        // TCSF missing in the second sample: blank, never zero.
+        history.record(&later, now + Duration::from_secs(1));
+        let path = std::env::temp_dir().join(format!(
+            "hardware-hub-all-sensors-{}-{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        export_all_sensors_csv(&path, &history, now).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap(),
+            "elapsed_seconds,TC0P,TCSF\n0.000,61.500,40.000\n1.000,63.000,\n"
+        );
+        assert!(export_all_sensors_csv(&path, &history, now).is_err());
         std::fs::remove_file(path).unwrap();
     }
 

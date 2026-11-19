@@ -111,7 +111,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("CPU cancellation: Stopped; restarting");
-    for kind in [Kind::Cpu, Kind::Memory, Kind::Disk, Kind::Gpu, Kind::Combined] {
+    for kind in [
+        Kind::Cpu,
+        Kind::Memory,
+        Kind::Disk,
+        Kind::Gpu,
+        Kind::Combined,
+    ] {
         let cfg = Config {
             kind,
             seconds: 1,

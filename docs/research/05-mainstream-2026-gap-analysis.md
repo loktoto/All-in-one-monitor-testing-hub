@@ -97,6 +97,20 @@ the combined load: a GPU adapter cannot be safely shared with a second worker on
 every backend, and real PSU stability needs voltage/current sensors this app does
 not read. No certificate or score is implied by either addition.
 
+## Certificates, wide sensor logs and full keyboard access (2026-11-19 follow-up 3)
+
+A further 2026 pass confirmed HWiNFO's multi-format reports (text/CSV/HTML/XML),
+per-sensor monitoring/alerting and OSD, MemTest86's 13 algorithms with pass
+counts and ECC support, and CPU-Z's validator/benchmark graphs against our app.
+Three more safe gaps were closed: a shareable one-page **run summary**
+(OCCT-style stability certificate, but explicitly not a score or certification,
+with paths/adapter names/serials omitted), an **all-sensors wide CSV** export
+(HWMonitor-style multi-series log, gaps left blank), and **keyboard access to all
+15 pages** via Cmd/Ctrl+Shift+1–6 for the six previously mouse-only pages.
+Per-sensor alert rules, target pass counts and ECC/boot-time testing remain
+deliberate boundaries: they need intrusive changes or kernel/boot access that
+conflicts with the read-only, always-reversible positioning.
+
 ## Remaining, deliberate boundaries
 
 CPU-Z-style voltage readings depend on model-specific SMC keys and are not
