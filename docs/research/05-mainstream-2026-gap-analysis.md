@@ -57,6 +57,28 @@ short explanatory captions, selectable severity chips, a graph with a compact
 range summary, and discoverable keyboard hints. Alerts and sampling were placed
 on the Thermal page where their meaning is obvious; exports live on Reports.
 
+## Pro stress-test workflow (2026-11-19 follow-up)
+
+A second pass focused on how dedicated stress tools present a run, using the
+vendors' own pages: Prime95's Torture Test modes (Small/Large FFTs and Blend,
+with per-worker iterations and error counts), MemTest86's 14 algorithms with
+pass/test numbers and address/expected/actual error lines, OCCT's live graphs
+and multi-sensor supervision with opt-in automatic stop, and BurnInTest's
+cycle counters and simultaneous subsystem tests. The concrete gaps in this app
+were a single fixed workload, no error detail, no work-unit progress or rate,
+and only advisory safety feedback.
+
+The stress workflow now exposes: selectable data patterns for memory (four)
+and disk (three), three GPU shader intensity levels, a live WORK PROGRESS block
+(phase, completed units, units/s, error count), a temperature sparkline during a
+run, and mismatch records with location/expected/actual values in the result
+card and Reports. An opt-in checkbox stops only the running check at the
+advisory temperature limit. These are deliberately still **bounded correctness
+checks**, not exhaustive burn-in: no simultaneous subsystem load, no comparable
+score, no raw-disk or full-RAM coverage, and no hardware writes. Full MemTest86
+or Prime95 algorithm suites need boot-time or kernel-level access that conflicts
+with this app's read-only, always-reversible positioning.
+
 ## Remaining, deliberate boundaries
 
 CPU-Z-style voltage readings depend on model-specific SMC keys and are not

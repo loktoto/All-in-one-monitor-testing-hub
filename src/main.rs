@@ -10,7 +10,10 @@ use hardware_hub::{
     report::{self, Format},
     smart::{self, SmartReport},
     specs::{self, SystemSpecs},
-    stress::{self, Config, Kind, ReportContext, State, Status},
+    stress::{
+        self, Config, DiskPattern, ErrorDetail, GpuIntensity, Kind, MemPattern, ReportContext,
+        State, Status,
+    },
     system_report,
     telemetry::{self, Snapshot},
 };
@@ -177,12 +180,23 @@ struct App {
     /// Highest temperature observed during the current stress run, for the
     /// live safety readout. Cleared whenever a new check starts.
     run_peak_c: Option<f32>,
+    /// Previous live-progress reading and its timestamp, for a units/s rate.
+    last_live_units: u64,
+    last_live_at: Instant,
     kind: Kind,
     seconds: u64,
     workers: usize,
     mib: usize,
     disk_write_limit_mib: u64,
     directory: String,
+    /// Selected data pattern for memory and disk checks (pro-tool style).
+    mem_pattern: hardware_hub::stress::MemPattern,
+    disk_pattern: hardware_hub::stress::DiskPattern,
+    gpu_intensity: hardware_hub::stress::GpuIntensity,
+    /// Opt-in: stop the current check when peak temperature reaches the
+    /// advisory alert limit. This stops only the software check, never hardware.
+    auto_stop_on_heat: bool,
+    auto_stop_fired: bool,
     report: String,
     report_format: Format,
     gpu_index: usize,
@@ -256,6 +270,8 @@ impl App {
             cancel: Arc::new(AtomicBool::new(false)),
             state: Arc::new(Mutex::new(State::default())),
             run_peak_c: None,
+            last_live_units: 0,
+            last_live_at: Instant::now(),
             kind: Kind::Cpu,
             seconds: 15,
             workers: std::thread::available_parallelism()
@@ -264,6 +280,11 @@ impl App {
             mib: 64,
             disk_write_limit_mib: 64,
             directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            mem_pattern: MemPattern::Alternating,
+            disk_pattern: DiskPattern::Constant,
+            gpu_intensity: GpuIntensity::Standard,
+            auto_stop_on_heat: false,
+            auto_stop_fired: false,
             report: "hardware-hub-report.txt".into(),
             report_format: Format::Text,
             gpu_index: 0,
@@ -1686,11 +1707,14 @@ impl App {
                                         }
                                     });
                             }
+                            ui.add_space(6.0);
+                            picker(ui, "gpu-intensity", "Intensity", &mut self.gpu_intensity,
+                                &GpuIntensity::ALL.map(|v| (v, v.label())));
                         }
                         Kind::Memory => {
                             ui.label(
                                 RichText::new(format!(
-                                    "Alternating patterns, limited to 256 MiB and one quarter of available RAM ({:.0} MiB).",
+                                    "Write/read patterns over the allocated region, limited to 256 MiB and one quarter of available RAM ({:.0} MiB).",
                                     s.memory_available as f64 / 4.0 / 1048576.0
                                 ))
                                 .size(11.0)
@@ -1698,6 +1722,9 @@ impl App {
                             );
                             ui.add_space(4.0);
                             ui.add(egui::Slider::new(&mut self.mib, 1..=256).text("MiB"));
+                            ui.add_space(6.0);
+                            picker(ui, "mem-pattern", "Pattern", &mut self.mem_pattern,
+                                &MemPattern::ALL.map(|v| (v, v.label())));
                         }
                         Kind::Disk => {
                             ui.label(
@@ -1724,13 +1751,16 @@ impl App {
                                 )
                                 .text("write cap MiB"),
                             );
+                            ui.add_space(6.0);
+                            picker(ui, "disk-pattern", "Pattern", &mut self.disk_pattern,
+                                &DiskPattern::ALL.map(|v| (v, v.label())));
                         }
                     }
                     ui.add_space(6.0);
                     duration_presets(ui, &mut self.seconds);
                     ui.add_space(4.0);
                     ui.add(egui::Slider::new(&mut self.seconds, 1..=600).text("max seconds"));
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     let start = ui.add_sized(
                         [ui.available_width(), 34.0],
                         egui::Button::new(RichText::new("Start test").strong().color(Color32::from_rgb(9, 18, 30)))
@@ -1739,6 +1769,9 @@ impl App {
                     );
                     if start.clicked() {
                         self.run_peak_c = None;
+                        self.auto_stop_fired = false;
+                        self.last_live_units = 0;
+                        self.last_live_at = Instant::now();
                         let adapter = if self.kind == Kind::Gpu {
                             s.adapters.get(self.gpu_index)
                         } else {
@@ -1754,6 +1787,9 @@ impl App {
                             directory: PathBuf::from(&self.directory),
                             gpu_adapter: gpu_name,
                             disk_write_limit_mib: self.disk_write_limit_mib,
+                            mem_pattern: self.mem_pattern,
+                            disk_pattern: self.disk_pattern,
+                            gpu_intensity: self.gpu_intensity,
                         };
                         let context = ReportContext {
                             cpu: s.cpu_name.clone(),
@@ -1826,6 +1862,55 @@ impl App {
                             .desired_height(8.0),
                     );
                     ui.add_space(14.0);
+                    ui.label(RichText::new("WORK PROGRESS").size(9.5).strong().color(MUTED));
+                    ui.add_space(4.0);
+                    {
+                        let live = self.state.lock().ok().map(|s| s.live.clone()).unwrap_or_default();
+                        let now = Instant::now();
+                        let dt = now.duration_since(self.last_live_at).as_secs_f64().max(1e-3);
+                        let rate = if self.last_live_units > 0 || live.units > 0 {
+                            (live.units.saturating_sub(self.last_live_units)) as f64 / dt
+                        } else {
+                            0.0
+                        };
+                        self.last_live_units = live.units;
+                        self.last_live_at = now;
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Phase").size(11.0).color(MUTED));
+                            ui.label(RichText::new(&live.phase).size(11.0).strong().color(TEXT));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Done").size(11.0).color(MUTED));
+                            ui.label(
+                                RichText::new(format!("{} {}", live.units, live.unit_label))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(ACCENT),
+                            );
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("Rate").size(11.0).color(MUTED));
+                            ui.label(
+                                RichText::new(if rate >= 1.0 {
+                                    format!("{rate:.0}/s")
+                                } else {
+                                    format!("{rate:.2}/s")
+                                })
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT_DIM),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Errors").size(11.0).color(MUTED));
+                            ui.label(
+                                RichText::new(live.errors.to_string())
+                                    .size(12.5)
+                                    .strong()
+                                    .color(if live.errors > 0 { RED } else { GREEN }),
+                            );
+                        });
+                    }
+                    ui.add_space(12.0);
                     ui.label(RichText::new("LIVE READINGS").size(9.5).strong().color(MUTED));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -1874,6 +1959,8 @@ impl App {
                             }
                         }
                     });
+                    ui.add_space(6.0);
+                    mini_temperature_graph(ui, &self.history);
                     ui.add_space(12.0);
                     if ui
                         .add_sized(
@@ -1888,8 +1975,13 @@ impl App {
                         self.message = "Stopping after the current work or I/O operation…".into();
                     }
                     ui.add_space(10.0);
-                    callout(ui, AMBER, "No automatic shutdown",
-                        "Watch the peak temperature above. Stop the check yourself if it climbs; a blocked driver or disk operation can also delay stopping.");
+                    if self.auto_stop_on_heat {
+                        callout(ui, GREEN, "Auto-stop armed (check only)",
+                            "This check will stop itself if peak temperature reaches the advisory limit. No fan, clock or other hardware setting is changed. A blocked driver or disk operation can still delay stopping.");
+                    } else {
+                        callout(ui, AMBER, "No automatic shutdown",
+                            "Watch the peak temperature above. Stop the check yourself if it climbs; a blocked driver or disk operation can also delay stopping.");
+                    }
                 } else {
                     let last = self
                         .state
@@ -1941,6 +2033,7 @@ impl App {
                                 .size(10.0)
                                 .color(MUTED),
                             );
+                            error_details(ui, &r.errors, r.error_count);
                             ui.add_space(8.0);
                             if ui.button("View all reports").clicked() {
                                 self.page = Page::Reports;
@@ -1954,8 +2047,16 @@ impl App {
                         }
                     }
                     ui.add_space(12.0);
+                    // Safety option sits with the run status: it is a property
+                    // of the next run, and the right column has room for it.
+                    let auto_stop = ui.checkbox(
+                        &mut self.auto_stop_on_heat,
+                        format!("Stop check at {:.0} °C (advisory)", self.alert_celsius),
+                    );
+                    auto_stop.on_hover_text("Stops only this check when the observed peak reaches the alert limit. Never changes fans, clocks or hardware.");
+                    ui.add_space(10.0);
                     callout(ui, MUTED, "Read-only checks, never benchmarks",
-                        "These bounded checks verify correctness, not raw speed or full burn-in. There is no automatic temperature-based shutdown; supervise any stress run.");
+                        "These bounded checks verify correctness, not raw speed or full burn-in. The machine has no automatic temperature shutdown; supervise any stress run.");
                 }
             });
         });
@@ -2636,11 +2737,15 @@ impl App {
                     .size(10.5)
                     .color(MUTED),
                 );
+                error_details(ui, &r.errors, r.error_count);
                 ui.push_id(record_index, |ui| {
                     egui::CollapsingHeader::new("Evidence and limits").show(ui, |ui| {
                         ui.strong("Test settings");
                         ui.label(format!("Time limit: {} seconds · {}", r.config.seconds, config_summary(&r.config)));
                         if r.kind == Kind::Disk { ui.label(format!("Directory: {} · write cap: {} MiB", r.config.directory.display(), r.config.disk_write_limit_mib)); }
+                        if r.kind == Kind::Memory { ui.label(format!("Pattern: {}", r.config.mem_pattern.label())); }
+                        if r.kind == Kind::Disk { ui.label(format!("Pattern: {}", r.config.disk_pattern.label())); }
+                        if r.kind == Kind::Gpu { ui.label(format!("Intensity: {}", r.config.gpu_intensity.label())); }
                         ui.strong("System context at start");
                         ui.label(format!("{} · {} logical cores · {:.1} GiB RAM", r.context.cpu, r.context.logical_cpus, gib(r.context.memory_total)));
                         ui.label(format!("OS: {}", r.context.os));
@@ -2816,6 +2921,21 @@ impl eframe::App for App {
         if running {
             if let Some(value) = hottest {
                 self.run_peak_c = Some(self.run_peak_c.map_or(value, |peak| peak.max(value)));
+            }
+            // Opt-in safety: stop only the running check when the peak reaches
+            // the advisory limit. Never alters fans, clocks or other hardware.
+            if self.auto_stop_on_heat
+                && !self.auto_stop_fired
+                && self
+                    .run_peak_c
+                    .is_some_and(|peak| peak >= self.alert_celsius)
+            {
+                self.auto_stop_fired = true;
+                self.cancel.store(true, Ordering::Relaxed);
+                self.message = format!(
+                    "Check stopped: peak temperature reached {:.0} °C. No hardware setting was changed.",
+                    self.alert_celsius
+                );
             }
         }
         let rule = Threshold {
@@ -3621,6 +3741,35 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Generic labelled combo box for a bounded set of enum choices.
+fn picker<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    current: &mut T,
+    choices: &[(T, &'static str)],
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(11.0).color(MUTED));
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(
+                RichText::new(
+                    choices
+                        .iter()
+                        .find(|(v, _)| *v == *current)
+                        .map(|(_, s)| *s)
+                        .unwrap_or("—"),
+                )
+                .size(11.0),
+            )
+            .show_ui(ui, |ui| {
+                for (value, text) in choices {
+                    ui.selectable_value(current, *value, *text);
+                }
+            });
+    });
+}
+
 /// Apple-style segmented control for common test durations. The fine-grained
 /// slider remains below; presets just make the usual choices one tap away.
 fn duration_presets(ui: &mut egui::Ui, seconds: &mut u64) {
@@ -3871,6 +4020,93 @@ fn thermal_safety(celsius: f32, limit_celsius: f32) -> (&'static str, Color32) {
         ("Warming", AMBER)
     } else {
         ("Normal", GREEN)
+    }
+}
+
+/// Compact temperature sparkline from the bounded session history. Draws the
+/// hottest sensor per sample; gaps (missing readings) break the line like the
+/// full thermal graph does.
+fn mini_temperature_graph(ui: &mut egui::Ui, history: &History) {
+    let values: Vec<f64> = history
+        .samples()
+        .map(|sample| {
+            sample
+                .temperatures
+                .iter()
+                .filter_map(|(_, v)| *v)
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .filter(|v| v.is_finite())
+        .collect();
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) || values.len() < 2 {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "temperature graph needs a sensor",
+            egui::FontId::proportional(10.0),
+            MUTED,
+        );
+        return;
+    }
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (max - min).max(1.0);
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(8),
+        Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+    );
+    let points: Vec<egui::Pos2> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x =
+                rect.left() + 6.0 + (rect.width() - 12.0) * i as f32 / (values.len() - 1) as f32;
+            let y = rect.bottom() - 6.0 - (rect.height() - 12.0) * ((*v - min) / span) as f32;
+            egui::pos2(x, y)
+        })
+        .collect();
+    for pair in points.windows(2) {
+        painter.line_segment([pair[0], pair[1]], Stroke::new(1.6_f32, ACCENT));
+    }
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        format!("{max:.0}° peak"),
+        egui::FontId::proportional(9.0),
+        TEXT_DIM,
+    );
+}
+
+/// Show the first few recorded mismatches in a compact table, in the style of
+/// memory-diagnostic tools: location, expected value and actual value.
+fn error_details(ui: &mut egui::Ui, errors: &[ErrorDetail], total: u64) {
+    if errors.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(format!("MISMATCHES ({total} total)"))
+            .size(9.5)
+            .strong()
+            .color(RED),
+    );
+    ui.add_space(3.0);
+    for error in errors {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&error.location).size(10.0).color(TEXT_DIM));
+            ui.label(
+                RichText::new(format!("exp {} / got {}", error.expected, error.actual))
+                    .size(10.0)
+                    .color(MUTED),
+            );
+        });
+    }
+    if total > errors.len() as u64 {
+        ui.weak(format!("+ {} more not shown", total - errors.len() as u64));
     }
 }
 

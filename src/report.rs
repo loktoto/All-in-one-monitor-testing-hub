@@ -41,7 +41,9 @@ pub fn export(path: &Path, format: Format, records: &[ResultRecord]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stress::{Config, Kind, ReportContext, ResultRecord, Status};
+    use crate::stress::{
+        Config, DiskPattern, GpuIntensity, Kind, MemPattern, ReportContext, ResultRecord, Status,
+    };
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -74,8 +76,13 @@ mod tests {
                 directory: dir.clone(),
                 gpu_adapter: None,
                 disk_write_limit_mib: 1,
+                mem_pattern: MemPattern::Alternating,
+                disk_pattern: DiskPattern::Constant,
+                gpu_intensity: GpuIntensity::Standard,
             },
             context: ReportContext::default(),
+            error_count: 0,
+            errors: Vec::new(),
         };
         export(&path, Format::Json, std::slice::from_ref(&record)).unwrap();
         let original = fs::read(&path).unwrap();

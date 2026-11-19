@@ -1,7 +1,9 @@
 //! Bounded local smoke run: CPU, 1 MiB RAM, 1 MiB file, unavailable GPU, JSON export.
 use hardware_hub::{
     report::{self, Format},
-    stress::{self, Config, Kind, ReportContext, State, Status},
+    stress::{
+        self, Config, DiskPattern, GpuIntensity, Kind, MemPattern, ReportContext, State, Status,
+    },
     telemetry::{self, Snapshot},
 };
 use std::{
@@ -85,6 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         directory: root.clone(),
         gpu_adapter: None,
         disk_write_limit_mib: 1,
+        mem_pattern: MemPattern::Alternating,
+        disk_pattern: DiskPattern::Constant,
+        gpu_intensity: GpuIntensity::Standard,
     };
     stress::start(
         cancel_config,
@@ -115,6 +120,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             directory: root.clone(),
             gpu_adapter: None,
             disk_write_limit_mib: 1,
+            mem_pattern: MemPattern::Alternating,
+            disk_pattern: DiskPattern::Constant,
+            gpu_intensity: GpuIntensity::Standard,
         };
         // No physical GPU workload is launched by this smoke test.
         stress::start(cfg, state.clone(), cancel.clone(), None, context.clone())?;
