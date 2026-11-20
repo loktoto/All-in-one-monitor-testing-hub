@@ -290,11 +290,19 @@ fn parse_ioreg_gpu(text: &str) -> Vec<Gpu> {
 }
 #[cfg(target_os = "macos")]
 fn mac_gpu_sources() -> Vec<Gpu> {
-    std::process::Command::new("/usr/sbin/ioreg")
-        .args(["-r", "-c", "IOAccelerator", "-d", "1"])
+    let args = ["-r", "-c", "IOAccelerator", "-d", "1"];
+    let output = std::process::Command::new("ioreg")
+        .args(args)
         .output()
         .ok()
-        .filter(|o| o.status.success())
+        .or_else(|| {
+            std::process::Command::new("/usr/sbin/ioreg")
+                .args(args)
+                .output()
+                .ok()
+        })
+        .filter(|o| o.status.success());
+    output
         .map(|o| parse_ioreg_gpu(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
 }

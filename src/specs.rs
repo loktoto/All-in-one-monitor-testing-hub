@@ -242,14 +242,44 @@ pub fn collect() -> SystemSpecs {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
     use sysinfo::Disks;
 
     fn run(command: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(command).args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
+        run_with_timeout(command, args, Duration::from_secs(5))
+    }
+
+    /// `system_profiler` can hang on a misbehaving device tree. Never let that
+    /// stall the inventory thread indefinitely; missing fields degrade to
+    /// "unavailable" in the UI.
+    fn run_with_timeout(command: &str, args: &[&str], timeout: Duration) -> Option<String> {
+        let mut child = Command::new(command)
+            .args(args)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                if !status.success() {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).ok()?;
+                return Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn sysctl(key: &str) -> Option<String> {
@@ -282,7 +312,8 @@ mod macos {
 
         // Apple silicon reports "hw.optional.arm64" and splits cores by performance
         // level; Intel Macs expose a single cache/frequency set instead.
-        let apple_silicon = sysctl("hw.optional.arm64").as_deref() == Some("1");
+        let apple_silicon = sysctl("hw.optional.arm64").as_deref() == Some("1")
+            || std::env::consts::ARCH == "aarch64";
         let cpu = &mut specs.cpu;
         cpu.name = sysctl("machdep.cpu.brand_string")
             .or_else(|| {
@@ -1214,6 +1245,16 @@ fn profile_value(text: &str, key: &str) -> Option<String> {
 }
 
 /// Decimal units are used by `system_profiler`; exact byte counts win when present.
+/// `system_profiler` localises its values; accept the common English and
+/// Chinese spellings instead of treating "Enabled"/"Yes" as the only truth.
+fn profile_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "enabled" | "on" | "是" | "开启" | "啟用" => Some(true),
+        "no" | "false" | "disabled" | "off" | "否" | "关闭" | "關閉" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_capacity(value: &str) -> Option<u64> {
     if let Some(start) = value.find('(') {
         let inside = &value[start + 1..];
@@ -1228,7 +1269,7 @@ fn parse_capacity(value: &str) -> Option<u64> {
         }
     }
     let mut parts = value.split_whitespace();
-    let number: f64 = parts.next()?.parse().ok()?;
+    let number: f64 = parts.next()?.replace(',', ".").parse().ok()?;
     let unit = parts.next()?.to_lowercase();
     let multiplier = match unit.as_str() {
         "tb" => 1e12,
@@ -1252,8 +1293,8 @@ fn parse_memory_profile(text: &str) -> MemoryProfile {
     let mut current: Option<MemoryModule> = None;
     for (indent, key, value) in run_section(text) {
         match key.as_str() {
-            "ECC" => profile.ecc = Some(value == "Enabled"),
-            "Upgradeable Memory" => profile.upgradeable = Some(value == "Yes"),
+            "ECC" => profile.ecc = profile_flag(&value),
+            "Upgradeable Memory" => profile.upgradeable = profile_flag(&value),
             "Size" if current.is_some() => {
                 if let Some(module) = current.as_mut() {
                     module.size_bytes = parse_capacity(&value);
@@ -1381,7 +1422,7 @@ fn parse_diskutil_info(text: &str) -> Option<VolumeHealth> {
             "Device / Media Name" => health.media = value,
             "Protocol" => health.protocol = value,
             "SMART Status" => health.smart = value,
-            "Solid State" => health.solid_state = Some(value == "Yes"),
+            "Solid State" => health.solid_state = profile_flag(&value),
             _ => {}
         }
     }
@@ -1395,7 +1436,11 @@ fn parse_board_id(text: &str) -> Option<String> {
     let line = text
         .lines()
         .find(|line| line.trim_start().starts_with("\"board-id\" = "))?;
-    let value = line.split_once("= <\"")?.1.split_once("\">")?.0;
+    let raw = line.split_once("= ")?.1.trim();
+    let value = raw
+        .strip_prefix("<\"")
+        .and_then(|v| v.strip_suffix("\">"))
+        .or_else(|| raw.strip_prefix('"').and_then(|v| v.strip_suffix('"')))?;
     if value.is_empty() || value.len() > 128 {
         None
     } else {
@@ -1408,7 +1453,9 @@ fn parse_wifi_interface(text: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
         if let Some(port) = line.strip_prefix("Hardware Port: ") {
-            wifi = port == "Wi-Fi";
+            wifi = port.trim().eq_ignore_ascii_case("wi-fi")
+                || port.trim().eq_ignore_ascii_case("wifi")
+                || port.trim().eq_ignore_ascii_case("wireless");
         } else if wifi {
             if let Some(device) = line.strip_prefix("Device: ") {
                 let device = device.trim();
@@ -1421,22 +1468,33 @@ fn parse_wifi_interface(text: &str) -> Option<String> {
     None
 }
 
+/// `system_profiler -json` has shipped both a top-level `SPBluetoothDataType`
+/// array and a nested `Bluetooth` object across macOS versions.
+fn bluetooth_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .get("SPBluetoothDataType")
+        .or_else(|| value.get("Bluetooth")?.get("SPBluetoothDataType"))
+}
+
+fn first_profile_entry(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    match value {
+        serde_json::Value::Array(items) => items.first(),
+        serde_json::Value::Object(_) => Some(value),
+        _ => None,
+    }
+}
+
 fn parse_bluetooth(text: &str) -> Option<BluetoothSpec> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let controller = value
-        .get("SPBluetoothDataType")?
-        .as_array()?
-        .first()?
-        .get("controller_properties")?;
+    let root = bluetooth_root(&value)?;
+    let entry = first_profile_entry(root)?;
+    let controller = entry.get("controller_properties")?;
     let state = match controller.get("controller_state").and_then(|v| v.as_str()) {
         Some("attrib_on") => Some(true),
         Some("attrib_off") => Some(false),
         _ => None,
     };
-    let devices = value
-        .get("SPBluetoothDataType")?
-        .as_array()?
-        .first()?
+    let devices = entry
         .get("device_connected")
         .and_then(|v| v.as_array())
         .map(|items| {
@@ -1645,7 +1703,21 @@ NVMExpress:
             parse_board_id("  \"board-id\" = <\"Mac-TEST\">\n"),
             Some("Mac-TEST".into())
         );
+        assert_eq!(
+            parse_board_id("  \"board-id\" = \"Mac-TEST\"\n"),
+            Some("Mac-TEST".into())
+        );
         assert_eq!(parse_board_id("  \"model\" = <\"Mac-TEST\">\n"), None);
+    }
+
+    #[test]
+    fn profile_flags_accept_common_localised_values() {
+        assert_eq!(profile_flag("Enabled"), Some(true));
+        assert_eq!(profile_flag("yes"), Some(true));
+        assert_eq!(profile_flag("是"), Some(true));
+        assert_eq!(profile_flag("Disabled"), Some(false));
+        assert_eq!(profile_flag("关闭"), Some(false));
+        assert_eq!(profile_flag("unknown"), None);
     }
 
     #[test]
@@ -1674,6 +1746,9 @@ NVMExpress:
             Some(vec!["Example device".into()])
         );
         assert!(parse_bluetooth(r#"{"SPBluetoothDataType":[]}"#).is_none());
+        let nested = parse_bluetooth(r#"{"Bluetooth":{"SPBluetoothDataType":{"controller_properties":{"controller_state":"attrib_off","controller_transport":"USB"}}}}"#).unwrap();
+        assert_eq!(nested.state, Some(false));
+        assert_eq!(nested.transport, "USB");
         assert!(parse_bluetooth("invalid").is_none());
     }
 
@@ -1860,6 +1935,7 @@ NVMExpress:
             Some(512_110_190_592)
         );
         assert_eq!(parse_capacity("256.0 GB"), Some(256_000_000_000));
+        assert_eq!(parse_capacity("256,0 GB"), Some(256_000_000_000));
         assert_eq!(parse_capacity("1536 MB"), Some(1_536_000_000));
         assert_eq!(parse_capacity("unknown"), None);
     }

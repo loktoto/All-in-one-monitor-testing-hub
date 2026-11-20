@@ -3780,13 +3780,31 @@ fn empty_note(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).color(MUTED).italics());
 }
 
+#[cfg(target_os = "macos")]
+fn running_on_apple_silicon() -> bool {
+    std::process::Command::new("sysctl")
+        .args(["-n", "hw.optional.arm64"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(std::env::consts::ARCH == "aarch64")
+}
+
 /// Why the sensor table has no rows, stated as the platform actually behaves.
 fn sensor_unavailable_note() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         "This firmware reported no ACPI thermal zone. Windows exposes temperature only through ACPI thermal zones (the Thermal Zone Information counters, or the WMI class when elevated), and states no per-core die temperature without a kernel driver."
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        if running_on_apple_silicon() {
+            "This build reads Intel SMC keys, which Apple Silicon does not expose. Temperature and fan readings may stay unavailable; usage, memory, storage and inventory still work."
+        } else {
+            "No SMC sensor provider responded on this Intel Mac. Temperature and fan readings may stay unavailable; usage, memory, storage and inventory still work."
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         "No sensor provider is available here. The Details page lists what this platform exposes."
     }
