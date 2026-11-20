@@ -1510,6 +1510,7 @@ fn parse_battery(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "windows")]
     use serde_json::Value;
 
     const MEMORY: &str = r#"
@@ -1779,6 +1780,7 @@ NVMExpress:
         assert_eq!(pci_ids("ACPI\\PNP0A08\\0"), "");
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_inventory_reads_gpus_slots_monitors_and_drivers() {
         let value: Value = serde_json::from_str(
