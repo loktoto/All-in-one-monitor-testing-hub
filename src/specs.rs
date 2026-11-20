@@ -210,7 +210,7 @@ pub fn bluetooth_status() -> Option<BluetoothSpec> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("system_profiler")
-            .args(["-json", "SPBluetoothDataType"])
+            .args(["-json", "-timeout", "5", "SPBluetoothDataType"])
             .output()
             .ok()?;
         if !output.status.success() {
@@ -237,6 +237,14 @@ pub fn collect() -> SystemSpecs {
     {
         portable::collect()
     }
+}
+
+/// True when the physical host is an Apple silicon Mac, even under Rosetta.
+#[cfg(target_os = "macos")]
+pub use macos::is_apple_silicon;
+#[cfg(not(target_os = "macos"))]
+pub fn is_apple_silicon() -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -292,6 +300,13 @@ mod macos {
         sysctl(key)?.parse().ok()
     }
 
+    /// Physical host architecture, even when this process is translated by Rosetta.
+    pub fn is_apple_silicon() -> bool {
+        sysctl("hw.optional.arm64").as_deref() == Some("1")
+            || sysctl("sysctl.proc_translated").as_deref() == Some("1")
+            || std::env::consts::ARCH == "aarch64"
+    }
+
     pub fn collect() -> SystemSpecs {
         let mut specs = SystemSpecs {
             sources: "sysctl · system_profiler · diskutil · pmset".into(),
@@ -304,7 +319,7 @@ mod macos {
             .unwrap_or_default();
         specs.model_id = sysctl("hw.model").unwrap_or_default();
 
-        let hardware = run("system_profiler", &["SPHardwareDataType"]);
+        let hardware = run("system_profiler", &["-timeout", "5", "SPHardwareDataType"]);
         if let Some(text) = &hardware {
             specs.model_name = profile_value(text, "Model Name").unwrap_or_default();
             specs.firmware = profile_value(text, "System Firmware Version").unwrap_or_default();
@@ -312,8 +327,7 @@ mod macos {
 
         // Apple silicon reports "hw.optional.arm64" and splits cores by performance
         // level; Intel Macs expose a single cache/frequency set instead.
-        let apple_silicon = sysctl("hw.optional.arm64").as_deref() == Some("1")
-            || std::env::consts::ARCH == "aarch64";
+        let apple_silicon = is_apple_silicon();
         let cpu = &mut specs.cpu;
         cpu.name = sysctl("machdep.cpu.brand_string")
             .or_else(|| {
@@ -321,6 +335,7 @@ mod macos {
                     .as_deref()
                     .and_then(|t| profile_value(t, "Processor Name"))
             })
+            .or_else(|| hardware.as_deref().and_then(|t| profile_value(t, "Chip")))
             .unwrap_or_default();
         cpu.vendor = sysctl("machdep.cpu.vendor").unwrap_or_default();
         cpu.architecture = if apple_silicon {
@@ -348,7 +363,7 @@ mod macos {
         cpu.cache_line_bytes = sysctl_num("hw.cachelinesize");
 
         specs.memory.total_bytes = sysctl_num("hw.memsize");
-        if let Some(text) = run("system_profiler", &["SPMemoryDataType"]) {
+        if let Some(text) = run("system_profiler", &["-timeout", "5", "SPMemoryDataType"]) {
             let profile = parse_memory_profile(&text);
             specs.memory.ecc = profile.ecc;
             specs.memory.upgradeable = profile.upgradeable;
@@ -360,10 +375,10 @@ mod macos {
             }
             specs.memory.modules = profile.modules;
         }
-        if let Some(text) = run("system_profiler", &["SPDisplaysDataType"]) {
+        if let Some(text) = run("system_profiler", &["-timeout", "5", "SPDisplaysDataType"]) {
             specs.graphics = parse_graphics_profile(&text);
         }
-        if let Some(text) = run("system_profiler", &["SPNVMeDataType"]) {
+        if let Some(text) = run("system_profiler", &["-timeout", "5", "SPNVMeDataType"]) {
             specs.drives = parse_storage_profile(&text);
         }
         for mount in mounts() {

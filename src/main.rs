@@ -934,6 +934,15 @@ impl App {
             if !temp_rows.is_empty() {
                 sensor_table(ui, "temperature-sensors", "Temperature", temp_rows);
             }
+            #[cfg(target_os = "macos")]
+            if s.fans.is_empty() && !s.temperatures.is_empty() {
+                ui.add_space(8.0);
+                empty_note(ui, if specs::is_apple_silicon() {
+                    "No fan readings were reported. Many Apple silicon laptops are fanless, and fan sensor support is model-specific."
+                } else {
+                    "No fan readings were reported. Some Mac models are fanless; this is expected when the firmware exposes no fan keys."
+                });
+            }
             let fan_rows: Vec<RowView<'_>> = s
                 .fans
                 .iter()
@@ -3780,16 +3789,6 @@ fn empty_note(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).color(MUTED).italics());
 }
 
-#[cfg(target_os = "macos")]
-fn running_on_apple_silicon() -> bool {
-    std::process::Command::new("sysctl")
-        .args(["-n", "hw.optional.arm64"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
-        .unwrap_or(std::env::consts::ARCH == "aarch64")
-}
-
 /// Why the sensor table has no rows, stated as the platform actually behaves.
 fn sensor_unavailable_note() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -3798,8 +3797,8 @@ fn sensor_unavailable_note() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        if running_on_apple_silicon() {
-            "This build reads Intel SMC keys, which Apple Silicon does not expose. Temperature and fan readings may stay unavailable; usage, memory, storage and inventory still work."
+        if specs::is_apple_silicon() {
+            "This build uses the Intel SMC key set, which Apple silicon models do not use. Temperature and fan readings may stay unavailable; usage, memory, storage and inventory still work."
         } else {
             "No SMC sensor provider responded on this Intel Mac. Temperature and fan readings may stay unavailable; usage, memory, storage and inventory still work."
         }

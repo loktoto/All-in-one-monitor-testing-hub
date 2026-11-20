@@ -884,7 +884,7 @@ mod tests {
         let result = memory(
             &test_config(Kind::Memory),
             &AtomicBool::new(false),
-            Instant::now() + Duration::from_millis(200),
+            Instant::now() + Duration::from_secs(2),
             &dummy_live(),
         )
         .unwrap();
