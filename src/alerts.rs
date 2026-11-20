@@ -68,7 +68,7 @@ impl Monitor {
         }
         let was_active = self.active_since.is_some();
         match (temperature, rule.is_valid()) {
-            (Some(value), true) if value >= rule.celsius => {
+            (Some(value), true) if value.is_finite() && value >= rule.celsius => {
                 self.recovered_since = None;
                 // A breach starts with the first hot sample; never backdate it,
                 // otherwise the first frame could fire an "already sustained" alert.

@@ -56,6 +56,9 @@ pub fn start(
                         drop(stream);
                         s.succeeded += 1;
                         s.total_ms += started.elapsed().as_secs_f64() * 1000.0;
+                        // A later success supersedes any earlier failure; keep
+                        // "Most recent error" honest with the success count.
+                        s.last_error = None;
                     }
                     Err(e) => s.last_error = Some(e.to_string()),
                 }

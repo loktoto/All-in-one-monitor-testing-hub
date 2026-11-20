@@ -794,7 +794,7 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
             v.get(key)
                 .and_then(Value::as_u64)
                 .filter(|kb| *kb > 0)
-                .map(|kb| kb * 1024)
+                .map(|kb| kb.saturating_mul(1024))
         };
         if specs.cpu.l1_data_bytes.is_none() {
             specs.cpu.l1_data_bytes = cache("cpu_l1_data_kb");
@@ -964,7 +964,7 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
             .get("mem_max_capacity_kb")
             .and_then(Value::as_u64)
             .filter(|kb| *kb > 0)
-            .map(|kb| kb * 1024);
+            .map(|kb| kb.saturating_mul(1024));
         // SMBIOS memory-array error correction: 5/6/7 are ECC schemes, 3 is none.
         specs.memory.ecc = match v.get("mem_ecc").and_then(Value::as_u64) {
             Some(5..=7) => Some(true),

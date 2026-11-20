@@ -296,11 +296,12 @@ pub fn label_for(key: &str, unit: Unit) -> String {
         let number = key.as_bytes().get(1).copied().unwrap_or(b'0');
         return format!("Fan {}", number.saturating_sub(b'0'));
     }
-    let bytes = key.as_bytes();
-    let prefix = if bytes.len() >= 2 {
-        &key[..2]
-    } else {
-        return key.to_owned();
+    // A firmware key may contain non-ASCII bytes (fourcc is decoded lossily).
+    // `&key[..2]` would panic when byte 2 is not a UTF-8 char boundary, so fall
+    // back to the whole key — unknown prefixes are returned unchanged below.
+    let prefix = match key.get(..2) {
+        Some(p) => p,
+        None => return key.to_owned(),
     };
     let area = match prefix {
         "TC" => "CPU",
@@ -547,6 +548,15 @@ mod tests {
         assert_eq!(label_for("F0Ac", Unit::Rpm), "Fan 0");
         assert_eq!(label_for("F1Ac", Unit::Rpm), "Fan 1");
         assert_eq!(label_for("ZZ1Z", Unit::Celsius), "ZZ1Z");
+    }
+
+    #[test]
+    fn labels_never_panic_on_non_ascii_keys() {
+        // A malformed firmware key reaching label_for must not slice a UTF-8
+        // byte in half; unknown prefixes fall back to the full key.
+        assert_eq!(label_for("€x", Unit::Celsius), "€x");
+        assert_eq!(label_for("€TC", Unit::Celsius), "€TC");
+        assert_eq!(label_for("é", Unit::Celsius), "é");
     }
 
     #[test]

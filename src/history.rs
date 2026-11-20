@@ -105,16 +105,29 @@ pub fn export_csv(path: &Path, history: &History, origin: Instant) -> Result<(),
 }
 
 /// Split lines on missing samples or long collection gaps rather than inventing readings.
+/// Uses the default 3 s gap (kept for internal callers and tests).
 pub fn segments(
     history: &History,
     origin: Instant,
+    value: impl Fn(&Sample) -> Option<f64>,
+) -> Vec<Vec<[f64; 2]>> {
+    segments_with_gap(history, origin, MAX_AGE, value)
+}
+
+/// Like [`segments`] but with an explicit gap. The caller passes roughly twice
+/// its configured sampling interval, so a slow 5 s poll still draws a continuous
+/// line instead of splitting every pair of samples into a one-point segment.
+pub fn segments_with_gap(
+    history: &History,
+    origin: Instant,
+    gap: Duration,
     value: impl Fn(&Sample) -> Option<f64>,
 ) -> Vec<Vec<[f64; 2]>> {
     let mut result: Vec<Vec<[f64; 2]>> = Vec::new();
     let mut current = Vec::new();
     let mut previous = None;
     for sample in history.samples() {
-        if previous.is_some_and(|at: Instant| sample.at.duration_since(at) >= MAX_AGE)
+        if previous.is_some_and(|at: Instant| sample.at.duration_since(at) >= gap)
             || value(sample).is_none()
         {
             if !current.is_empty() {

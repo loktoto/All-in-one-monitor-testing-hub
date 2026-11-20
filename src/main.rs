@@ -192,6 +192,16 @@ struct App {
     /// Previous live-progress reading and its timestamp, for a units/s rate.
     last_live_units: u64,
     last_live_at: Instant,
+    /// Smoothed units/s so the readout does not flicker to 0 between worker
+    /// progress publications (workers publish ~5x/s, UI repaints ~4x/s).
+    rate_ema: f64,
+    /// Eased progress value so the determinate bar glides instead of jumping
+    /// between worker publications.
+    shown_progress: f32,
+    /// Page id of the last frame, used to trigger the enter transition once.
+    last_page: Page,
+    /// Timestamp of the last page change, driving a short enter animation.
+    page_enter_at: Instant,
     kind: Kind,
     seconds: u64,
     workers: usize,
@@ -286,6 +296,10 @@ impl App {
             run_peak_c: None,
             last_live_units: 0,
             last_live_at: Instant::now(),
+            rate_ema: 0.0,
+            shown_progress: 0.0,
+            last_page: initial_page(),
+            page_enter_at: Instant::now(),
             kind: Kind::Cpu,
             seconds: 15,
             workers: std::thread::available_parallelism()
@@ -339,6 +353,27 @@ impl App {
             show_widget: false,
             started: Instant::now(),
         }
+    }
+
+    /// Gap used to split chart lines: twice the configured sampling interval,
+    /// so slow polls never turn every sample into its own one-point segment.
+    fn history_gap(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.poll_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_mul(2)
+                .max(500),
+        )
+    }
+
+    /// Age above which a snapshot is considered stale, derived from the poll
+    /// interval so the LIVE/STALE badge stays consistent with the sampling slider.
+    fn stale_secs(&self) -> f32 {
+        self.poll_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_mul(2)
+            .max(1000) as f32
+            / 1000.0
     }
 
     // ------------------------------------------------------------- navigation
@@ -733,10 +768,10 @@ impl App {
                     .allow_zoom(false)
                     .allow_scroll(false)
                     .show(ui, |p| {
-                        for (i, points) in history::segments(&self.history, self.started, |v| v.cpu).into_iter().enumerate() {
+                        for (i, points) in history::segments_with_gap(&self.history, self.started, self.history_gap(), |v| v.cpu).into_iter().enumerate() {
                             p.line(Line::new(PlotPoints::from(points)).name(if i == 0 { "CPU %" } else { "" }).color(ACCENT).width(1.8_f32));
                         }
-                        for (i, points) in history::segments(&self.history, self.started, |v| v.memory).into_iter().enumerate() {
+                        for (i, points) in history::segments_with_gap(&self.history, self.started, self.history_gap(), |v| v.memory).into_iter().enumerate() {
                             p.line(Line::new(PlotPoints::from(points)).name(if i == 0 { "Memory %" } else { "" }).color(VIOLET).width(1.8_f32));
                         }
                     });
@@ -957,6 +992,7 @@ impl App {
                 });
                 bar(
                     ui,
+                    "disk-usage",
                     fraction,
                     if fraction > 0.9 { AMBER } else { ACCENT },
                     6.0,
@@ -1048,7 +1084,7 @@ impl App {
                     }
                     egui::CollapsingHeader::new("Recent CPU activity").show(ui, |ui| {
                         Plot::new("cpu-page-history").height(120.0).include_y(0.0).include_y(100.0).allow_drag(false).allow_zoom(false).allow_scroll(false).show_x(false).show(ui, |plot| {
-                            for points in history::segments(&self.history, self.started, |sample| sample.cpu) { plot.line(Line::new(PlotPoints::from(points)).color(ACCENT)); }
+                            for points in history::segments_with_gap(&self.history, self.started, self.history_gap(), |sample| sample.cpu) { plot.line(Line::new(PlotPoints::from(points)).color(ACCENT)); }
                         });
                         ui.weak("Up to 60 batches; gaps mean missing or delayed readings.");
                     });
@@ -1176,10 +1212,10 @@ impl App {
                     if snapshot.memory_total == 0 { ui.weak("Memory usage unavailable."); }
                     else { ui.label(format!("{:.1} / {:.1} GiB used · {:.1} GiB available", gib(snapshot.memory_used), gib(snapshot.memory_total), gib(snapshot.memory_available))); }
                     ui.add_space(6.0);
-                    bar(ui, if snapshot.memory_total > 0 { snapshot.memory_used as f32 / snapshot.memory_total as f32 } else { 0.0 }, VIOLET, 6.0);
+                    bar(ui, "mem-detail", if snapshot.memory_total > 0 { snapshot.memory_used as f32 / snapshot.memory_total as f32 } else { 0.0 }, VIOLET, 6.0);
                     egui::CollapsingHeader::new("Recent memory activity").show(ui, |ui| {
                         Plot::new("memory-page-history").height(120.0).include_y(0.0).include_y(100.0).allow_drag(false).allow_zoom(false).allow_scroll(false).show_x(false).show(ui, |plot| {
-                            for points in history::segments(&self.history, self.started, |sample| sample.memory) { plot.line(Line::new(PlotPoints::from(points)).color(VIOLET)); }
+                            for points in history::segments_with_gap(&self.history, self.started, self.history_gap(), |sample| sample.memory) { plot.line(Line::new(PlotPoints::from(points)).color(VIOLET)); }
                         });
                         ui.weak("Up to 60 batches; gaps mean missing or delayed readings.");
                     });
@@ -1286,7 +1322,7 @@ impl App {
                             .allow_scroll(false)
                             .show_x(false)
                             .show(ui, |plot| {
-                                for points in history::segments(&self.history, self.started, |sample| history::temperature_value(sample, &selected)) {
+                                for points in history::segments_with_gap(&self.history, self.started, self.history_gap(), |sample| history::temperature_value(sample, &selected)) {
                                     plot.line(Line::new(PlotPoints::from(points)).color(AMBER).width(1.8_f32));
                                 }
                             });
@@ -1822,6 +1858,8 @@ impl App {
                         self.auto_stop_fired = false;
                         self.last_live_units = 0;
                         self.last_live_at = Instant::now();
+                        self.rate_ema = 0.0;
+                        self.shown_progress = 0.0;
                         let adapter = if self.kind == Kind::Gpu {
                             s.adapters.get(self.gpu_index)
                         } else {
@@ -1884,6 +1922,12 @@ impl App {
                         .map(|t| t.elapsed().as_secs_f32())
                         .unwrap_or_default();
                     let fraction = (elapsed / self.seconds as f32).clamp(0.0, 1.0);
+                    // Ease the displayed bar toward the true fraction so it
+                    // glides instead of stepping between elapsed-time samples.
+                    let dt: f32 = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
+                    let k = 1.0 - (-9.0f32 * dt).exp();
+                    self.shown_progress += (fraction - self.shown_progress) * k;
+                    let shown = self.shown_progress;
                     let remaining = (self.seconds as f32 - elapsed).max(0.0);
                     let percent = (fraction * 100.0).round() as u32;
                     ui.horizontal(|ui| {
@@ -1906,7 +1950,7 @@ impl App {
                     // Keep the progress bar moving and let people estimate the
                     // wait — both are Apple HIG guidance for determinate tasks.
                     ui.add(
-                        egui::ProgressBar::new(fraction)
+                        egui::ProgressBar::new(shown)
                             .fill(ACCENT)
                             .corner_radius(CornerRadius::same(6))
                             .desired_height(8.0),
@@ -1917,14 +1961,23 @@ impl App {
                     {
                         let live = self.state.lock().ok().map(|s| s.live.clone()).unwrap_or_default();
                         let now = Instant::now();
-                        let dt = now.duration_since(self.last_live_at).as_secs_f64().max(1e-3);
-                        let rate = if self.last_live_units > 0 || live.units > 0 {
-                            (live.units.saturating_sub(self.last_live_units)) as f64 / dt
-                        } else {
-                            0.0
-                        };
-                        self.last_live_units = live.units;
-                        self.last_live_at = now;
+                        // Only recompute when workers actually published new units;
+                        // otherwise an unchanged counter over a tiny dt reads as 0/s
+                        // and the number visibly flickers between frames.
+                        if live.units != self.last_live_units {
+                            if self.last_live_units > 0 {
+                                let dt = now.duration_since(self.last_live_at).as_secs_f64().max(1e-3);
+                                let inst = (live.units.saturating_sub(self.last_live_units)) as f64 / dt;
+                                self.rate_ema = if self.rate_ema <= 0.0 {
+                                    inst
+                                } else {
+                                    self.rate_ema * 0.65 + inst * 0.35
+                                };
+                            }
+                            self.last_live_units = live.units;
+                            self.last_live_at = now;
+                        }
+                        let rate = self.rate_ema;
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Phase").size(11.0).color(MUTED));
                             ui.label(RichText::new(&live.phase).size(11.0).strong().color(TEXT));
@@ -2943,8 +2996,9 @@ impl App {
                         let (dot, text) = if !s.ready {
                             (MUTED, "Collecting readings…".to_string())
                         } else {
+                            let stale_after = self.stale_secs();
                             match s.updated_at.map(|t| t.elapsed().as_secs_f32()) {
-                                Some(age) if age > 3.0 => {
+                                Some(age) if age > stale_after => {
                                     (AMBER, format!("Readings are stale ({age:.0}s old)"))
                                 }
                                 Some(age) => (GREEN, format!("Live · updated {age:.1}s ago")),
@@ -3025,6 +3079,12 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // Detect a page change once and start the enter transition.
+        if self.last_page != self.page {
+            self.last_page = self.page;
+            self.page_enter_at = Instant::now();
+            ctx.request_repaint();
+        }
         let running = self.state.lock().map(|s| s.running).unwrap_or(false);
         if !running && (self.message.starts_with("Stopping") || self.message == "Test started") {
             if let Ok(state) = self.state.lock() {
@@ -3037,20 +3097,25 @@ impl eframe::App for App {
             }
         }
         if ctx.input(|i| i.viewport().close_requested()) {
+            let mut notices: Vec<&str> = Vec::new();
             if let Some(recorder) = &mut self.recorder {
                 if !recorder.status().closed {
                     recorder.stop();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    self.message =
-                        "Finishing the recording. Close again when it has stopped.".into();
+                    notices.push("Finishing the recording");
                 }
             }
-        }
-        if ctx.input(|i| i.viewport().close_requested()) && running {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.cancel.store(true, Ordering::Relaxed);
-            self.page = Page::Tests;
-            self.message = "Stopping test before closing. Close again when it has stopped.".into();
+            if running {
+                self.cancel.store(true, Ordering::Relaxed);
+                self.page = Page::Tests;
+                notices.push("Stopping the test");
+            }
+            if !notices.is_empty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.message = format!(
+                    "{}. Close again when it has stopped.",
+                    notices.join(" and ")
+                );
+            }
         }
         let snapshot = self
             .snapshot
@@ -3060,9 +3125,10 @@ impl eframe::App for App {
         let now = Instant::now();
         // The alert only sees a fresh provider sample. A stale snapshot pauses
         // the streak instead of pretending the machine has cooled down.
+        let fresh_for = std::time::Duration::from_secs_f32(self.stale_secs());
         let fresh = snapshot
             .updated_at
-            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(3));
+            .is_some_and(|at| now.saturating_duration_since(at) < fresh_for);
         let hottest = fresh
             .then(|| {
                 snapshot
@@ -3188,24 +3254,41 @@ impl eframe::App for App {
             },
             ..Default::default()
         };
+        // Short entrance animation for the page header: ease-out fade + slide.
+        let enter = (self.page_enter_at.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
+        if enter < 1.0 {
+            ctx.request_repaint();
+        }
+        let eased = 1.0 - (1.0 - enter).powi(3);
+        let slide = (1.0 - eased) * 10.0;
+        let fade = |c: Color32| {
+            let a = (c.a() as f32 * (0.25 + 0.75 * eased))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            Color32::from_rgba_premultiplied(c.r(), c.g(), c.b(), a)
+        };
+        let group_c = fade(ACCENT);
+        let title_c = fade(TEXT);
+        let sub_c = fade(MUTED);
         egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.add_space(slide);
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new(self.page.group())
                             .size(10.5)
                             .strong()
-                            .color(ACCENT),
+                            .color(group_c),
                     );
                     ui.add_space(3.0);
                     ui.label(
                         RichText::new(self.page.title())
                             .size(28.0)
                             .strong()
-                            .color(TEXT),
+                            .color(title_c),
                     );
                     ui.add_space(3.0);
-                    ui.label(RichText::new(self.page.subtitle()).size(12.5).color(MUTED));
+                    ui.label(RichText::new(self.page.subtitle()).size(12.5).color(sub_c));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if matches!(
@@ -3222,9 +3305,10 @@ impl eframe::App for App {
                         };
                         pill(ui, label, MUTED);
                     } else if snapshot.ready {
+                        let stale_after = self.stale_secs();
                         let (color, text) =
                             match snapshot.updated_at.map(|t| t.elapsed().as_secs_f32()) {
-                                Some(age) if age >= 3.0 => (AMBER, "STALE"),
+                                Some(age) if age >= stale_after => (AMBER, "STALE"),
                                 Some(_) => (GREEN, "LIVE"),
                                 None => (MUTED, "WAITING"),
                             };
@@ -3257,6 +3341,7 @@ impl eframe::App for App {
                 });
         });
         if self.show_widget {
+            let monitor_stale = std::time::Duration::from_secs_f32(self.stale_secs());
             let mut keep_open = true;
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("floating-monitor"),
@@ -3269,10 +3354,10 @@ impl eframe::App for App {
                     if class == egui::ViewportClass::Embedded {
                         egui::Window::new("Floating monitor")
                             .open(&mut keep_open)
-                            .show(ctx, |ui| floating_readings(ui, &snapshot));
+                            .show(ctx, |ui| floating_readings(ui, &snapshot, monitor_stale));
                     } else {
                         egui::CentralPanel::default()
-                            .show(ctx, |ui| floating_readings(ui, &snapshot));
+                            .show(ctx, |ui| floating_readings(ui, &snapshot, monitor_stale));
                         if ctx.input(|input| input.viewport().close_requested()) {
                             keep_open = false;
                         }
@@ -3293,10 +3378,10 @@ impl eframe::App for App {
     }
 }
 
-fn floating_readings(ui: &mut egui::Ui, s: &Snapshot) {
+fn floating_readings(ui: &mut egui::Ui, s: &Snapshot, stale_after: Duration) {
     ui.strong("LIVE MONITOR");
     match s.updated_at {
-        Some(at) if at.elapsed() >= Duration::from_secs(3) => {
+        Some(at) if at.elapsed() >= stale_after => {
             ui.colored_label(
                 AMBER,
                 format!("Stale · {:.1}s ago", at.elapsed().as_secs_f32()),
@@ -3875,38 +3960,59 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 33.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
+        let ctx = ui.ctx();
+        // Smooth selection + hover transitions give the sidebar a lively,
+        // native feel instead of instant state flips.
+        let sel = ctx.animate_bool_with_time(egui::Id::new(("nav-sel", label)), active, 0.16);
+        let hov = ctx.animate_bool_with_time(
+            egui::Id::new(("nav-hover", label)),
+            response.hovered(),
+            0.12,
+        );
         let painter = ui.painter();
-        if active {
+        if sel > 0.01 {
             // macOS sidebars use a translucent neutral selection, not a filled accent row.
+            let a = (20.0 * sel).round() as u8;
             painter.rect_filled(
                 rect,
                 CornerRadius::same(9),
-                Color32::from_rgba_unmultiplied(255, 255, 255, 20),
+                Color32::from_rgba_unmultiplied(255, 255, 255, a),
             );
             let accent = egui::Rect::from_min_size(
                 rect.left_center() + egui::vec2(0.0, -8.0),
-                egui::vec2(3.0, 16.0),
+                egui::vec2(3.0, 16.0 * sel),
             );
             painter.rect_filled(accent, CornerRadius::same(2), ACCENT);
-        } else if response.hovered() {
+        } else if hov > 0.01 {
+            let a = (10.0 * hov).round() as u8;
             painter.rect_filled(
                 rect,
                 CornerRadius::same(9),
-                Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+                Color32::from_rgba_unmultiplied(255, 255, 255, a),
             );
         }
+        let icon_c = Color32::from_rgb(
+            (MUTED.r() as f32 + (ACCENT.r() as f32 - MUTED.r() as f32) * sel) as u8,
+            (MUTED.g() as f32 + (ACCENT.g() as f32 - MUTED.g() as f32) * sel) as u8,
+            (MUTED.b() as f32 + (ACCENT.b() as f32 - MUTED.b() as f32) * sel) as u8,
+        );
+        let text_c = Color32::from_rgb(
+            (TEXT_DIM.r() as f32 + (TEXT.r() as f32 - TEXT_DIM.r() as f32) * sel) as u8,
+            (TEXT_DIM.g() as f32 + (TEXT.g() as f32 - TEXT_DIM.g() as f32) * sel) as u8,
+            (TEXT_DIM.b() as f32 + (TEXT.b() as f32 - TEXT_DIM.b() as f32) * sel) as u8,
+        );
         draw_nav_icon(
             painter,
             rect.left_center() + egui::vec2(20.0, 0.0),
             page,
-            if active { ACCENT } else { MUTED },
+            icon_c,
         );
         painter.text(
             rect.left_center() + egui::vec2(40.0, 0.0),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(13.0),
-            if active { TEXT } else { TEXT_DIM },
+            text_c,
         );
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -4042,7 +4148,7 @@ fn metric(
         ui.label(RichText::new(value).size(27.0).strong().color(TEXT));
         ui.add_space(9.0);
         match fraction {
-            Some(f) => bar(ui, f, accent, 6.0),
+            Some(f) => bar(ui, label, f, accent, 6.0),
             // No meaningful ratio: keep the caption baseline without faking 0%.
             None => ui.add_space(6.0),
         }
@@ -4051,7 +4157,7 @@ fn metric(
     });
 }
 
-fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32, height: f32) {
+fn bar(ui: &mut egui::Ui, id: &str, fraction: f32, color: Color32, height: f32) {
     let width = ui.available_width().max(24.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
@@ -4060,7 +4166,12 @@ fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32, height: f32) {
     let radius = CornerRadius::same((height / 2.0) as u8);
     let painter = ui.painter();
     painter.rect_filled(rect, radius, TRACK);
-    let fraction = fraction.clamp(0.0, 1.0);
+    // Ease the fill so per-second telemetry updates glide instead of stepping.
+    let fraction = ui.ctx().animate_value_with_time(
+        egui::Id::new(("bar", id)),
+        fraction.clamp(0.0, 1.0),
+        0.18,
+    );
     if fraction > 0.0 {
         let filled = egui::Rect::from_min_size(
             rect.min,
@@ -4075,7 +4186,11 @@ fn core_meter(ui: &mut egui::Ui, index: usize, usage: f32, width: f32) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let fraction = (usage / 100.0).clamp(0.0, 1.0);
+    let fraction = ui.ctx().animate_value_with_time(
+        egui::Id::new(("core-meter", index)),
+        (usage / 100.0).clamp(0.0, 1.0),
+        0.18,
+    );
     let painter = ui.painter();
     painter.text(
         rect.left_center(),
