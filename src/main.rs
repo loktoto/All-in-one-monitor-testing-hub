@@ -44,6 +44,17 @@ const AMBER: Color32 = Color32::from_rgb(255, 159, 10);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const VIOLET: Color32 = Color32::from_rgb(191, 90, 242);
 
+// Motion tokens — Apple-style understated transitions, all disableable.
+const MOTION_FAST: f32 = 0.12;
+const MOTION_MEDIUM: f32 = 0.18;
+const MOTION_SLOW: f32 = 0.28;
+
+// Type ramp — shared by the theme and the large-title page header.
+const TYPE_OVERLINE: f32 = 10.5;
+const TYPE_TITLE: f32 = 28.0;
+const TYPE_SUBTITLE: f32 = 12.5;
+const TYPE_BODY: f32 = 13.0;
+
 const KINDS: [(Kind, &str, &str); 5] = [
     (Kind::Cpu, "CPU compute", "Integer rounds, fixed answer"),
     (Kind::Gpu, "GPU check", "Shader dispatch, read back"),
@@ -119,6 +130,26 @@ impl Page {
                 "WORKSPACE"
             }
             _ => "HARDWARE",
+        }
+    }
+    /// Shortcut hint shown in the sidebar; mirrors `App::update` keyboard jump.
+    fn shortcut(self) -> &'static str {
+        match self {
+            Page::Overview => "1",
+            Page::Cpu => "2",
+            Page::Gpu => "3",
+            Page::Memory => "4",
+            Page::Storage => "5",
+            Page::Thermal => "6",
+            Page::Details => "7",
+            Page::Processes => "8",
+            Page::Reports => "9",
+            Page::Motherboard => "⇧1",
+            Page::Drivers => "⇧2",
+            Page::Network => "⇧3",
+            Page::Bluetooth => "⇧4",
+            Page::Frames => "⇧5",
+            Page::Tests => "⇧6",
         }
     }
     fn subtitle(self) -> &'static str {
@@ -257,6 +288,8 @@ struct App {
     system_report_path: String,
     system_report_format: Format,
     system_report_redact: bool,
+    /// Accessibility: disable page transitions and eased meters when enabled.
+    reduce_motion: bool,
     show_widget: bool,
     started: Instant,
 }
@@ -350,6 +383,7 @@ impl App {
             system_report_path: "hardware-hub-system.txt".into(),
             system_report_format: Format::Text,
             system_report_redact: true,
+            reduce_motion: false,
             show_widget: false,
             started: Instant::now(),
         }
@@ -451,6 +485,13 @@ impl App {
                         ui.add_space(8.0);
                         ui.checkbox(&mut self.show_widget, "Floating monitor")
                             .on_hover_text("Desktop window; not an in-game FPS overlay.");
+                        if ui
+                            .checkbox(&mut self.reduce_motion, "Reduce motion")
+                            .on_hover_text("Turn off page transitions and eased meters.")
+                            .clicked()
+                        {
+                            set_reduce_motion(ui.ctx(), self.reduce_motion);
+                        }
                         if let Some(recorder) = &mut self.recorder {
                             let status = recorder.status();
                             if recorder.active() {
@@ -1924,9 +1965,13 @@ impl App {
                     let fraction = (elapsed / self.seconds as f32).clamp(0.0, 1.0);
                     // Ease the displayed bar toward the true fraction so it
                     // glides instead of stepping between elapsed-time samples.
-                    let dt: f32 = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
-                    let k = 1.0 - (-9.0f32 * dt).exp();
-                    self.shown_progress += (fraction - self.shown_progress) * k;
+                    if motion_enabled(ui.ctx()) {
+                        let dt: f32 = ui.ctx().input(|i| i.stable_dt).clamp(0.0, 0.1);
+                        let k = 1.0 - (-9.0f32 * dt).exp();
+                        self.shown_progress += (fraction - self.shown_progress) * k;
+                    } else {
+                        self.shown_progress = fraction;
+                    }
                     let shown = self.shown_progress;
                     let remaining = (self.seconds as f32 - elapsed).max(0.0);
                     let percent = (fraction * 100.0).round() as u32;
@@ -3255,7 +3300,11 @@ impl eframe::App for App {
             ..Default::default()
         };
         // Short entrance animation for the page header: ease-out fade + slide.
-        let enter = (self.page_enter_at.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
+        let enter = if motion_enabled(ctx) {
+            (self.page_enter_at.elapsed().as_secs_f32() / MOTION_SLOW).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         if enter < 1.0 {
             ctx.request_repaint();
         }
@@ -3276,19 +3325,23 @@ impl eframe::App for App {
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new(self.page.group())
-                            .size(10.5)
+                            .size(TYPE_OVERLINE)
                             .strong()
                             .color(group_c),
                     );
                     ui.add_space(3.0);
                     ui.label(
                         RichText::new(self.page.title())
-                            .size(28.0)
+                            .size(TYPE_TITLE)
                             .strong()
                             .color(title_c),
                     );
                     ui.add_space(3.0);
-                    ui.label(RichText::new(self.page.subtitle()).size(12.5).color(sub_c));
+                    ui.label(
+                        RichText::new(self.page.subtitle())
+                            .size(TYPE_SUBTITLE)
+                            .color(sub_c),
+                    );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if matches!(
@@ -3446,7 +3499,7 @@ fn install_theme(ctx: &egui::Context) {
     // Apple-style type ramp: a 13 pt body, compact captions and one heading level.
     style.text_styles = [
         (egui::TextStyle::Heading, egui::FontId::proportional(21.0)),
-        (egui::TextStyle::Body, egui::FontId::proportional(13.0)),
+        (egui::TextStyle::Body, egui::FontId::proportional(TYPE_BODY)),
         (egui::TextStyle::Button, egui::FontId::proportional(12.5)),
         (egui::TextStyle::Small, egui::FontId::proportional(11.0)),
         (egui::TextStyle::Monospace, egui::FontId::monospace(11.5)),
@@ -3461,7 +3514,7 @@ fn install_theme(ctx: &egui::Context) {
     style.spacing.scroll.bar_inner_margin = 3.0;
     style.spacing.scroll.bar_outer_margin = 2.0;
     style.spacing.menu_margin = egui::Margin::same(8);
-    style.animation_time = 0.12;
+    style.animation_time = MOTION_FAST;
     visuals.window_corner_radius = CornerRadius::same(12);
     visuals.menu_corner_radius = CornerRadius::same(10);
     visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
@@ -3474,6 +3527,35 @@ fn install_theme(ctx: &egui::Context) {
     visuals.popup_shadow = visuals.window_shadow;
     visuals.widgets.open.corner_radius = CornerRadius::same(8);
     ctx.set_style(style);
+}
+
+/// `animation_time == 0` is the single source of truth for Reduce Motion.
+fn motion_enabled(ctx: &egui::Context) -> bool {
+    ctx.style().animation_time > 0.0
+}
+
+fn set_reduce_motion(ctx: &egui::Context, reduce: bool) {
+    let mut style = (*ctx.style()).clone();
+    style.animation_time = if reduce { 0.0 } else { MOTION_FAST };
+    ctx.set_style(style);
+}
+
+fn animated_bool(ctx: &egui::Context, id: egui::Id, target: bool, seconds: f32) -> f32 {
+    if motion_enabled(ctx) {
+        ctx.animate_bool_with_time(id, target, seconds)
+    } else if target {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn animated_value(ctx: &egui::Context, id: egui::Id, target: f32, seconds: f32) -> f32 {
+    if motion_enabled(ctx) {
+        ctx.animate_value_with_time(id, target, seconds)
+    } else {
+        target
+    }
 }
 
 fn card_frame() -> egui::Frame {
@@ -3963,11 +4045,17 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
         let ctx = ui.ctx();
         // Smooth selection + hover transitions give the sidebar a lively,
         // native feel instead of instant state flips.
-        let sel = ctx.animate_bool_with_time(egui::Id::new(("nav-sel", label)), active, 0.16);
-        let hov = ctx.animate_bool_with_time(
+        let sel = animated_bool(
+            ctx,
+            egui::Id::new(("nav-sel", label)),
+            active,
+            MOTION_MEDIUM,
+        );
+        let hov = animated_bool(
+            ctx,
             egui::Id::new(("nav-hover", label)),
             response.hovered(),
-            0.12,
+            MOTION_FAST,
         );
         let painter = ui.painter();
         if sel > 0.01 {
@@ -4014,8 +4102,20 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
             egui::FontId::proportional(13.0),
             text_c,
         );
+        // Menu-style shortcut hint: appears on hover, stays subtle when selected.
+        let hint_alpha = (MUTED.a() as f32 * hov.max(sel * 0.55)).round() as u8;
+        let hint_c = Color32::from_rgba_premultiplied(MUTED.r(), MUTED.g(), MUTED.b(), hint_alpha);
+        painter.text(
+            rect.right_center() + egui::vec2(-12.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            format!("⌘{}", page.shortcut()),
+            egui::FontId::proportional(9.5),
+            hint_c,
+        );
     }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("Open {label}  ·  ⌘{}", page.shortcut()))
 }
 
 /// Generic labelled combo box for a bounded set of enum choices.
@@ -4119,7 +4219,9 @@ fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui
             MUTED,
         );
     }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("{title} — {hint}"))
 }
 
 fn metric(
@@ -4167,10 +4269,11 @@ fn bar(ui: &mut egui::Ui, id: &str, fraction: f32, color: Color32, height: f32) 
     let painter = ui.painter();
     painter.rect_filled(rect, radius, TRACK);
     // Ease the fill so per-second telemetry updates glide instead of stepping.
-    let fraction = ui.ctx().animate_value_with_time(
+    let fraction = animated_value(
+        ui.ctx(),
         egui::Id::new(("bar", id)),
         fraction.clamp(0.0, 1.0),
-        0.18,
+        MOTION_MEDIUM,
     );
     if fraction > 0.0 {
         let filled = egui::Rect::from_min_size(
@@ -4186,10 +4289,11 @@ fn core_meter(ui: &mut egui::Ui, index: usize, usage: f32, width: f32) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    let fraction = ui.ctx().animate_value_with_time(
+    let fraction = animated_value(
+        ui.ctx(),
         egui::Id::new(("core-meter", index)),
         (usage / 100.0).clamp(0.0, 1.0),
-        0.18,
+        MOTION_MEDIUM,
     );
     let painter = ui.painter();
     painter.text(
