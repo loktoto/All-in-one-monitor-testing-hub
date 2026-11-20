@@ -1,0 +1,123 @@
+# 2026 mainstream monitor study → implementation gap analysis
+
+Research date: 2026-11-18. Sources are the vendors' own product pages where
+available. This is a practical feature comparison for this repository, not a
+claim of feature-for-feature equivalence with any commercial product.
+
+## What was researched
+
+| Product | Documented strengths | Official source |
+| --- | --- | --- |
+| CPU-Z 3.02 | CPU name/codename/process/package/caches, mainboard/chipset/BIOS, memory type/size/timings/SPD including DDR5 and XMP 3.0, per-core clocks, GPU tab with clocks/TDP, sensor voltages, single/multi-core benchmark, Validator V3, text/HTML reports, CLI report/bench flags, F5/F6/F7 screenshot, clipboard and validation-file shortcuts. | <https://www.cpuid.com/softwares/cpu-z.html> |
+| HWMonitor / HWMonitor PRO | Voltages, temperatures, fan speeds, power, current, utilisation, clocks; S.M.A.R.T., battery, LPCIO, PSU and AIO sources; per-pin GPU currents, max sensors, CSV logging (1.62), real-time and transparent graph windows (1.64/1.66), themes, sensor tree state. | <https://www.cpuid.com/softwares/hwmonitor.html> |
+| GPU-Z | NVIDIA/AMD/Intel adapter, GPU and display information, default/overclock/boost clocks, memory size/type/speed/bus width, PCIe-lane render test, result validation, BIOS backup, no install required. | <https://www.techpowerup.com/gpuz/> |
+| HWiNFO | In-depth hardware tree, low-overhead real-time monitoring, extensive reporting/status logging, failure prediction and add-on interfaces; no personal data collection. | <https://www.hwinfo.com/> |
+
+## Comparison with this build, and what changed
+
+| Mainstream capability | This build before | This build now |
+| --- | --- | --- |
+| CPU/mainboard/memory/drive identity and caches | Specification sheet added on Windows in the uncommitted work: socket, stepping, configured memory speed, form factor, serials, GPU driver/date, display mode, drive serials | Same, plus **exportable CPU-Z-style system report** (text or JSON, optional redaction of serials/paths/device names) from Reports |
+| GPU identity, driver and device limits | Adapter name/vendor/device ID and NVML detail string | Added an **Adapter capabilities** section: backend, vendor/device IDs, maximum 2D texture, compute workgroup dimensions, storage-buffer binding and optional feature count |
+| Temperature/fan current-min-max table | Present on all platforms | Retained; values are labelled as observed session extremes rather than specifications |
+| Real-time multi-sensor graphs | CPU and memory chart only | Added a **selectable temperature history graph** with min/max/average, gap-aware line segments and single-sensor CSV export |
+| CSV session logging | Fixed ~1 s cadence | Unchanged bounded writer, plus **user-controlled sampling interval (250–5000 ms)** so cost and density can be balanced |
+| Threshold alerts | None | Added **sustained temperature alerts** with warning/critical severity, configurable threshold and hold time, freshness checks, acknowledgement and a status-bar indicator. Advisory only: no fan, clock or test changes |
+| Reports, clipboard, validation | Text/JSON test results | System report added; online validation is deliberately not implemented (it would transmit hardware data) |
+| Benchmarks (CPU-Z, 3DMark-style) | Bounded correctness checks, explicitly not benchmarks | Still correctness checks. A cross-machine comparable score would need a fixed, calibrated workload and versioned scoring; publishing an uncalibrated ops/sec number would be misleading |
+| Overclocking, fan curves, BIOS backup, hardware writes | None | Still none. These need privileged/driver access and have real hardware risk; this app stays read-only except for its owned scratch test file |
+| Remote monitoring, alerts by email, account/cloud | None | Still none; local-only by design |
+| GPU render/PCIe-lane test | Small verified compute dispatch | Still compute-only; no synthetic graphics load or VRAM stress test |
+| Keyboard-driven navigation | None | **Cmd/Ctrl+1…9** page shortcuts and **Esc** to request check cancellation; hint shown in the sidebar |
+
+## Performance profiling and optimisation
+
+Profiled on the Windows development host with a synthetic 500-process snapshot
+(`cargo run --release --example perf`; hardware untouched, no disk writes):
+
+| Read path | Before | After |
+| --- | --- | --- |
+| Snapshot read per rendered frame | 33,294 ns deep clone of processes, disks, names and adapters | 15 ns atomic `Arc` clone |
+| Specification sheet read per frame | Full `SystemSpecs` deep clone | `Arc` clone |
+| Temperature graph split for 60 samples | n/a (no graph) | 1,895 ns/frame |
+| Telemetry cadence | Fixed ~1 s, fixed sleeps stacked onto collection time | Configurable 250–5000 ms; worker sleeps only for the remainder of the period after collection finishes |
+
+The release smoke run (`cargo run --release --example smoke`) passed: telemetry
+with 8 logical CPUs and 221 processes, a completed CPU check (3,423 verified
+rounds), memory and file checks, and an honestly reported unavailable GPU path.
+A `cargo test --locked` run passed 48 library and 4 binary tests. The release
+binary was launched on the Thermal page without a runtime failure.
+
+## UI/UX direction
+
+The existing Apple-HIG-inspired tokens (neutral graphite surfaces, SF-style
+system fonts, translucent-looking cards, restrained accent colours, generous
+spacing) were kept. New controls follow the same language: grouped sections,
+short explanatory captions, selectable severity chips, a graph with a compact
+range summary, and discoverable keyboard hints. Alerts and sampling were placed
+on the Thermal page where their meaning is obvious; exports live on Reports.
+
+## Pro stress-test workflow (2026-11-19 follow-up)
+
+A second pass focused on how dedicated stress tools present a run, using the
+vendors' own pages: Prime95's Torture Test modes (Small/Large FFTs and Blend,
+with per-worker iterations and error counts), MemTest86's 14 algorithms with
+pass/test numbers and address/expected/actual error lines, OCCT's live graphs
+and multi-sensor supervision with opt-in automatic stop, and BurnInTest's
+cycle counters and simultaneous subsystem tests. The concrete gaps in this app
+were a single fixed workload, no error detail, no work-unit progress or rate,
+and only advisory safety feedback.
+
+The stress workflow now exposes: selectable data patterns for memory (four)
+and disk (three), three GPU shader intensity levels, a live WORK PROGRESS block
+(phase, completed units, units/s, error count), a temperature sparkline during a
+run, and mismatch records with location/expected/actual values in the result
+card and Reports. An opt-in checkbox stops only the running check at the
+advisory temperature limit. These are deliberately still **bounded correctness
+checks**, not exhaustive burn-in: no comparable score, no raw-disk or full-RAM
+coverage, and no hardware writes. Full MemTest86 or Prime95 algorithm suites need
+boot-time or kernel-level access that conflicts with this app's read-only,
+always-reversible positioning.
+
+## Combined load and report comparison (2026-11-19 follow-up 2)
+
+A fresh 2026 check of the OCCT site (v17 notes, May 2026) confirmed that its
+headline differentiators are combined CPU/GPU/RAM/PSU testing, integrated live
+HWiNFO telemetry, and a report comparison tool with shareable stability
+certificates. Comparing that with the current app left two safe, software-only
+gaps: a multi-subsystem load, and any way to compare two runs.
+
+Added: a **Combined CPU + memory** check that runs the existing bounded CPU and
+memory workers concurrently with one merged progress/error readout and a single
+combined result (including first mismatch detail from either worker). Added a
+**Compare runs** card in Reports that places any two session results side by side
+(status, verified units, errors, elapsed, settings) with a note that differing
+settings make raw counts non-comparable. GPU, disk and PSI/voltage remain outside
+the combined load: a GPU adapter cannot be safely shared with a second worker on
+every backend, and real PSU stability needs voltage/current sensors this app does
+not read. No certificate or score is implied by either addition.
+
+## Certificates, wide sensor logs and full keyboard access (2026-11-19 follow-up 3)
+
+A further 2026 pass confirmed HWiNFO's multi-format reports (text/CSV/HTML/XML),
+per-sensor monitoring/alerting and OSD, MemTest86's 13 algorithms with pass
+counts and ECC support, and CPU-Z's validator/benchmark graphs against our app.
+Three more safe gaps were closed: a shareable one-page **run summary**
+(OCCT-style stability certificate, but explicitly not a score or certification,
+with paths/adapter names/serials omitted), an **all-sensors wide CSV** export
+(HWMonitor-style multi-series log, gaps left blank), and **keyboard access to all
+15 pages** via Cmd/Ctrl+Shift+1–6 for the six previously mouse-only pages.
+Per-sensor alert rules, target pass counts and ECC/boot-time testing remain
+deliberate boundaries: they need intrusive changes or kernel/boot access that
+conflicts with the read-only, always-reversible positioning.
+
+## Remaining, deliberate boundaries
+
+CPU-Z-style voltage readings depend on model-specific SMC keys and are not
+guessable; motherboard chipset and SPD timing profiles are not exposed by the
+read-only providers used here. AMD/Intel GPU sensors need vendor libraries or
+kernel drivers. Windows cannot expose per-fan RPM or per-core die temperature
+through the standard-user providers used. Online validation, overclocking,
+remote monitoring and scheduled stress suites are outside the local, read-only
+scope. These gaps are listed in the UI under **Not available** rather than
+filled with estimates.

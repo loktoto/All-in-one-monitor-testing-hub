@@ -1,0 +1,36 @@
+[package]
+name = "hardware-hub"
+version = "0.1.0"
+edition = "2021"
+description = "A local hardware monitor and bounded manual test bench"
+license = "MIT"
+
+[dependencies]
+egui_plot = "0.31"
+sysinfo = "0.33"
+nvml-wrapper = "0.11"
+wgpu = "24"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+csv = "1.3"
+
+# X11 is only needed on Linux. On macOS (CGL) and Windows the window is created
+# natively, so requesting the X11 backend there pulls unused system libraries.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+
+# Windows reports temperature through the ACPI thermal zones: the WMI class in
+# ROOT\WMI (elevated only) and the "Thermal Zone Information" performance
+# counters in ROOT\CIMV2 (readable as a standard user). `sysinfo` has no
+# component provider on Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+wmi = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
