@@ -88,6 +88,12 @@ impl Settings {
         Self::config_dir().map(|dir| dir.join("settings.json"))
     }
 
+    /// Full path of the cached hardware inventory, which lets the next launch
+    /// show the Details page before the slow OS collection finishes.
+    pub fn inventory_path() -> Option<PathBuf> {
+        Self::config_dir().map(|dir| dir.join("inventory.json"))
+    }
+
     /// Read settings from disk. Any failure (missing file, bad JSON, no config
     /// directory) yields the defaults so startup is never blocked.
     pub fn load() -> Self {

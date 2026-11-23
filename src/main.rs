@@ -300,6 +300,11 @@ struct App {
     page: Page,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
     specs: Arc<Mutex<Option<Arc<SystemSpecs>>>>,
+    /// True once the background inventory refresh has finished; until then the
+    /// shown specs may come from the on-disk cache.
+    specs_refreshed: Arc<AtomicBool>,
+    /// Unix time of the cached inventory, when one was loaded at startup.
+    inventory_cached_at: Option<u64>,
     /// Desired telemetry period in milliseconds; the worker clamps it to 250–5000.
     poll_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -404,19 +409,38 @@ impl App {
             poll_ms.clone(),
         );
         // The inventory shells out to local tools once, so it must not block the
-        // first frame; the Details page shows a placeholder until it lands.
-        let specs = Arc::new(Mutex::new(None));
+        // first frame. The previous result is loaded from disk immediately, then
+        // a fresh collection runs in the background and updates the cache.
+        let cache_path = Settings::inventory_path();
+        let cached = cache_path
+            .as_deref()
+            .and_then(specs::load_cache)
+            .filter(|(specs, _)| !specs.cpu.name.is_empty() || !specs.model_name.is_empty());
+        let inventory_cached_at = cached.as_ref().map(|(_, at)| *at);
+        let specs = Arc::new(Mutex::new(cached.map(|(specs, _)| Arc::new(specs))));
         let specs_slot = Arc::clone(&specs);
+        let specs_refreshed = Arc::new(AtomicBool::new(false));
+        let refreshed_flag = Arc::clone(&specs_refreshed);
         std::thread::spawn(move || {
             let collected = specs::collect();
+            // Never let a failed collection overwrite a usable cache with an
+            // empty one: an inventory with no CPU and no model is not useful.
+            if !collected.cpu.name.is_empty() || !collected.model_name.is_empty() {
+                if let Some(path) = cache_path.as_deref() {
+                    let _ = specs::save_cache(path, &collected);
+                }
+            }
             if let Ok(mut slot) = specs_slot.lock() {
                 *slot = Some(Arc::new(collected));
             }
+            refreshed_flag.store(true, Ordering::Relaxed);
         });
         Self {
             page: start_page,
             snapshot,
             specs,
+            specs_refreshed,
+            inventory_cached_at,
             poll_ms,
             stop,
             stats_reset,
@@ -2941,6 +2965,20 @@ impl App {
             .size(10.0)
             .color(MUTED),
         );
+        if let Some(at) = self
+            .inventory_cached_at
+            .filter(|_| !self.specs_refreshed.load(Ordering::Relaxed))
+        {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!(
+                    "Showing the inventory saved on {}; a fresh collection is running.",
+                    timestamp_text(at)
+                ))
+                .size(10.0)
+                .color(MUTED),
+            );
+        }
         ui.add_space(8.0);
     }
 
@@ -3777,11 +3815,14 @@ impl eframe::App for App {
 
         let frame = egui::Frame {
             fill: BG,
+            // No bottom margin: the scroll viewport then ends exactly at the
+            // status bar, so the fade can hide the last row cleanly instead of
+            // letting it peek into a margin gap.
             inner_margin: egui::Margin {
                 left: 28,
                 right: 28,
                 top: 24,
-                bottom: 20,
+                bottom: 0,
             },
             ..Default::default()
         };
@@ -3835,8 +3876,11 @@ impl eframe::App for App {
                         Page::Details | Page::Motherboard | Page::Bluetooth
                     ) {
                         let ready = self.specs.lock().map(|s| s.is_some()).unwrap_or(false);
+                        let refreshed = self.specs_refreshed.load(Ordering::Relaxed);
                         let label = if !ready {
                             "WAITING"
+                        } else if !refreshed {
+                            "CACHED"
                         } else if self.page == Page::Bluetooth {
                             "SNAPSHOT"
                         } else {
@@ -3883,11 +3927,9 @@ impl eframe::App for App {
                     // Clear the fade zone when the reader reaches the end.
                     ui.add_space(26.0);
                 });
-            // Cover the panel's bottom margin too: content can paint a sliver
-            // past the scroll viewport into that margin.
-            let mut fade_rect = page.inner_rect;
-            fade_rect.max.y = ui.clip_rect().bottom();
-            scroll_fade(ui, fade_rect, BG);
+            // The panel has no bottom margin, so the viewport ends exactly at
+            // the status bar and the fade can hide the last row cleanly.
+            scroll_fade(ui, page.inner_rect, BG);
         });
         if self.show_widget {
             let monitor_stale = std::time::Duration::from_secs_f32(self.stale_secs());
@@ -4333,22 +4375,40 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
 /// Soft gradient at the bottom of a scroll viewport so content dissolves into
 /// the status bar instead of being sliced by a hard edge.
 fn scroll_fade(ui: &egui::Ui, viewport: egui::Rect, color: Color32) {
-    let height = 26.0_f32.min(viewport.height() * 0.3);
+    let height = 40.0_f32.min(viewport.height() * 0.35);
     if height <= 1.0 {
         return;
     }
     let bottom = viewport.bottom().min(ui.clip_rect().bottom());
-    let top = bottom - height;
-    let mut mesh = egui::Mesh::default();
+    // A thin opaque band at the very edge guarantees that a peeking row of
+    // text is gone instead of showing at 90% opacity.
+    let solid = 14.0_f32.min(height * 0.4);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(viewport.left(), bottom - solid),
+            egui::pos2(viewport.right(), bottom),
+        ),
+        0.0,
+        color,
+    );
+    let bottom = bottom - solid;
+    let top = bottom - (height - solid);
     let clear = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
+    let half = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 150);
     let left = viewport.left();
     let right = viewport.right();
-    mesh.colored_vertex(egui::pos2(left, top), clear);
-    mesh.colored_vertex(egui::pos2(right, top), clear);
-    mesh.colored_vertex(egui::pos2(right, bottom), color);
-    mesh.colored_vertex(egui::pos2(left, bottom), color);
+    let mid = top + height * 0.45;
+    // Two bands: a gentle start, then a quick ramp so a peeking row is gone
+    // before the status bar rather than showing half a line of text.
+    let mut mesh = egui::Mesh::default();
+    for (y, tint) in [(top, clear), (mid, half), (bottom, color)] {
+        mesh.colored_vertex(egui::pos2(left, y), tint);
+        mesh.colored_vertex(egui::pos2(right, y), tint);
+    }
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
+    mesh.add_triangle(2, 3, 4);
+    mesh.add_triangle(2, 4, 5);
     ui.painter().add(egui::Shape::mesh(mesh));
 }
 

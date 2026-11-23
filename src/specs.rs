@@ -8,10 +8,13 @@
 //! Each field is optional on purpose: a missing value is reported as unavailable
 //! instead of being guessed, because the sources differ per platform.
 
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CpuSpec {
     pub name: String,
     pub vendor: String,
@@ -43,7 +46,8 @@ pub struct CpuSpec {
     pub virtualization: Option<bool>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemoryModule {
     pub slot: String,
     pub size_bytes: Option<u64>,
@@ -64,7 +68,8 @@ pub struct MemoryModule {
     pub max_voltage_mv: Option<u64>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemoryProfile {
     pub total_bytes: Option<u64>,
     pub ecc: Option<bool>,
@@ -75,7 +80,8 @@ pub struct MemoryProfile {
     pub modules: Vec<MemoryModule>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GraphicsSpec {
     pub name: String,
     pub chipset: String,
@@ -98,7 +104,8 @@ pub struct GraphicsSpec {
 }
 
 /// One installed driver record, as listed by the OS driver store.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DriverSpec {
     pub name: String,
     pub class_name: String,
@@ -109,7 +116,8 @@ pub struct DriverSpec {
 }
 
 /// A display attached to the machine, decoded from its EDID identity block.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MonitorSpec {
     pub manufacturer: String,
     pub model: String,
@@ -119,7 +127,8 @@ pub struct MonitorSpec {
 }
 
 /// One network adapter, kept as a physical "part" rather than a traffic counter.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NetworkAdapterSpec {
     pub name: String,
     pub description: String,
@@ -128,7 +137,8 @@ pub struct NetworkAdapterSpec {
 }
 
 /// A physical storage device, CrystalDiskInfo style.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DriveSpec {
     pub model: String,
     pub firmware: String,
@@ -141,7 +151,8 @@ pub struct DriveSpec {
 }
 
 /// Health of one mounted volume, which is what a user can actually point at.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VolumeHealth {
     pub mount: String,
     pub media: String,
@@ -150,7 +161,8 @@ pub struct VolumeHealth {
     pub smart: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BluetoothSpec {
     pub state: Option<bool>,
     pub transport: String,
@@ -158,7 +170,8 @@ pub struct BluetoothSpec {
     pub connected_devices: Option<Vec<String>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SystemSpecs {
     pub os_name: String,
     pub os_version: String,
@@ -222,6 +235,52 @@ pub fn bluetooth_status() -> Option<BluetoothSpec> {
     {
         None
     }
+}
+
+// ------------------------------------------------------------ cached inventory
+// Collecting the inventory shells out to slow OS tools (WMI, SMART, driver
+// store), which can take many seconds. The last result is cached so the next
+// launch can paint the Details page immediately and refresh in the background.
+
+/// Schema version of the on-disk cache. Bump it when a field changes meaning so
+/// an old file is ignored instead of being misread.
+const CACHE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct InventoryCache {
+    version: u32,
+    /// Unix seconds when the inventory was collected.
+    cached_at: u64,
+    specs: SystemSpecs,
+}
+
+/// Read a previously saved inventory. Returns the specs and their collection
+/// time, or `None` for a missing, unreadable or outdated file.
+pub fn load_cache(path: &Path) -> Option<(SystemSpecs, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cache: InventoryCache = serde_json::from_str(&text).ok()?;
+    (cache.version == CACHE_VERSION).then_some((cache.specs, cache.cached_at))
+}
+
+/// Persist the inventory for the next launch. The write goes through a
+/// temporary file and an atomic rename, so a crash cannot truncate the cache.
+pub fn save_cache(path: &Path, specs: &SystemSpecs) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let cache = InventoryCache {
+        version: CACHE_VERSION,
+        cached_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default(),
+        specs: specs.clone(),
+    };
+    let text = serde_json::to_string(&cache).map_err(|e| format!("serialise: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+    Ok(())
 }
 
 pub fn collect() -> SystemSpecs {
@@ -1964,6 +2023,40 @@ NVMExpress:
         assert_eq!(specs.drivers[0].signed, Some(true));
         assert_eq!(specs.network_adapters[0].speed, "2.5 Gbps");
         assert_eq!(specs.display, "2560 x 1440 x 32 @ 165 Hz");
+    }
+
+    #[test]
+    fn inventory_cache_roundtrips_and_rejects_other_versions() {
+        let mut specs = SystemSpecs::default();
+        specs.cpu.name = "Test Processor".into();
+        specs.memory.total_bytes = Some(32 * 1024 * 1024 * 1024);
+        specs.drives.push(DriveSpec {
+            model: "Test SSD".into(),
+            smart: "Healthy".into(),
+            ..Default::default()
+        });
+        let unique = format!(
+            "hardware-hub-cache-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let path = std::env::temp_dir().join(unique);
+        save_cache(&path, &specs).expect("cache write");
+        let (loaded, cached_at) = load_cache(&path).expect("cache read");
+        assert_eq!(loaded.cpu.name, "Test Processor");
+        assert_eq!(loaded.drives[0].smart, "Healthy");
+        assert!(cached_at > 0);
+
+        // A cache written by a future schema must be ignored, not misread.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let bumped = text.replacen("\"version\":1", "\"version\":99", 1);
+        assert_ne!(text, bumped);
+        std::fs::write(&path, bumped).unwrap();
+        assert!(load_cache(&path).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
