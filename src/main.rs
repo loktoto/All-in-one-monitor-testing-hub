@@ -29,21 +29,28 @@ use std::{
 
 // ---------------------------------------------------------------- design tokens
 // Apple system dark palette — neutral graphite surfaces with high-contrast labels.
-const BG: Color32 = Color32::from_rgb(28, 28, 30);
-const PANEL: Color32 = Color32::from_rgb(36, 36, 38);
-const CARD: Color32 = Color32::from_rgb(44, 44, 46);
-const CARD_HI: Color32 = Color32::from_rgb(58, 58, 60);
-const BORDER: Color32 = Color32::from_rgb(52, 52, 54);
-const TRACK: Color32 = Color32::from_rgb(64, 64, 66);
+// Three deliberate surface steps (window < sidebar < card) keep edges readable
+// without relying on heavy borders, and every border is one hairline token.
+const BG: Color32 = Color32::from_rgb(20, 20, 22);
+const PANEL: Color32 = Color32::from_rgb(28, 28, 31);
+const CARD: Color32 = Color32::from_rgb(38, 38, 42);
+const CARD_HI: Color32 = Color32::from_rgb(52, 52, 57);
+const BORDER: Color32 = Color32::from_rgb(58, 58, 64);
+const HAIRLINE: Color32 = Color32::from_rgb(48, 48, 53);
+const INPUT: Color32 = Color32::from_rgb(29, 29, 33);
+const TRACK: Color32 = Color32::from_rgb(70, 70, 77);
 const TEXT: Color32 = Color32::from_rgb(245, 245, 247);
-const TEXT_DIM: Color32 = Color32::from_rgb(174, 174, 178);
-const MUTED: Color32 = Color32::from_rgb(134, 134, 139);
+const TEXT_DIM: Color32 = Color32::from_rgb(176, 176, 181);
+const MUTED: Color32 = Color32::from_rgb(138, 138, 144);
 const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
-const ACCENT_SOFT: Color32 = Color32::from_rgb(36, 62, 96);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(30, 58, 92);
+const ACCENT_INK: Color32 = Color32::from_rgb(8, 16, 28);
 const GREEN: Color32 = Color32::from_rgb(48, 209, 88);
 const AMBER: Color32 = Color32::from_rgb(255, 159, 10);
 const RED: Color32 = Color32::from_rgb(255, 69, 58);
 const VIOLET: Color32 = Color32::from_rgb(191, 90, 242);
+/// Row tint used instead of egui's square zebra stripes.
+const STRIPE: Color32 = Color32::from_rgba_premultiplied(9, 9, 9, 9);
 
 // Motion tokens — Apple-style understated transitions, all disableable.
 const MOTION_FAST: f32 = 0.12;
@@ -536,27 +543,86 @@ impl App {
         if !self.show_help {
             return;
         }
-        let mut open = self.show_help;
-        egui::Window::new("Keyboard shortcuts")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(
-                egui::Frame::window(&ctx.style())
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(egui::Margin::same(18)),
-            )
+        let frame = egui::Frame::NONE
+            .fill(PANEL)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(CornerRadius::same(16))
+            .inner_margin(egui::Margin::same(20))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 18],
+                blur: 44,
+                spread: 0,
+                color: Color32::from_black_alpha(120),
+            });
+        let modal = egui::Modal::new(egui::Id::new("help-modal"))
+            .backdrop_color(Color32::from_black_alpha(150))
+            .frame(frame)
             .show(ctx, |ui| {
-                ui.set_max_width(430.0);
+                ui.set_width(470.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Keyboard shortcuts")
+                            .size(15.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(22.0, 22.0),
+                            egui::Sense::click(),
+                        );
+                        let hover = animated_bool(
+                            ctx,
+                            egui::Id::new("help-close-hover"),
+                            response.hovered(),
+                            MOTION_FAST,
+                        );
+                        if ui.is_rect_visible(rect) {
+                            ui.painter().rect_filled(
+                                rect,
+                                CornerRadius::same(11),
+                                Color32::from_rgba_unmultiplied(
+                                    255,
+                                    255,
+                                    255,
+                                    (30.0 * hover) as u8,
+                                ),
+                            );
+                            let c = rect.center();
+                            let ink = if response.hovered() { TEXT } else { MUTED };
+                            let stroke = Stroke::new(1.4_f32, ink);
+                            ui.painter().line_segment(
+                                [c + egui::vec2(-4.2, -4.2), c + egui::vec2(4.2, 4.2)],
+                                stroke,
+                            );
+                            ui.painter().line_segment(
+                                [c + egui::vec2(4.2, -4.2), c + egui::vec2(-4.2, 4.2)],
+                                stroke,
+                            );
+                        }
+                        if response.clicked() {
+                            self.show_help = false;
+                        }
+                        if response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                    });
+                });
+                ui.add_space(12.0);
+                let (rule, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .hline(rule.x_range(), rule.center().y, Stroke::new(1.0_f32, HAIRLINE));
+                ui.add_space(14.0);
                 let rows: [(&str, &str); 4] = [
                     (
-                        "Ctrl / Cmd + 1–9",
+                        "⌘/Ctrl 1–9",
                         "Overview, CPU, GPU, Memory, Storage, Thermals, Details, Processes, Reports",
                     ),
                     (
-                        "Ctrl / Cmd + Shift + 1–6",
+                        "⌘/Ctrl + Shift 1–6",
                         "Parts & board, Drivers, Network, Bluetooth, Frame analysis, Stress tests",
                     ),
                     ("Esc", "Cancel the running check, or close this help"),
@@ -564,24 +630,26 @@ impl App {
                 ];
                 egui::Grid::new("help_grid")
                     .num_columns(2)
-                    .spacing([16.0, 10.0])
+                    .spacing([18.0, 12.0])
                     .show(ui, |ui| {
                         for (keys, what) in rows {
-                            ui.label(RichText::new(keys).strong().color(ACCENT));
-                            ui.label(RichText::new(what).size(12.5).color(TEXT_DIM));
+                            keycap(ui, keys);
+                            ui.label(RichText::new(what).size(12.0).color(TEXT_DIM));
                             ui.end_row();
                         }
                     });
-                ui.add_space(12.0);
+                ui.add_space(16.0);
                 ui.label(
                     RichText::new(
                         "Your page, sampling cadence and thresholds are saved when you close the window.",
                     )
-                    .size(11.5)
+                    .size(10.5)
                     .color(MUTED),
                 );
             });
-        self.show_help = open;
+        if modal.should_close() {
+            self.show_help = false;
+        }
     }
 
     // ------------------------------------------------------------- navigation
@@ -636,7 +704,20 @@ impl App {
                 egui::TopBottomPanel::bottom("nav-footer")
                     .frame(egui::Frame::NONE)
                     .show_inside(ui, |ui| {
-                        ui.add_space(2.0);
+                        // A hairline and real breathing room separate the
+                        // footer from the toggles; before, the two lines sat
+                        // directly under the last checkbox label.
+                        ui.add_space(10.0);
+                        let (line, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 1.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().hline(
+                            line.x_range(),
+                            line.center().y,
+                            Stroke::new(1.0_f32, HAIRLINE),
+                        );
+                        ui.add_space(9.0);
                         // One compact line: local-only reassurance plus the
                         // graphics provider, so the footer never crowds the
                         // taskbar when a run adds status rows above it.
@@ -646,23 +727,24 @@ impl App {
                             format!("local only · wgpu · {}", s.gpu_backend)
                         };
                         ui.label(RichText::new(backend).size(10.0).color(MUTED));
+                        ui.add_space(4.0);
                         ui.label(
-                            RichText::new("⌘/Ctrl 1–9 pages · ⇧1–6 more · Esc stop")
+                            RichText::new("⌘/Ctrl 1–9 pages · Shift 1–6 more · Esc stop")
                                 .size(10.0)
                                 .color(MUTED),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(12.0);
                     });
                 egui::TopBottomPanel::bottom("nav-controls")
                     .frame(egui::Frame::NONE)
                     .show_inside(ui, |ui| {
                         ui.add_space(8.0);
-                        ui.checkbox(&mut self.show_widget, "Floating monitor")
+                        toggle(ui, &mut self.show_widget, "Floating monitor")
                             .on_hover_text("Desktop window; not an in-game FPS overlay.");
-                        if ui
-                            .checkbox(&mut self.reduce_motion, "Reduce motion")
+                        ui.add_space(2.0);
+                        if toggle(ui, &mut self.reduce_motion, "Reduce motion")
                             .on_hover_text("Turn off page transitions and eased meters.")
-                            .clicked()
+                            .changed()
                         {
                             set_reduce_motion(ui.ctx(), self.reduce_motion);
                         }
@@ -707,7 +789,7 @@ impl App {
                             });
                         }
                     });
-                egui::ScrollArea::vertical()
+                let nav = egui::ScrollArea::vertical()
                     .id_salt("navigation-pages")
                     // Always show the bar: on a 1280x720 screen at 150% scaling
                     // there is not enough height for all pages, and a fading
@@ -734,7 +816,7 @@ impl App {
                                 self.page = page;
                             }
                         }
-                        ui.add_space(10.0);
+                        ui.add_space(12.0);
                         ui.label(RichText::new("WORKSPACE").size(10.0).strong().color(MUTED));
                         ui.add_space(7.0);
                         for page in [
@@ -748,7 +830,11 @@ impl App {
                                 self.page = page;
                             }
                         }
+                        ui.add_space(4.0);
                     });
+                // Let the last row dissolve into the footer instead of being
+                // cut by the scroll viewport edge.
+                scroll_fade(ui, nav.inner_rect, PANEL);
             });
     }
 
@@ -942,15 +1028,7 @@ impl App {
             ui.horizontal(|ui| {
                 section_title(ui, "Recent activity", Some("up to 60 samples"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Reset").size(11.5))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, BORDER))
-                                .corner_radius(CornerRadius::same(7)),
-                        )
-                        .clicked()
-                    {
+                    if ghost_button(ui, "Reset").clicked() {
                         self.history.clear();
                     }
                     if let (Some((lo, hi, _)), Some((mem_lo, mem_hi, _))) = (history::range(&self.history, |v| v.cpu), history::range(&self.history, |v| v.memory)) {
@@ -996,14 +1074,14 @@ impl App {
                     let active = self.recorder.as_ref().is_some_and(|r| r.active());
                     let finishing = self.recorder.as_ref().is_some_and(|r| !r.active() && !r.status().closed);
                     ui.horizontal_wrapped(|ui| {
-                        ui.add_enabled(!active && !finishing, egui::TextEdit::singleline(&mut self.log_path).desired_width(330.0));
+                        text_field_enabled(ui, !active && !finishing, &mut self.log_path, "CSV path for a new log", 330.0);
                         if ui.add_enabled(!active && !finishing, egui::Button::new("Start recording")).clicked() {
                             match Recorder::start(std::path::Path::new(&self.log_path)) {
                                 Ok(recorder) => { self.recorder = Some(recorder); self.message = format!("Recording to {}", self.log_path); }
                                 Err(error) => self.message = format!("Recording failed: {error}"),
                             }
                         }
-                        if active && ui.button("Stop recording").clicked() { if let Some(r) = &mut self.recorder { r.stop(); } }
+                        if active && ghost_button(ui, "Stop recording").clicked() { if let Some(r) = &mut self.recorder { r.stop(); } }
                     });
                     if let Some(recorder) = &self.recorder {
                         let status = recorder.status();
@@ -1016,8 +1094,8 @@ impl App {
                 egui::CollapsingHeader::new("Export recent history").show(ui, |ui| {
                     ui.weak("CSV contains up to 60 samples, with elapsed seconds since launch. Missing values are blank; existing files are never overwritten.");
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.history_path);
-                        if ui.button("Export CSV").clicked() {
+                        text_field(ui, &mut self.history_path, "CSV path", 330.0);
+                        if ghost_button(ui, "Export CSV").clicked() {
                             self.message = match history::export_csv(std::path::Path::new(&self.history_path), &self.history, self.started) {
                                 Ok(()) => format!("Saved {}", self.history_path),
                                 Err(e) => format!("Export failed: {e}"),
@@ -1076,15 +1154,7 @@ impl App {
                     )),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Reset min/max").size(11.5))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::new(1.0_f32, BORDER))
-                                .corner_radius(CornerRadius::same(7)),
-                        )
-                        .clicked()
-                    {
+                    if ghost_button(ui, "Reset min/max").clicked() {
                         self.stats_reset.store(true, Ordering::Relaxed);
                     }
                 });
@@ -1372,9 +1442,23 @@ impl App {
                 }
                 Page::Gpu => {
                     section_title(ui, "Graphics", Some("adapter inventory and independent sensor sources"));
+                    ui.add_space(8.0);
                     if snapshot.gpus.is_empty() { ui.weak("No graphics source reported."); }
-                    for gpu in &snapshot.gpus { ui.strong(&gpu.name); ui.label(&gpu.detail); ui.add_space(4.0); }
-                    ui.weak("Sources may overlap; IORegistry and name-based matches do not prove adapter identity.");
+                    for gpu in &snapshot.gpus {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&gpu.name).size(12.5).strong().color(TEXT));
+                            if gpu.detail.contains("software") {
+                                chip(ui, "SOFTWARE", AMBER);
+                            }
+                        });
+                        ui.label(RichText::new(&gpu.detail).size(10.5).color(MUTED));
+                        ui.add_space(6.0);
+                    }
+                    ui.label(
+                        RichText::new("Sources may overlap; IORegistry and name-based matches do not prove adapter identity.")
+                            .size(10.5)
+                            .color(MUTED),
+                    );
 
                     match &specs {
                         Some(specs) if !specs.graphics.is_empty() => {
@@ -1429,7 +1513,7 @@ impl App {
                             ui.weak("Limits come from the graphics API and describe capability, not current clocks or temperature.");
                         });
                     }
-                    if ui.button("Open frame analysis").clicked() { self.page = Page::Frames; }
+                    if ghost_button(ui, "Open frame analysis").clicked() { self.page = Page::Frames; }
                 }
                 Page::Memory => {
                     section_title(ui, "Memory", Some("OS-reported usage and installed modules"));
@@ -1502,11 +1586,18 @@ impl App {
                     for disk in &snapshot.disks { ui.label(format!("{} · {} · {:.1} / {:.1} GiB free", disk.mount, disk.name, gib(disk.available), gib(disk.total))); }
                     if let Some(specs) = &specs { for drive in &specs.drives { ui.weak(format!("{} · SMART: {}", drive.model, if drive.smart.is_empty() { "unavailable" } else { &drive.smart })); } }
                     ui.weak("A volume is not necessarily a physical drive. Imported SMART reports are not live or automatically associated.");
-                    if ui.button("Open detailed specifications").clicked() { self.page = Page::Details; }
+                    if ghost_button(ui, "Open detailed specifications").clicked() { self.page = Page::Details; }
                 }
                 Page::Thermal => {
-                    section_title(ui, "Thermal sensors and fans", Some("observed min/max since launch or reset"));
-                    if ui.button("Reset min/max").clicked() { self.stats_reset.store(true, Ordering::Relaxed); }
+                    ui.horizontal(|ui| {
+                        section_title(ui, "Thermal sensors and fans", Some("observed min/max since launch or reset"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ghost_button(ui, "Reset min/max").clicked() {
+                                self.stats_reset.store(true, Ordering::Relaxed);
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
                     if snapshot.temperatures.is_empty() && snapshot.fans.is_empty() { ui.weak("No temperature or fan sensors were reported."); }
                     let temps = snapshot.temperatures.iter().map(|t| RowView { label: &t.label, key: &t.key, current: t.celsius, min: t.min, max: t.max, unit: "°C" }).collect::<Vec<_>>();
                     if !temps.is_empty() { sensor_table(ui, "thermal-page-temperatures", "Temperatures", temps); }
@@ -1554,8 +1645,8 @@ impl App {
                         egui::CollapsingHeader::new("Export sensors to CSV").show(ui, |ui| {
                             ui.label(RichText::new("One sensor").size(10.5).color(MUTED));
                             ui.horizontal(|ui| {
-                                ui.text_edit_singleline(&mut self.sensor_log_path);
-                                if ui.button("Export CSV").clicked() {
+                                text_field(ui, &mut self.sensor_log_path, "CSV path", 320.0);
+                                if ghost_button(ui, "Export CSV").clicked() {
                                     self.message = match history::export_sensor_csv(
                                         std::path::Path::new(&self.sensor_log_path),
                                         &self.history,
@@ -1570,8 +1661,8 @@ impl App {
                             ui.add_space(4.0);
                             ui.label(RichText::new("All sensors (one column each)").size(10.5).color(MUTED));
                             ui.horizontal(|ui| {
-                                ui.text_edit_singleline(&mut self.all_sensor_log_path);
-                                if ui.button("Export all").clicked() {
+                                text_field(ui, &mut self.all_sensor_log_path, "CSV path", 320.0);
+                                if ghost_button(ui, "Export all").clicked() {
                                     self.message = match history::export_all_sensors_csv(
                                         std::path::Path::new(&self.all_sensor_log_path),
                                         &self.history,
@@ -1586,16 +1677,32 @@ impl App {
                     }
 
                     // Advisory threshold: a sustained breach of a fresh reading.
-                    ui.add_space(14.0);
+                    ui.add_space(16.0);
                     section_title(ui, "Temperature alert", Some("advisory only · no automatic stop"));
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Warn when any sensor reaches");
-                        ui.add(egui::DragValue::new(&mut self.alert_celsius).range(30.0..=125.0).speed(0.5).suffix(" °C"));
-                        ui.label("for");
-                        ui.add(egui::DragValue::new(&mut self.alert_hold_secs).range(1..=120).speed(1).suffix(" s"));
-                        ui.selectable_value(&mut self.alert_severity, Severity::Warning, "Warning");
-                        ui.selectable_value(&mut self.alert_severity, Severity::Critical, "Critical");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Warn when any sensor reaches").size(11.5).color(TEXT_DIM));
+                        ui.add(
+                            egui::DragValue::new(&mut self.alert_celsius)
+                                .range(30.0..=125.0)
+                                .speed(0.5)
+                                .suffix(" °C"),
+                        );
+                        ui.label(RichText::new("for").size(11.5).color(TEXT_DIM));
+                        ui.add(
+                            egui::DragValue::new(&mut self.alert_hold_secs)
+                                .range(1..=120)
+                                .speed(1)
+                                .suffix(" s"),
+                        );
                     });
+                    ui.add_space(8.0);
+                    segmented(
+                        ui,
+                        &mut self.alert_severity,
+                        &[(Severity::Warning, "Warning"), (Severity::Critical, "Critical")],
+                    );
+                    ui.add_space(8.0);
                     let rule = Threshold {
                         celsius: self.alert_celsius,
                         hold: Duration::from_secs(self.alert_hold_secs),
@@ -1608,12 +1715,17 @@ impl App {
                         ui.horizontal_wrapped(|ui| {
                             pill(ui, rule.severity.label(), color);
                             ui.colored_label(color, format!("Temperature has been at or above {:.0} °C for {:.0}s.", rule.celsius, since.elapsed().as_secs_f32()));
-                            if ui.button("Acknowledge").clicked() { self.alert.clear(); }
+                            if ghost_button(ui, "Acknowledge").clicked() { self.alert.clear(); }
                         });
                     } else {
-                        ui.weak(format!("No active alert. Highest observation this session: {}.", self.alert.peak_celsius().map(|v| format!("{v:.1} °C")).unwrap_or_else(|| "unavailable".into())));
+                        ui.label(
+                            RichText::new(format!("No active alert. Highest observation this session: {}.", self.alert.peak_celsius().map(|v| format!("{v:.1} °C")).unwrap_or_else(|| "unavailable".into())))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
                     }
-                    if ui.button("Reset alert state").clicked() { self.alert.clear(); }
+                    ui.add_space(4.0);
+                    if ghost_button(ui, "Reset alert state").clicked() { self.alert.clear(); }
 
                     // Polling cost is user-controlled; slower sampling reduces CPU work.
                     ui.add_space(14.0);
@@ -1712,7 +1824,7 @@ impl App {
                             }
                             ui.horizontal_wrapped(|ui| {
                                 ui.label("Find:");
-                                ui.add(egui::TextEdit::singleline(&mut self.driver_query).hint_text("Driver or device name").desired_width(220.0));
+                                text_field(ui, &mut self.driver_query, "Driver or device name", 220.0);
                                 ui.add_space(6.0);
                                 ui.label("Class:");
                                 egui::ComboBox::from_id_salt("driver-class")
@@ -1736,33 +1848,7 @@ impl App {
                             if filtered.is_empty() {
                                 empty_note(ui, "No driver matches the current filter.");
                             } else {
-                                egui::Grid::new("drivers-grid")
-                                    .num_columns(4)
-                                    .spacing([22.0, 7.0])
-                                    .striped(true)
-                                    .show(ui, |ui| {
-                                        for heading in ["Driver", "Class", "Version", "Signature"] {
-                                            ui.label(RichText::new(heading).size(10.5).strong().color(MUTED));
-                                        }
-                                        ui.end_row();
-                                        for driver in filtered {
-                                            ui.vertical(|ui| {
-                                                ui.label(RichText::new(&driver.name).size(11.5).color(TEXT));
-                                                let mut meta: Vec<String> = Vec::new();
-                                                if !driver.provider.is_empty() { meta.push(driver.provider.clone()); }
-                                                if !driver.date.is_empty() { meta.push(driver.date.clone()); }
-                                                ui.label(RichText::new(meta.join(" · ")).size(10.0).color(MUTED));
-                                            });
-                                            ui.label(RichText::new(driver_class_label(&driver.class_name)).size(11.0).color(TEXT_DIM));
-                                            ui.label(RichText::new(if driver.version.is_empty() { "—" } else { &driver.version }).size(11.0).color(TEXT_DIM));
-                                            match driver.signed {
-                                                Some(true) => { chip(ui, "SIGNED", GREEN); }
-                                                Some(false) => { chip(ui, "UNSIGNED", AMBER); }
-                                                None => { ui.label(RichText::new("—").color(MUTED)); }
-                                            }
-                                            ui.end_row();
-                                        }
-                                    });
+                                driver_table(ui, &filtered);
                             }
                             ui.weak("Signature state is what the OS reports for the installed package. A signed driver is not a guarantee of stability.");
                         }
@@ -1785,22 +1871,67 @@ impl App {
                         ui.label(format!("{} · received {} · sent {}", n.name, rate(n.received), rate(n.transmitted)));
                     }
                     ui.weak("The OS may include virtual interfaces. Wi-Fi mapping is collected once at startup; link quality and network stress testing are unavailable.");
-                    if ui.button("Open process usage").clicked() { self.page = Page::Processes; }
+                    if ghost_button(ui, "Open process usage").clicked() { self.page = Page::Processes; }
                 }
                 Page::Bluetooth => {
                     section_title(ui, "Bluetooth", Some("read-only controller diagnostic"));
                     let (running, attempted, refreshed) = self.bluetooth_refresh.lock().map(|s| (s.running, s.attempted, s.value.clone())).unwrap_or_default();
                     let info = if attempted { refreshed.as_ref() } else { specs.as_ref().and_then(|s| s.bluetooth.as_ref()) };
+                    ui.add_space(8.0);
                     if let Some(info) = info {
-                        ui.label(format!("Controller state: {}", match info.state { Some(true) => "on", Some(false) => "off", None => "unavailable" }));
-                        if !info.transport.is_empty() { ui.label(format!("Transport: {}", info.transport)); }
-                        if !info.chipset.is_empty() { ui.label(format!("Chipset (OS-reported): {}", info.chipset)); }
-                        match &info.connected_devices {
-                            Some(devices) if devices.is_empty() => { ui.weak("No connected devices were listed in this snapshot."); }
-                            Some(devices) => { ui.weak("Connected devices reported by the OS (up to 32):"); for device in devices { ui.label(device); } }
-                            None => { ui.weak("Connected-device list not reported."); }
+                        let mut rows: Vec<(String, String)> = Vec::new();
+                        rows.push((
+                            "Controller state".into(),
+                            match info.state {
+                                Some(true) => "On".into(),
+                                Some(false) => "Off".into(),
+                                None => "Unavailable".into(),
+                            },
+                        ));
+                        if !info.transport.is_empty() {
+                            rows.push(("Transport".into(), info.transport.clone()));
                         }
-                    } else { ui.weak("Bluetooth controller status is unavailable or not reported by the OS."); }
+                        if !info.chipset.is_empty() {
+                            rows.push(("Chipset (OS-reported)".into(), info.chipset.clone()));
+                        }
+                        match &info.connected_devices {
+                            Some(devices) if devices.is_empty() => {
+                                rows.push(("Connected devices".into(), "None listed".into()));
+                            }
+                            Some(devices) => {
+                                rows.push((
+                                    "Connected devices".into(),
+                                    format!("{} listed", devices.len()),
+                                ));
+                            }
+                            None => {
+                                rows.push(("Connected devices".into(), "Not reported".into()));
+                            }
+                        }
+                        spec_grid(ui, "bluetooth-specs", &rows);
+                        if let Some(devices) = info.connected_devices.as_ref() {
+                            if !devices.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Connected devices reported by the OS (up to 32)")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(MUTED),
+                                );
+                                ui.add_space(4.0);
+                                for device in devices {
+                                    ui.label(
+                                        RichText::new(format!("· {device}"))
+                                            .size(11.5)
+                                            .color(TEXT_DIM),
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        empty_note(ui, "Bluetooth controller status is unavailable or not reported by the OS.");
+                    }
+                    ui.add_space(10.0);
                     if ui.add_enabled(!running, egui::Button::new(if running { "Checking…" } else { "Check controller again" })).clicked() {
                         if let Ok(mut state) = self.bluetooth_refresh.lock() { state.running = true; }
                         let refresh = self.bluetooth_refresh.clone();
@@ -1835,7 +1966,7 @@ impl App {
                         "A {} check is already running. Only one check can run at a time.",
                         kind_label(self.kind)
                     ));
-                    if ui.button("View current check").clicked() {
+                    if ghost_button(ui, "View current check").clicked() {
                         self.page = Page::Tests;
                     }
                 });
@@ -1883,7 +2014,7 @@ impl App {
                         r.detail
                     ));
                 }
-                if ui.button("View all reports").clicked() {
+                if ghost_button(ui, "View all reports").clicked() {
                     self.page = Page::Reports;
                 }
             });
@@ -1897,8 +2028,11 @@ impl App {
             ui.weak("Enter a numeric IP address and port. Each attempt opens and closes a TCP connection without sending an application payload.");
             let state = self.network_check.lock().map(|s| s.clone()).unwrap_or_default();
             ui.horizontal_wrapped(|ui| {
-                ui.add_enabled(!state.running, egui::TextEdit::singleline(&mut self.network_target).desired_width(260.0).hint_text("e.g. 127.0.0.1:80"));
-                if ui.add_enabled(!state.running, egui::Button::new("Start check")).clicked() {
+                text_field_enabled(ui, !state.running, &mut self.network_target, "e.g. 127.0.0.1:80", 260.0);
+                let start = ui.add_enabled_ui(!state.running, |ui| {
+                    primary_button(ui, "Start check", false, 30.0)
+                });
+                if start.inner.clicked() {
                     self.network_message = match netcheck::start(&self.network_target, self.network_check.clone(), self.network_cancel.clone()) { Ok(()) => String::new(), Err(e) => e };
                 }
                 if state.running && ui.button("Stop check").clicked() { self.network_cancel.store(true, Ordering::Relaxed); }
@@ -1923,21 +2057,30 @@ impl App {
                 ui.set_width(ui.available_width());
                 section_title(ui, "Check", Some(if running { "locked while running" } else if fixed.is_some() { "selected for this device" } else { "choose one" }));
                 ui.add_space(8.0);
+                let mut start_clicked = false;
                 ui.add_enabled_ui(!running, |ui| {
                     // On the standalone Tests page the card fills the viewport, so
                     // the configuration scrolls while the Start button stays pinned
-                    // (Apple HIG: consistent action location). On the embedded
-                    // hardware pages the whole page already scrolls, so let the card
-                    // grow to its content instead of clipping the last control.
-                    let config_height = if fixed.is_some() {
-                        10_000.0
-                    } else {
-                        (ui.available_height() - 62.0).max(150.0)
-                    };
+                    // (Apple HIG: consistent action location). A bottom panel
+                    // reserves the button's exact height, so the card always ends
+                    // flush with the viewport instead of being clipped.
+                    if fixed.is_none() {
+                        egui::TopBottomPanel::bottom("stress-start-bar")
+                            .frame(egui::Frame::NONE)
+                            .show_inside(ui, |ui| {
+                                ui.add_space(6.0);
+                                start_clicked =
+                                    primary_button(ui, "Start test", true, 34.0).clicked();
+                            });
+                    }
                     egui::ScrollArea::vertical()
                         .id_salt("stress-config")
-                        .max_height(config_height)
-                        .auto_shrink([false, true])
+                        .max_height(if fixed.is_some() {
+                            f32::INFINITY
+                        } else {
+                            ui.available_height()
+                        })
+                        .auto_shrink([false, fixed.is_some()])
                         .show(ui, |ui| {
                     if fixed.is_none() {
                     for pair in KINDS.chunks(2) {
@@ -1955,7 +2098,7 @@ impl App {
                                 }
                             }
                         });
-                        ui.add_space(2.0);
+                        ui.add_space(8.0);
                     }
                     } else {
                         ui.label(RichText::new(kind_label(self.kind)).strong().color(TEXT));
@@ -2035,24 +2178,39 @@ impl App {
                                 .size(11.0)
                                 .color(AMBER),
                             );
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("Temporary directory").size(11.0).color(MUTED));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.directory)
-                                    .desired_width(f32::INFINITY),
-                            );
-                            ui.add_space(4.0);
-                            ui.add(egui::Slider::new(&mut self.mib, 1..=256).text("file MiB"));
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Directory")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(MUTED),
+                                );
+                                text_field(
+                                    ui,
+                                    &mut self.directory,
+                                    "Temporary directory",
+                                    f32::INFINITY,
+                                );
+                            });
+                            ui.add_space(2.0);
+                            ui.columns(2, |sliders| {
+                                sliders[0].spacing_mut().slider_width = 92.0;
+                                sliders[1].spacing_mut().slider_width = 92.0;
+                                sliders[0].add(
+                                    egui::Slider::new(&mut self.mib, 1..=256).text("file MiB"),
+                                );
+                                sliders[1].add(
+                                    egui::Slider::new(
+                                        &mut self.disk_write_limit_mib,
+                                        self.mib as u64..=1024,
+                                    )
+                                    .text("cap MiB"),
+                                );
+                            });
                             self.disk_write_limit_mib =
                                 self.disk_write_limit_mib.max(self.mib as u64);
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.disk_write_limit_mib,
-                                    self.mib as u64..=1024,
-                                )
-                                .text("write cap MiB"),
-                            );
-                            ui.add_space(6.0);
+                            ui.add_space(4.0);
                             picker(ui, "disk-pattern", "Pattern", &mut self.disk_pattern,
                                 &DiskPattern::ALL.map(|v| (v, v.label())));
                         }
@@ -2077,14 +2235,11 @@ impl App {
                     ui.add_space(4.0);
                     ui.add(egui::Slider::new(&mut self.seconds, 1..=600).text("max seconds"));
                         });
-                    ui.add_space(4.0);
-                    let start = ui.add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::Button::new(RichText::new("Start test").strong().color(Color32::from_rgb(9, 18, 30)))
-                            .fill(ACCENT)
-                            .corner_radius(CornerRadius::same(9)),
-                    );
-                    if start.clicked() {
+                    if fixed.is_some() {
+                        ui.add_space(6.0);
+                        start_clicked = primary_button(ui, "Start test", true, 34.0).clicked();
+                    }
+                    if start_clicked {
                         self.run_peak_c = None;
                         self.auto_stop_fired = false;
                         self.last_live_units = 0;
@@ -2142,6 +2297,10 @@ impl App {
             // ------------------------------------------------------------ progress
             card_frame().show(&mut cols[1], |ui| {
                 ui.set_width(ui.available_width());
+                if fixed.is_none() {
+                    // Match the configuration card so the pair ends level.
+                    ui.set_min_height(ui.available_height());
+                }
                 section_title(ui, "Current run", Some(if running { "in progress" } else { "idle" }));
                 ui.add_space(10.0);
                 if running {
@@ -2303,9 +2462,11 @@ impl App {
                     if ui
                         .add_sized(
                             [ui.available_width(), 32.0],
-                            egui::Button::new(RichText::new("Stop test · Esc").color(Color32::from_rgb(30, 18, 6)))
-                                .fill(AMBER)
-                                .corner_radius(CornerRadius::same(9)),
+                            egui::Button::new(
+                                RichText::new("Stop test · Esc").size(12.5).strong().color(ACCENT_INK),
+                            )
+                            .fill(AMBER)
+                            .corner_radius(CornerRadius::same(9)),
                         )
                         .clicked()
                     {
@@ -2373,7 +2534,7 @@ impl App {
                             );
                             error_details(ui, &r.errors, r.error_count);
                             ui.add_space(8.0);
-                            if ui.button("View all reports").clicked() {
+                            if ghost_button(ui, "View all reports").clicked() {
                                 self.page = Page::Reports;
                             }
                         }
@@ -2387,11 +2548,12 @@ impl App {
                     ui.add_space(12.0);
                     // Safety option sits with the run status: it is a property
                     // of the next run, and the right column has room for it.
-                    let auto_stop = ui.checkbox(
+                    toggle(
+                        ui,
                         &mut self.auto_stop_on_heat,
-                        format!("Stop check at {:.0} °C (advisory)", self.alert_celsius),
-                    );
-                    auto_stop.on_hover_text("Stops only this check when the observed peak reaches the alert limit. Never changes fans, clocks or hardware.");
+                        &format!("Stop check at {:.0} °C (advisory)", self.alert_celsius),
+                    )
+                    .on_hover_text("Stops only this check when the observed peak reaches the alert limit. Never changes fans, clocks or hardware.");
                     ui.add_space(10.0);
                     callout(ui, MUTED, "Read-only checks, never benchmarks",
                         "These bounded checks verify correctness, not raw speed or full burn-in. The machine has no automatic temperature shutdown; supervise any stress run.");
@@ -2694,34 +2856,44 @@ impl App {
             spec_row(&mut storage_rows, format!("Drive {}", index + 1), detail);
         }
 
+        // Both cards in a row share the taller height so the pair reads as one
+        // block instead of two ragged columns.
+        let row_h = 24.0;
+        let spec_height = |rows: usize| rows as f32 * row_h + 46.0;
+        let top_row = spec_height(system_rows.len()).max(spec_height(cpu_rows.len()));
         ui.columns(2, |cols| {
             card_frame().show(&mut cols[0], |ui| {
                 ui.set_width(ui.available_width());
+                ui.set_min_height(top_row);
                 section_title(ui, "System", Some("operating-system report"));
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 spec_grid(ui, "spec-system", &system_rows);
             });
             card_frame().show(&mut cols[1], |ui| {
                 ui.set_width(ui.available_width());
+                ui.set_min_height(top_row);
                 section_title(ui, "Processor", Some("identification and caches"));
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 spec_grid(ui, "spec-cpu", &cpu_rows);
             });
         });
 
         ui.add_space(12.0);
 
+        let second_row = spec_height(memory_rows.len()).max(spec_height(graphics_rows.len()));
         ui.columns(2, |cols| {
             card_frame().show(&mut cols[0], |ui| {
                 ui.set_width(ui.available_width());
+                ui.set_min_height(second_row);
                 section_title(ui, "Memory", Some("installed modules"));
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 spec_grid(ui, "spec-memory", &memory_rows);
             });
             card_frame().show(&mut cols[1], |ui| {
                 ui.set_width(ui.available_width());
+                ui.set_min_height(second_row);
                 section_title(ui, "Graphics", Some("wgpu adapter and system profile"));
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 if graphics_rows.is_empty() {
                     empty_note(ui, "No adapter was reported by wgpu or the system profile.");
                 }
@@ -2778,14 +2950,14 @@ impl App {
             section_title(ui, "Import S.M.A.R.T. report", Some("optional · smartctl JSON"));
             ui.weak("Open a locally saved smartctl -a -j report to inspect ATA attributes or NVMe health fields. This app does not run smartctl or access a drive for this view.");
             ui.horizontal_wrapped(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.smart_path).desired_width(380.0).hint_text("Path to smartctl JSON report"));
-                if ui.button("Open report").clicked() {
+                text_field(ui, &mut self.smart_path, "Path to smartctl JSON report", 380.0);
+                if ghost_button(ui, "Open report").clicked() {
                     match smart::read(std::path::Path::new(&self.smart_path)) {
                         Ok(report) => { self.smart_report = Some(report); self.smart_message.clear(); }
                         Err(error) => { self.smart_report = None; self.smart_message = error; }
                     }
                 }
-                if self.smart_report.is_some() && ui.button("Clear").clicked() { self.smart_report = None; }
+                if self.smart_report.is_some() && ghost_button(ui, "Clear").clicked() { self.smart_report = None; }
             });
             if !self.smart_message.is_empty() { ui.colored_label(AMBER, &self.smart_message); }
             if let Some(report) = &self.smart_report {
@@ -2848,28 +3020,39 @@ impl App {
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "Processes", Some("OS-reported"));
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Find:");
-                ui.add(egui::TextEdit::singleline(&mut self.process_query).hint_text("Name or PID"));
-                ui.label("Sort:");
-                ui.selectable_value(&mut self.process_sort_memory, false, "CPU");
-                ui.selectable_value(&mut self.process_sort_memory, true, "Memory");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Find").size(10.0).strong().color(MUTED));
+                text_field(ui, &mut self.process_query, "Name or PID", 220.0);
+                ui.add_space(6.0);
+                ui.label(RichText::new("Sort").size(10.0).strong().color(MUTED));
+                let mut by_memory = self.process_sort_memory;
+                if segmented(ui, &mut by_memory, &[(false, "CPU"), (true, "Memory")]) {
+                    self.process_sort_memory = by_memory;
+                }
             });
-            ui.weak("CPU is relative to one logical core and can exceed 100%. OS permissions may limit results.");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("CPU is relative to one logical core and can exceed 100%. OS permissions may limit results.")
+                    .size(10.5)
+                    .color(MUTED),
+            );
             let query = self.process_query.to_lowercase();
             let mut processes: Vec<_> = s.processes.iter().filter(|p| p.name.to_lowercase().contains(&query) || p.pid.to_string().contains(&query)).collect();
             if self.process_sort_memory { processes.sort_by(|a, b| b.memory.cmp(&a.memory).then_with(|| a.pid.cmp(&b.pid))); }
             else { processes.sort_by(|a, b| b.cpu_usage.total_cmp(&a.cpu_usage).then_with(|| a.pid.cmp(&b.pid))); }
-            ui.weak(format!("Showing up to 100 of {} matching processes", processes.len()));
-            if processes.is_empty() { ui.label(if s.ready { "No matching processes reported." } else { "Collecting process data…" }); }
-            egui::Grid::new("process_table").striped(true).min_col_width(70.0).show(ui, |ui| {
-                ui.strong("Process"); ui.strong("PID"); ui.strong("CPU"); ui.strong("Memory"); ui.end_row();
-                for p in processes.iter().take(100) {
-                    ui.label(truncate(&p.name, 38)); ui.label(p.pid.to_string());
-                    ui.label(if p.cpu_usage.is_finite() { format!("{:.1}%", p.cpu_usage) } else { "unavailable".into() });
-                    ui.label(format!("{:.1} MiB", p.memory as f64 / 1_048_576.0)); ui.end_row();
-                }
-            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(format!("Showing up to 100 of {} matching processes", processes.len()))
+                    .size(10.5)
+                    .color(MUTED),
+            );
+            ui.add_space(6.0);
+            if processes.is_empty() {
+                empty_note(ui, if s.ready { "No matching processes reported." } else { "Collecting process data…" });
+            } else {
+                process_table(ui, &processes);
+            }
         });
     }
 
@@ -2877,31 +3060,83 @@ impl App {
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "PresentMon capture", Some("local CSV · display metrics"));
-            ui.weak("Open a previously captured PresentMon CSV for one process and one swap chain. This app does not capture game frames.");
-            ui.horizontal_wrapped(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.frame_path).desired_width(400.0).hint_text("Path to PresentMon CSV"));
-                if ui.button("Analyze capture").clicked() {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Open a previously captured PresentMon CSV for one process and one swap chain. This app does not capture game frames.")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+            ui.add_space(10.0);
+            ui.label(RichText::new("Capture file").size(10.0).strong().color(MUTED));
+            ui.add_space(4.0);
+            text_field(ui, &mut self.frame_path, "Path to PresentMon CSV", f32::INFINITY);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if primary_button(ui, "Analyze capture", false, 32.0).clicked() {
                     match frames::read(std::path::Path::new(&self.frame_path)) {
                         Ok(summary) => { self.frame_summary = Some(summary); self.frame_message.clear(); }
                         Err(error) => { self.frame_summary = None; self.frame_message = error; }
                     }
                 }
-                if self.frame_summary.is_some() && ui.button("Clear").clicked() { self.frame_summary = None; }
+                if self.frame_summary.is_some() && ghost_button(ui, "Clear").clicked() {
+                    self.frame_summary = None;
+                }
             });
-            if !self.frame_message.is_empty() { ui.colored_label(AMBER, &self.frame_message); }
+            if !self.frame_message.is_empty() {
+                ui.add_space(6.0);
+                ui.colored_label(AMBER, &self.frame_message);
+            }
             if let Some(r) = &self.frame_summary {
-                ui.add_space(12.0);
-                ui.strong(format!("{} · PID {} · swap chain {}", r.application, r.process_id, r.swap_chain));
-                ui.weak(format!("{} valid displayed-frame intervals · {} missing or invalid rows · source: {}", r.valid, r.skipped, r.column));
-                ui.add_space(8.0);
-                egui::Grid::new("frame_summary").striped(true).show(ui, |ui| {
-                    ui.label("Average displayed FPS"); ui.strong(format!("{:.1}", r.average_fps)); ui.end_row();
-                    ui.label("Slowest 1% FPS"); ui.strong(format!("{:.1}", r.one_percent_low_fps)); ui.end_row();
-                    ui.label("99th percentile frame time"); ui.strong(format!("{:.2} ms", r.p99_ms)); ui.end_row();
-                    if let Some(v) = r.average_cpu_ms { ui.label("Mean CPU busy (available rows)"); ui.label(format!("{v:.2} ms")); ui.end_row(); }
-                    if let Some(v) = r.average_gpu_ms { ui.label("Mean GPU busy (available rows)"); ui.label(format!("{v:.2} ms")); ui.end_row(); }
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new(format!("{} · PID {} · swap chain {}", r.application, r.process_id, r.swap_chain))
+                        .size(12.5)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!("{} valid displayed-frame intervals · {} missing or invalid rows · source: {}", r.valid, r.skipped, r.column))
+                        .size(10.5)
+                        .color(MUTED),
+                );
+                ui.add_space(10.0);
+                let mut rows: Vec<(String, String)> = Vec::new();
+                rows.push(("Average displayed FPS".into(), format!("{:.1}", r.average_fps)));
+                rows.push(("Slowest 1% FPS".into(), format!("{:.1}", r.one_percent_low_fps)));
+                rows.push(("99th percentile frame time".into(), format!("{:.2} ms", r.p99_ms)));
+                if let Some(v) = r.average_cpu_ms { rows.push(("Mean CPU busy (available rows)".into(), format!("{v:.2} ms"))); }
+                if let Some(v) = r.average_gpu_ms { rows.push(("Mean GPU busy (available rows)".into(), format!("{v:.2} ms"))); }
+                spec_grid(ui, "frame-summary", &rows);
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Average FPS = valid intervals ÷ their total time. Slowest 1% FPS = reciprocal of the mean of the longest 1% of intervals (rounded up). Values describe this imported capture, not current performance.")
+                        .size(10.0)
+                        .color(MUTED),
+                );
+            } else if self.frame_message.is_empty() {
+                ui.add_space(14.0);
+                let (line, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 1.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .hline(line.x_range(), line.center().y, Stroke::new(1.0_f32, BORDER));
+                ui.add_space(14.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("No capture loaded")
+                            .size(13.0)
+                            .strong()
+                            .color(TEXT_DIM),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Point the field above at a PresentMon CSV to see frame pacing.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                 });
-                ui.weak("Average FPS = valid intervals ÷ their total time. Slowest 1% FPS = reciprocal of the mean of the longest 1% of intervals (rounded up). Values describe this imported capture, not current performance.");
             }
         });
     }
@@ -2916,15 +3151,44 @@ impl App {
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "System report", Some("CPU-Z / GPU-Z style inventory"));
-            ui.weak("Exports the Details inventory and current sensor readings to a new text or JSON file. Nothing is uploaded.");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Exports the Details inventory and current sensor readings to a new text or JSON file. Nothing is uploaded.")
+                    .size(11.0)
+                    .color(MUTED),
+            );
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.system_report_format, Format::Text, "Text");
-                ui.selectable_value(&mut self.system_report_format, Format::Json, "JSON");
-                ui.checkbox(&mut self.system_report_redact, "Redact identifiers");
+                let before = self.system_report_format;
+                segmented(
+                    ui,
+                    &mut self.system_report_format,
+                    &[(Format::Text, "Text"), (Format::Json, "JSON")],
+                );
+                if self.system_report_format != before {
+                    // Keep the default file name honest about the chosen format.
+                    match self.system_report_format {
+                        Format::Text if self.system_report_path.ends_with(".json") => {
+                            self.system_report_path =
+                                self.system_report_path.replace(".json", ".txt");
+                        }
+                        Format::Json if self.system_report_path.ends_with(".txt") => {
+                            self.system_report_path =
+                                self.system_report_path.replace(".txt", ".json");
+                        }
+                        _ => {}
+                    }
+                }
+                ui.add_space(10.0);
+                toggle(ui, &mut self.system_report_redact, "Redact identifiers");
             });
+            ui.add_space(10.0);
+            ui.label(RichText::new("Save as").size(10.0).strong().color(MUTED));
+            ui.add_space(4.0);
+            text_field(ui, &mut self.system_report_path, "Path for a new report file", f32::INFINITY);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.system_report_path);
-                if ui.button("Export system report").clicked() {
+                if primary_button(ui, "Export system report", false, 32.0).clicked() {
                     let specs = self.specs.lock().ok().and_then(|held| held.clone());
                     self.message = match specs {
                         Some(specs) => match system_report::export(
@@ -2941,11 +3205,36 @@ impl App {
                     };
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             ui.label(RichText::new("Redaction removes serial numbers, volume paths, interface names and connected-device names. Review the file before sharing.").size(10.0).color(MUTED));
         });
 
         ui.add_space(12.0);
+
+        if records.is_empty() {
+            // Nothing to export yet, so the empty state replaces the export
+            // card instead of being pushed below the fold.
+            card_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(
+                        RichText::new("No tests run in this session")
+                            .size(14.0)
+                            .strong()
+                            .color(TEXT_DIM),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new("Run a check from Stress tests to collect a result here.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(20.0);
+                });
+            });
+            return;
+        }
 
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2958,47 +3247,48 @@ impl App {
                     "never overwrites"
                 }),
             );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_value(&mut self.report_format, Format::Text, "Text")
-                    .clicked()
-                    && self.report == "hardware-hub-report.json"
-                {
-                    self.report = "hardware-hub-report.txt".into();
-                }
-                if ui
-                    .selectable_value(&mut self.report_format, Format::Json, "JSON")
-                    .clicked()
-                    && self.report == "hardware-hub-report.txt"
-                {
-                    self.report = "hardware-hub-report.json".into();
-                }
-                ui.add_space(6.0);
-                let export = ui.add_enabled(
-                    !records.is_empty(),
-                    egui::Button::new(RichText::new("Export report").strong())
-                        .fill(ACCENT)
-                        .corner_radius(CornerRadius::same(8)),
-                );
-                if export.clicked() {
-                    self.message = match report::export(
-                        std::path::Path::new(&self.report),
-                        self.report_format,
-                        &records,
-                    ) {
-                        Ok(()) => format!("Saved {}", self.report),
-                        Err(e) => format!("Export failed: {e}"),
-                    };
-                }
-            });
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.report)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Path for a new report file"),
+            ui.add_space(10.0);
+            let before = self.report_format;
+            segmented(
+                ui,
+                &mut self.report_format,
+                &[(Format::Text, "Text"), (Format::Json, "JSON")],
             );
+            if self.report_format != before {
+                match self.report_format {
+                    Format::Text if self.report == "hardware-hub-report.json" => {
+                        self.report = "hardware-hub-report.txt".into();
+                    }
+                    Format::Json if self.report == "hardware-hub-report.txt" => {
+                        self.report = "hardware-hub-report.json".into();
+                    }
+                    _ => {}
+                }
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Save as").size(10.0).strong().color(MUTED));
             ui.add_space(4.0);
+            text_field(
+                ui,
+                &mut self.report,
+                "Path for a new report file",
+                f32::INFINITY,
+            );
+            ui.add_space(8.0);
+            let export = ui.add_enabled_ui(!records.is_empty(), |ui| {
+                primary_button(ui, "Export report", false, 32.0)
+            });
+            if export.inner.clicked() {
+                self.message = match report::export(
+                    std::path::Path::new(&self.report),
+                    self.report_format,
+                    &records,
+                ) {
+                    Ok(()) => format!("Saved {}", self.report),
+                    Err(e) => format!("Export failed: {e}"),
+                };
+            }
+            ui.add_space(8.0);
             ui.label(
                 RichText::new(
                     "Reports include the chosen path and hardware details. Review before sharing.",
@@ -3096,28 +3386,6 @@ impl App {
             ui.add_space(12.0);
         }
 
-        if records.is_empty() {
-            card_frame().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.vertical_centered(|ui| {
-                    ui.add_space(18.0);
-                    ui.label(
-                        RichText::new("No tests run in this session")
-                            .size(14.0)
-                            .strong()
-                            .color(TEXT_DIM),
-                    );
-                    ui.label(
-                        RichText::new("Results stay in memory until you export them.")
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                    ui.add_space(18.0);
-                });
-            });
-            return;
-        }
-
         for (record_index, r) in records.iter().enumerate().rev() {
             card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -3164,8 +3432,8 @@ impl App {
                 error_details(ui, &r.errors, r.error_count);
                 ui.push_id(format!("certificate-{record_index}"), |ui| {
                     ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.certificate_path);
-                        if ui.button("Save run summary").clicked() {
+                        text_field(ui, &mut self.certificate_path, "Path for the summary", 360.0);
+                        if ghost_button(ui, "Save run summary").clicked() {
                             self.message = match report::export_certificate(
                                 std::path::Path::new(&self.certificate_path),
                                 r,
@@ -3213,16 +3481,19 @@ impl App {
     }
 
     fn status_bar(&mut self, ctx: &egui::Context, s: &Snapshot) {
-        let frame = egui::Frame {
-            fill: PANEL,
-            stroke: Stroke::new(1.0_f32, BORDER),
-            inner_margin: egui::Margin::symmetric(20, 10),
-            ..Default::default()
-        };
+        let frame = egui::Frame::NONE.fill(PANEL);
         egui::TopBottomPanel::bottom("status")
             .frame(frame)
             .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.top() + 0.5,
+                    Stroke::new(1.0_f32, BORDER),
+                );
+                ui.add_space(9.0);
                 ui.horizontal(|ui| {
+                    ui.add_space(20.0);
                     if self.alert.active_since().is_some() {
                         pill(ui, "TEMP ALERT", RED);
                         ui.add_space(8.0);
@@ -3272,21 +3543,28 @@ impl App {
                         ui.label(RichText::new(&self.message).size(11.0).color(TEXT_DIM));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(6.0);
+                        ui.add_space(20.0);
                         if ui
-                            .small_button(RichText::new("? shortcuts").size(10.5))
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("? shortcuts").size(10.5).color(MUTED),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0_f32, HAIRLINE))
+                                .corner_radius(CornerRadius::same(7)),
+                            )
                             .on_hover_text("Keyboard shortcuts (? or F1)")
                             .clicked()
                         {
                             self.show_help = true;
                         }
-                        ui.add_space(10.0);
+                        ui.add_space(14.0);
                         ui.label(
                             RichText::new(std::env::consts::OS.to_uppercase())
-                                .size(10.0)
+                                .size(9.5)
                                 .color(MUTED),
                         );
-                        ui.add_space(10.0);
+                        ui.add_space(12.0);
                         if s.ready {
                             let memory = if s.memory_total > 0 {
                                 format!(
@@ -3309,6 +3587,7 @@ impl App {
                         }
                     });
                 });
+                ui.add_space(9.0);
             });
     }
 }
@@ -3578,27 +3857,37 @@ impl eframe::App for App {
             });
             ui.add_space(18.0);
             page_rule(ui);
-            ui.add_space(18.0);
-            egui::ScrollArea::vertical()
+            ui.add_space(16.0);
+            let page = egui::ScrollArea::vertical()
                 .id_salt(self.page.label())
                 .auto_shrink([false, false])
-                .show(ui, |ui| match self.page {
-                    Page::Overview => self.overview(ui, &snapshot),
-                    Page::Cpu
-                    | Page::Gpu
-                    | Page::Memory
-                    | Page::Storage
-                    | Page::Thermal
-                    | Page::Motherboard
-                    | Page::Drivers
-                    | Page::Network
-                    | Page::Bluetooth => self.hardware_page(ui, &snapshot),
-                    Page::Details => self.details(ui, &snapshot),
-                    Page::Processes => self.processes(ui, &snapshot),
-                    Page::Frames => self.frames(ui),
-                    Page::Tests => self.tests(ui, &snapshot, None),
-                    Page::Reports => self.reports(ui, &snapshot),
+                .show(ui, |ui| {
+                    ui.add_space(2.0);
+                    match self.page {
+                        Page::Overview => self.overview(ui, &snapshot),
+                        Page::Cpu
+                        | Page::Gpu
+                        | Page::Memory
+                        | Page::Storage
+                        | Page::Thermal
+                        | Page::Motherboard
+                        | Page::Drivers
+                        | Page::Network
+                        | Page::Bluetooth => self.hardware_page(ui, &snapshot),
+                        Page::Details => self.details(ui, &snapshot),
+                        Page::Processes => self.processes(ui, &snapshot),
+                        Page::Frames => self.frames(ui),
+                        Page::Tests => self.tests(ui, &snapshot, None),
+                        Page::Reports => self.reports(ui, &snapshot),
+                    }
+                    // Clear the fade zone when the reader reaches the end.
+                    ui.add_space(26.0);
                 });
+            // Cover the panel's bottom margin too: content can paint a sliver
+            // past the scroll viewport into that margin.
+            let mut fade_rect = page.inner_rect;
+            fade_rect.max.y = ui.clip_rect().bottom();
+            scroll_fade(ui, fade_rect, BG);
         });
         if self.show_widget {
             let monitor_stale = std::time::Duration::from_secs_f32(self.stale_secs());
@@ -3690,25 +3979,30 @@ fn install_theme(ctx: &egui::Context) {
     *visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL;
     visuals.window_fill = CARD;
-    visuals.extreme_bg_color = Color32::from_rgb(20, 20, 22);
-    visuals.faint_bg_color = Color32::from_rgb(50, 50, 52);
+    visuals.extreme_bg_color = INPUT;
+    visuals.faint_bg_color = HAIRLINE;
     visuals.override_text_color = Some(TEXT);
     visuals.hyperlink_color = ACCENT;
     visuals.selection.bg_fill = ACCENT_SOFT;
     visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    // Charts and separators inherit this hairline, so grid lines stay quiet.
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
     visuals.widgets.inactive.weak_bg_fill = CARD_HI;
     visuals.widgets.inactive.bg_fill = TRACK;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
     visuals.widgets.hovered.weak_bg_fill = CARD_HI;
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(72, 72, 74);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(64, 64, 70);
     visuals.widgets.hovered.bg_stroke =
-        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 42));
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 54));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
     visuals.widgets.active.weak_bg_fill = ACCENT_SOFT;
     visuals.widgets.active.bg_fill = ACCENT;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, ACCENT_INK);
     visuals.widgets.active.corner_radius = CornerRadius::same(8);
     // Apple-style type ramp: a 13 pt body, compact captions and one heading level.
     style.text_styles = [
@@ -3724,21 +4018,28 @@ fn install_theme(ctx: &egui::Context) {
     style.spacing.slider_width = 180.0;
     style.spacing.slider_rail_height = 4.0;
     style.spacing.interact_size.y = 26.0;
-    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.icon_width = 16.0;
+    style.spacing.icon_width_inner = 9.0;
+    style.spacing.scroll.bar_width = 9.0;
     style.spacing.scroll.bar_inner_margin = 3.0;
-    style.spacing.scroll.bar_outer_margin = 2.0;
+    style.spacing.scroll.bar_outer_margin = 3.0;
     style.spacing.menu_margin = egui::Margin::same(8);
     style.animation_time = MOTION_FAST;
-    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.window_corner_radius = CornerRadius::same(14);
     visuals.menu_corner_radius = CornerRadius::same(10);
     visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 12],
+        blur: 32,
+        spread: 0,
+        color: Color32::from_black_alpha(96),
+    };
+    visuals.popup_shadow = egui::epaint::Shadow {
         offset: [0, 8],
         blur: 24,
         spread: 0,
-        color: Color32::from_black_alpha(70),
+        color: Color32::from_black_alpha(80),
     };
-    visuals.popup_shadow = visuals.window_shadow;
     visuals.widgets.open.corner_radius = CornerRadius::same(8);
     ctx.set_style(style);
 }
@@ -3784,13 +4085,294 @@ fn card_frame() -> egui::Frame {
             bottom: 16,
         },
         shadow: egui::epaint::Shadow {
-            offset: [0, 4],
-            blur: 14,
+            offset: [0, 6],
+            blur: 18,
             spread: 0,
-            color: Color32::from_black_alpha(28),
+            color: Color32::from_black_alpha(32),
         },
         ..Default::default()
     }
+}
+
+/// A single line of text that ends in an ellipsis instead of spilling out of its
+/// column. Used by every table and specification row.
+fn elided(ui: &egui::Ui, text: &str, size: f32, color: Color32, width: f32) -> Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(size),
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: width.max(12.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.fonts(|fonts| fonts.layout_job(job))
+}
+
+/// Filled, rounded text field used everywhere a path or a filter is typed.
+/// `width` of `f32::INFINITY` fills the remaining row.
+fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str, width: f32) -> egui::Response {
+    text_field_enabled(ui, true, text, hint, width)
+}
+
+fn text_field_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    text: &mut String,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::TextEdit::singleline(text)
+            .hint_text(RichText::new(hint).size(11.5).color(MUTED))
+            .margin(egui::Margin::symmetric(10, 6))
+            .background_color(INPUT)
+            .desired_width(width),
+    )
+}
+
+/// Custom switch-style checkbox: a 16 pt rounded square that fills with the
+/// accent and draws a check mark. egui's default box inherits the 8 pt widget
+/// radius and reads as a grey circle, which looked unfinished in the sidebar.
+fn toggle(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    let font = egui::FontId::proportional(12.5);
+    let galley = ui.fonts(|fonts| {
+        fonts.layout_no_wrap(label.to_owned(), font.clone(), ui.visuals().text_color())
+    });
+    let height: f32 = 22.0;
+    let width = ui.available_width();
+    let (rect, mut response) = ui.allocate_exact_size(
+        egui::vec2(width, height.max(galley.size().y)),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let ctx = ui.ctx();
+        let on = animated_bool(ctx, response.id.with("on"), *value, MOTION_FAST);
+        let hover = animated_bool(
+            ctx,
+            response.id.with("hover"),
+            response.hovered(),
+            MOTION_FAST,
+        );
+        let painter = ui.painter();
+        let box_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 8.0, rect.center().y),
+            egui::vec2(16.0, 16.0),
+        );
+        let fill = if on > 0.5 {
+            ACCENT
+        } else if hover > 0.5 {
+            Color32::from_rgb(46, 46, 51)
+        } else {
+            INPUT
+        };
+        painter.rect_filled(box_rect, CornerRadius::same(5), fill);
+        painter.rect_stroke(
+            box_rect,
+            CornerRadius::same(5),
+            Stroke::new(
+                1.0_f32,
+                if on > 0.5 {
+                    ACCENT
+                } else {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 40)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        if on > 0.01 {
+            let a = (255.0 * on).round() as u8;
+            let ink = Color32::from_rgba_unmultiplied(255, 255, 255, a);
+            let c = box_rect.center();
+            painter.line_segment(
+                [c + egui::vec2(-3.6, 0.2), c + egui::vec2(-1.0, 2.8)],
+                Stroke::new(1.7_f32, ink),
+            );
+            painter.line_segment(
+                [c + egui::vec2(-1.0, 2.8), c + egui::vec2(3.8, -2.6)],
+                Stroke::new(1.7_f32, ink),
+            );
+        }
+        let text_color = if *value || response.hovered() {
+            TEXT
+        } else {
+            TEXT_DIM
+        };
+        painter.galley(
+            egui::pos2(rect.left() + 30.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            text_color,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Apple-style segmented control: a recessed track with one raised segment.
+/// Used for format pickers, sort orders and duration presets so every
+/// two-or-three-way choice in the app looks the same.
+fn segmented<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    options: &[(T, &'static str)],
+) -> bool {
+    let mut changed = false;
+    let font = egui::FontId::proportional(11.0);
+    let heights: Vec<f32> = options
+        .iter()
+        .map(|(_, label)| {
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(label.to_string(), font.clone(), TEXT_DIM)
+                    .size()
+                    .y
+            })
+        })
+        .collect();
+    let text_h = heights.into_iter().fold(0.0_f32, f32::max).max(13.0);
+    let seg_h = text_h + 12.0;
+    let widths: Vec<f32> = options
+        .iter()
+        .map(|(_, label)| {
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(label.to_string(), font.clone(), TEXT_DIM)
+                    .size()
+                    .x
+            })
+        })
+        .collect();
+    let total: f32 = widths.iter().sum::<f32>() + 28.0 * options.len() as f32 + 4.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total, seg_h + 4.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return changed;
+    }
+    ui.painter().rect_filled(rect, CornerRadius::same(10), BG);
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(10),
+        Stroke::new(1.0_f32, HAIRLINE),
+        egui::StrokeKind::Inside,
+    );
+    let mut x = rect.left() + 2.0;
+    for (index, (value, label)) in options.iter().enumerate() {
+        let w = widths[index] + 28.0;
+        let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 2.0), egui::vec2(w, seg_h));
+        let response = ui.interact(seg, ui.next_auto_id(), egui::Sense::click());
+        let selected = *current == *value;
+        if response.clicked() && !selected {
+            *current = *value;
+            changed = true;
+        }
+        let hover = animated_bool(
+            ui.ctx(),
+            response.id.with("hover"),
+            response.hovered() && !selected,
+            MOTION_FAST,
+        );
+        if selected {
+            ui.painter()
+                .rect_filled(seg, CornerRadius::same(7), CARD_HI);
+            ui.painter().rect_stroke(
+                seg,
+                CornerRadius::same(7),
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 26)),
+                egui::StrokeKind::Inside,
+            );
+        } else if hover > 0.01 {
+            ui.painter().rect_filled(
+                seg,
+                CornerRadius::same(7),
+                Color32::from_rgba_unmultiplied(255, 255, 255, (12.0 * hover) as u8),
+            );
+        }
+        ui.painter().text(
+            seg.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            font.clone(),
+            if selected { TEXT } else { TEXT_DIM },
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        x += w;
+    }
+    changed
+}
+
+/// Small keycap used in the shortcut sheet and status bar hints.
+fn keycap(ui: &mut egui::Ui, text: &str) {
+    let font = egui::FontId::proportional(10.5);
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(text.to_owned(), font, TEXT_DIM));
+    let size = galley.size() + egui::vec2(16.0, 8.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(5), INPUT);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(5),
+        Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.center() - galley.size() / 2.0, galley, TEXT_DIM);
+}
+
+/// Soft gradient at the bottom of a scroll viewport so content dissolves into
+/// the status bar instead of being sliced by a hard edge.
+fn scroll_fade(ui: &egui::Ui, viewport: egui::Rect, color: Color32) {
+    let height = 26.0_f32.min(viewport.height() * 0.3);
+    if height <= 1.0 {
+        return;
+    }
+    let bottom = viewport.bottom().min(ui.clip_rect().bottom());
+    let top = bottom - height;
+    let mut mesh = egui::Mesh::default();
+    let clear = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 0);
+    let left = viewport.left();
+    let right = viewport.right();
+    mesh.colored_vertex(egui::pos2(left, top), clear);
+    mesh.colored_vertex(egui::pos2(right, top), clear);
+    mesh.colored_vertex(egui::pos2(right, bottom), color);
+    mesh.colored_vertex(egui::pos2(left, bottom), color);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+/// Primary action: accent fill, dark ink, full width when asked.
+fn primary_button(ui: &mut egui::Ui, text: &str, full_width: bool, height: f32) -> egui::Response {
+    let mut button = egui::Button::new(RichText::new(text).size(12.5).strong().color(ACCENT_INK))
+        .fill(ACCENT)
+        .corner_radius(CornerRadius::same(9));
+    if full_width {
+        button = button.min_size(egui::vec2(ui.available_width(), height));
+    } else {
+        button = button.min_size(egui::vec2(0.0, height));
+    }
+    ui.add(button)
+}
+
+/// Quiet secondary action: hairline outline on the card surface.
+fn ghost_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).size(11.5).color(TEXT_DIM))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .corner_radius(CornerRadius::same(8)),
+    )
 }
 
 fn spec_row(rows: &mut Vec<(String, String)>, label: impl Into<String>, value: impl Into<String>) {
@@ -3801,17 +4383,61 @@ fn spec_row(rows: &mut Vec<(String, String)>, label: impl Into<String>, value: i
 }
 
 fn spec_grid(ui: &mut egui::Ui, id: &str, rows: &[(String, String)]) {
-    egui::Grid::new(id)
-        .num_columns(2)
-        .spacing([28.0, 8.0])
-        .striped(true)
-        .show(ui, |ui| {
-            for (label, value) in rows {
-                ui.label(RichText::new(label).size(11.5).color(MUTED));
-                ui.label(RichText::new(value).size(12.0).color(TEXT_DIM));
-                ui.end_row();
+    if rows.is_empty() {
+        return;
+    }
+    ui.push_id(id, |ui| {
+        let width = ui.available_width();
+        let label_w = rows
+            .iter()
+            .map(|(label, _)| {
+                ui.fonts(|fonts| {
+                    fonts
+                        .layout_no_wrap(label.clone(), egui::FontId::proportional(11.5), MUTED)
+                        .size()
+                        .x
+                })
+            })
+            .fold(0.0_f32, f32::max)
+            .max(132.0)
+            .min(width * 0.45)
+            + 24.0;
+        let row_h = 24.0;
+        for (index, (label, value)) in rows.iter().enumerate() {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
+            if !ui.is_rect_visible(rect) {
+                continue;
             }
-        });
+            let painter = ui.painter();
+            if index % 2 == 1 {
+                // Rounded tint that stays inside the card's 18 pt padding, so
+                // the stripe never cuts across a rounded corner.
+                painter.rect_filled(
+                    rect.expand2(egui::vec2(8.0, 1.0)),
+                    CornerRadius::same(7),
+                    STRIPE,
+                );
+            }
+            let label_galley = elided(ui, label, 11.5, MUTED, label_w - 26.0);
+            painter.galley(
+                egui::pos2(
+                    rect.left() + 8.0,
+                    rect.center().y - label_galley.size().y / 2.0,
+                ),
+                label_galley,
+                MUTED,
+            );
+            let value_galley = elided(ui, value, 12.0, TEXT_DIM, width - label_w - 8.0);
+            painter.galley(
+                egui::pos2(
+                    rect.left() + label_w,
+                    rect.center().y - value_galley.size().y / 2.0,
+                ),
+                value_galley,
+                TEXT_DIM,
+            );
+        }
+    });
 }
 
 /// One row of the HWMonitor-style sensor table.
@@ -3912,6 +4538,247 @@ fn sensor_table(ui: &mut egui::Ui, id: &str, heading: &str, rows: Vec<RowView<'_
     });
 }
 
+/// Driver store table: the name column takes the remaining width, so long
+/// device names are elided on one line instead of wrapping into five.
+fn driver_table(ui: &mut egui::Ui, drivers: &[&specs::DriverSpec]) {
+    let width = ui.available_width();
+    let class_w = 118.0;
+    let version_w = 116.0;
+    let sign_w = 84.0;
+    let name_w = (width - class_w - version_w - sign_w).max(160.0);
+    let (header, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    if ui.is_rect_visible(header) {
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(9.5);
+        painter.text(
+            egui::pos2(header.left() + 8.0, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            "DRIVER",
+            font.clone(),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(header.left() + name_w, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            "CLASS",
+            font.clone(),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(header.left() + name_w + class_w, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            "VERSION",
+            font.clone(),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(header.right() - sign_w + 8.0, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            "SIGNATURE",
+            font,
+            MUTED,
+        );
+        painter.hline(
+            header.x_range(),
+            header.bottom() - 0.5,
+            Stroke::new(1.0_f32, HAIRLINE),
+        );
+    }
+    for (index, driver) in drivers.iter().enumerate() {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 42.0), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            continue;
+        }
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(
+                rect.expand2(egui::vec2(8.0, 1.0)),
+                CornerRadius::same(7),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+            );
+        } else if index % 2 == 1 {
+            painter.rect_filled(
+                rect.expand2(egui::vec2(8.0, 1.0)),
+                CornerRadius::same(7),
+                STRIPE,
+            );
+        }
+        let name = elided(ui, &driver.name, 11.5, TEXT, name_w - 20.0);
+        painter.galley(egui::pos2(rect.left() + 8.0, rect.top() + 8.0), name, TEXT);
+        let mut meta: Vec<String> = Vec::new();
+        if !driver.provider.is_empty() {
+            meta.push(driver.provider.clone());
+        }
+        if !driver.date.is_empty() {
+            meta.push(driver.date.clone());
+        }
+        let meta_galley = elided(ui, &meta.join(" · "), 10.0, MUTED, name_w - 20.0);
+        painter.galley(
+            egui::pos2(rect.left() + 8.0, rect.top() + 25.0),
+            meta_galley,
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(rect.left() + name_w, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            driver_class_label(&driver.class_name),
+            egui::FontId::proportional(11.0),
+            TEXT_DIM,
+        );
+        painter.text(
+            egui::pos2(rect.left() + name_w + class_w, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            if driver.version.is_empty() {
+                "—".to_string()
+            } else {
+                driver.version.clone()
+            },
+            egui::FontId::monospace(10.5),
+            TEXT_DIM,
+        );
+        if let Some(signed) = driver.signed {
+            let (label, color) = if signed {
+                ("SIGNED", GREEN)
+            } else {
+                ("UNSIGNED", AMBER)
+            };
+            let galley = ui.fonts(|fonts| {
+                fonts.layout_no_wrap(label.to_string(), egui::FontId::proportional(10.0), color)
+            });
+            let chip_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    rect.left() + name_w + class_w + version_w,
+                    rect.center().y - 8.0,
+                ),
+                galley.size() + egui::vec2(14.0, 7.0),
+            );
+            painter.rect_filled(chip_rect, CornerRadius::same(6), tint(color));
+            painter.galley(chip_rect.min + egui::vec2(7.0, 3.5), galley, color);
+        } else {
+            painter.text(
+                egui::pos2(
+                    rect.left() + name_w + class_w + version_w + 8.0,
+                    rect.center().y,
+                ),
+                egui::Align2::LEFT_CENTER,
+                "—",
+                egui::FontId::proportional(11.0),
+                MUTED,
+            );
+        }
+    }
+}
+
+/// Process list with fixed numeric columns, right-aligned figures and rounded
+/// row tinting. Replaces a striped Grid whose square stripes cut the card edge.
+fn process_table(ui: &mut egui::Ui, processes: &[&telemetry::Process]) {
+    let width = ui.available_width();
+    let pid_w = 74.0;
+    let cpu_w = 74.0;
+    let mem_w = 92.0;
+    let name_w = (width - pid_w - cpu_w - mem_w).max(120.0);
+    let header_h = 22.0;
+    let (header, _) = ui.allocate_exact_size(egui::vec2(width, header_h), egui::Sense::hover());
+    if ui.is_rect_visible(header) {
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(9.5);
+        painter.text(
+            egui::pos2(header.left() + 8.0, header.center().y),
+            egui::Align2::LEFT_CENTER,
+            "PROCESS",
+            font.clone(),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(header.left() + name_w + pid_w - 8.0, header.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "PID",
+            font.clone(),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(
+                header.left() + name_w + pid_w + cpu_w - 8.0,
+                header.center().y,
+            ),
+            egui::Align2::RIGHT_CENTER,
+            "CPU",
+            font.clone(),
+            MUTED,
+        );
+        painter.text(
+            egui::pos2(header.right() - 8.0, header.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "MEMORY",
+            font,
+            MUTED,
+        );
+        painter.hline(
+            header.x_range(),
+            header.bottom() - 0.5,
+            Stroke::new(1.0_f32, HAIRLINE),
+        );
+    }
+    for (index, process) in processes.iter().take(100).enumerate() {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 27.0), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            continue;
+        }
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(
+                rect.expand2(egui::vec2(8.0, 0.0)),
+                CornerRadius::same(7),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+            );
+        } else if index % 2 == 1 {
+            painter.rect_filled(
+                rect.expand2(egui::vec2(8.0, 0.0)),
+                CornerRadius::same(7),
+                STRIPE,
+            );
+        }
+        let name = elided(ui, &process.name, 12.0, TEXT_DIM, name_w - 16.0);
+        painter.galley(
+            egui::pos2(rect.left() + 8.0, rect.center().y - name.size().y / 2.0),
+            name,
+            TEXT_DIM,
+        );
+        painter.text(
+            egui::pos2(rect.left() + name_w + pid_w - 8.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            process.pid.to_string(),
+            egui::FontId::monospace(10.5),
+            MUTED,
+        );
+        let cpu_text = if process.cpu_usage.is_finite() {
+            format!("{:.1}%", process.cpu_usage)
+        } else {
+            "—".into()
+        };
+        painter.text(
+            egui::pos2(rect.left() + name_w + pid_w + cpu_w - 8.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            cpu_text,
+            egui::FontId::monospace(10.5),
+            if process.cpu_usage > 50.0 {
+                AMBER
+            } else {
+                TEXT_DIM
+            },
+        );
+        painter.text(
+            egui::pos2(rect.right() - 8.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{:.1} MiB", process.memory as f64 / 1_048_576.0),
+            egui::FontId::monospace(10.5),
+            MUTED,
+        );
+    }
+}
+
 fn uptime_text(seconds: u64) -> String {
     let days = seconds / 86_400;
     let hours = (seconds % 86_400) / 3600;
@@ -3958,7 +4825,7 @@ fn vendor_text(vendor: &str) -> &str {
 
 fn smart_color(smart: &str) -> Color32 {
     match smart.to_lowercase().as_str() {
-        "verified" | "good" | "ok" => GREEN,
+        "verified" | "good" | "ok" | "healthy" => GREEN,
         "" => MUTED,
         "failing" | "bad" => RED,
         _ => AMBER,
@@ -4282,19 +5149,19 @@ fn nav_item(ui: &mut egui::Ui, active: bool, page: Page, label: &str) -> egui::R
         let painter = ui.painter();
         if sel > 0.01 {
             // macOS sidebars use a translucent neutral selection, not a filled accent row.
-            let a = (20.0 * sel).round() as u8;
+            let a = (26.0 * sel).round() as u8;
             painter.rect_filled(
                 rect,
                 CornerRadius::same(9),
                 Color32::from_rgba_unmultiplied(255, 255, 255, a),
             );
             let accent = egui::Rect::from_min_size(
-                rect.left_center() + egui::vec2(0.0, -8.0),
-                egui::vec2(3.0, 16.0 * sel),
+                rect.left_center() + egui::vec2(1.0, -7.5),
+                egui::vec2(2.5, 15.0 * sel),
             );
             painter.rect_filled(accent, CornerRadius::same(2), ACCENT);
         } else if hov > 0.01 {
-            let a = (10.0 * hov).round() as u8;
+            let a = (12.0 * hov).round() as u8;
             painter.rect_filled(
                 rect,
                 CornerRadius::same(9),
@@ -4372,39 +5239,36 @@ fn picker<T: PartialEq + Copy>(
 /// Apple-style segmented control for common test durations. The fine-grained
 /// slider remains below; presets just make the usual choices one tap away.
 fn duration_presets(ui: &mut egui::Ui, seconds: &mut u64) {
-    ui.label(RichText::new("Quick duration").size(10.0).color(MUTED));
-    ui.add_space(3.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 5.0;
-        for (value, label) in [(15u64, "15s"), (60, "1 min"), (300, "5 min")] {
-            let selected = *seconds == value;
-            let fill = if selected {
-                ACCENT
-            } else {
-                Color32::from_rgba_unmultiplied(255, 255, 255, 12)
-            };
-            let text_color = if selected {
-                Color32::from_rgb(9, 18, 30)
-            } else {
-                TEXT_DIM
-            };
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(label).size(11.0).strong().color(text_color))
-                        .fill(fill)
-                        .corner_radius(CornerRadius::same(8)),
-                )
-                .clicked()
-            {
-                *seconds = value;
-            }
-        }
-    });
+    ui.label(
+        RichText::new("Quick duration")
+            .size(10.0)
+            .strong()
+            .color(MUTED),
+    );
+    ui.add_space(4.0);
+    let mut selected = if *seconds == 15 {
+        15u64
+    } else if *seconds == 60 {
+        60
+    } else if *seconds == 300 {
+        300
+    } else {
+        0
+    };
+    let before = selected;
+    segmented(
+        ui,
+        &mut selected,
+        &[(15u64, "15 s"), (60, "1 min"), (300, "5 min")],
+    );
+    if selected != before {
+        *seconds = selected;
+    }
 }
 
 fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui::Response {
     let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 50.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 52.0), egui::Sense::click());
     if ui.is_rect_visible(rect) {
         // Clip to the tile: a long hint used to spill over the card edge and
         // overlap the next tile and the description below.
@@ -4414,32 +5278,45 @@ fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui
         } else if response.hovered() {
             CARD_HI
         } else {
-            CARD
+            INPUT
         };
-        painter.rect_filled(rect, CornerRadius::same(12), fill);
+        painter.rect_filled(rect, CornerRadius::same(10), fill);
         painter.rect_stroke(
             rect,
-            CornerRadius::same(12),
+            CornerRadius::same(10),
             Stroke::new(
                 if selected { 1.4 } else { 1.0_f32 },
-                if selected { ACCENT } else { BORDER },
+                if selected {
+                    ACCENT
+                } else if response.hovered() {
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 54)
+                } else {
+                    BORDER
+                },
             ),
             egui::StrokeKind::Inside,
         );
         painter.text(
-            rect.left_top() + egui::vec2(13.0, 11.0),
+            rect.left_top() + egui::vec2(12.0, 10.0),
             egui::Align2::LEFT_TOP,
             title,
             egui::FontId::proportional(12.5),
             if selected { TEXT } else { TEXT_DIM },
         );
         painter.text(
-            rect.left_top() + egui::vec2(13.0, 30.0),
+            rect.left_top() + egui::vec2(12.0, 29.0),
             egui::Align2::LEFT_TOP,
             hint,
             egui::FontId::proportional(10.0),
             MUTED,
         );
+        if selected {
+            painter.circle_filled(
+                egui::pos2(rect.right() - 13.0, rect.top() + 13.0),
+                3.0,
+                ACCENT,
+            );
+        }
     }
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -4601,14 +5478,14 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, hint: &str)
 }
 
 fn load_color(fraction: f32) -> Color32 {
+    // Load is data, not a health verdict: stay on the accent until the machine
+    // is genuinely busy, then warn. Keeps a 16-core grid calm instead of green.
     if fraction > 0.9 {
         RED
     } else if fraction > 0.7 {
         AMBER
-    } else if fraction > 0.45 {
-        ACCENT
     } else {
-        GREEN
+        ACCENT
     }
 }
 
