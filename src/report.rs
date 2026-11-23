@@ -54,7 +54,7 @@ pub fn render_certificate(record: &ResultRecord, peak_c: Option<f32>) -> String 
     };
     let settings = match record.kind {
         crate::stress::Kind::Cpu => format!("CPU workers: {}", record.config.workers),
-        crate::stress::Kind::Gpu => format!("GPU compute dispatch check"),
+        crate::stress::Kind::Gpu => "GPU compute dispatch check".to_string(),
         crate::stress::Kind::Memory => format!(
             "Memory: {} MiB, pattern {}",
             record.config.mib,

@@ -922,9 +922,11 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                 pci: text(gpu.get("pci")),
                 refresh: {
                     let value = text(gpu.get("refresh"));
-                    (!value.is_empty())
-                        .then(|| format!("{value} Hz"))
-                        .unwrap_or_default()
+                    if !value.is_empty() {
+                        format!("{value} Hz")
+                    } else {
+                        Default::default()
+                    }
                 },
                 status: text(gpu.get("status")),
                 bios: matched
@@ -966,11 +968,14 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                     manufacturer: text(module.get("manufacturer")),
                     part_number: text(module.get("part")),
                     // Firmware often reports an all-zero placeholder.
-                    serial: text(module.get("serial"))
+                    serial: if text(module.get("serial"))
                         .chars()
                         .any(|c| c.is_ascii_alphanumeric() && c != '0')
-                        .then(|| text(module.get("serial")))
-                        .unwrap_or_default(),
+                    {
+                        text(module.get("serial"))
+                    } else {
+                        Default::default()
+                    },
                     configured_mhz: module
                         .get("configured")
                         .and_then(Value::as_u64)
@@ -1040,11 +1045,14 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
                 specs.monitors.push(MonitorSpec {
                     manufacturer,
                     model,
-                    serial: text(monitor.get("serial"))
+                    serial: if text(monitor.get("serial"))
                         .chars()
                         .any(|c| c.is_ascii_alphanumeric() && c != '0')
-                        .then(|| text(monitor.get("serial")))
-                        .unwrap_or_default(),
+                    {
+                        text(monitor.get("serial"))
+                    } else {
+                        Default::default()
+                    },
                     year: monitor
                         .get("year")
                         .and_then(Value::as_u64)
@@ -1232,6 +1240,7 @@ ConvertTo-Json -InputObject $devices -Depth 3 -Compress
 // These parsers are platform independent so they can be unit tested against
 // captured command output.
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn run_section(text: &str) -> Vec<(usize, String, String)> {
     let mut lines = Vec::new();
     for line in text.lines() {
@@ -1252,6 +1261,7 @@ fn run_section(text: &str) -> Vec<(usize, String, String)> {
     lines
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn profile_value(text: &str, key: &str) -> Option<String> {
     run_section(text)
         .into_iter()
@@ -1262,6 +1272,7 @@ fn profile_value(text: &str, key: &str) -> Option<String> {
 /// Decimal units are used by `system_profiler`; exact byte counts win when present.
 /// `system_profiler` localises its values; accept the common English and
 /// Chinese spellings instead of treating "Enabled"/"Yes" as the only truth.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn profile_flag(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "yes" | "true" | "enabled" | "on" | "是" | "开启" | "啟用" => Some(true),
@@ -1270,6 +1281,7 @@ fn profile_flag(value: &str) -> Option<bool> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_capacity(value: &str) -> Option<u64> {
     if let Some(start) = value.find('(') {
         let inside = &value[start + 1..];
@@ -1296,6 +1308,7 @@ fn parse_capacity(value: &str) -> Option<u64> {
     Some((number * multiplier) as u64)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_mhz(value: &str) -> Option<u64> {
     value
         .split_whitespace()
@@ -1303,6 +1316,7 @@ fn parse_mhz(value: &str) -> Option<u64> {
         .filter(|v| *v > 0)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_memory_profile(text: &str) -> MemoryProfile {
     let mut profile = MemoryProfile::default();
     let mut current: Option<MemoryModule> = None;
@@ -1356,6 +1370,7 @@ fn parse_memory_profile(text: &str) -> MemoryProfile {
     profile
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_graphics_profile(text: &str) -> Vec<GraphicsSpec> {
     let mut found: Vec<GraphicsSpec> = Vec::new();
     for (indent, key, value) in run_section(text) {
@@ -1393,6 +1408,7 @@ fn parse_graphics_profile(text: &str) -> Vec<GraphicsSpec> {
     found
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_storage_profile(text: &str) -> Vec<DriveSpec> {
     let mut found: Vec<DriveSpec> = Vec::new();
     for (indent, key, value) in run_section(text) {
@@ -1430,6 +1446,7 @@ fn parse_storage_profile(text: &str) -> Vec<DriveSpec> {
     found
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_diskutil_info(text: &str) -> Option<VolumeHealth> {
     let mut health = VolumeHealth::default();
     for (_, key, value) in run_section(text) {
@@ -1447,6 +1464,7 @@ fn parse_diskutil_info(text: &str) -> Option<VolumeHealth> {
     Some(health)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_board_id(text: &str) -> Option<String> {
     let line = text
         .lines()
@@ -1463,6 +1481,7 @@ fn parse_board_id(text: &str) -> Option<String> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_wifi_interface(text: &str) -> Option<String> {
     let mut wifi = false;
     for line in text.lines() {
@@ -1485,12 +1504,14 @@ fn parse_wifi_interface(text: &str) -> Option<String> {
 
 /// `system_profiler -json` has shipped both a top-level `SPBluetoothDataType`
 /// array and a nested `Bluetooth` object across macOS versions.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bluetooth_root(value: &serde_json::Value) -> Option<&serde_json::Value> {
     value
         .get("SPBluetoothDataType")
         .or_else(|| value.get("Bluetooth")?.get("SPBluetoothDataType"))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn first_profile_entry(value: &serde_json::Value) -> Option<&serde_json::Value> {
     match value {
         serde_json::Value::Array(items) => items.first(),
@@ -1499,6 +1520,7 @@ fn first_profile_entry(value: &serde_json::Value) -> Option<&serde_json::Value> 
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_bluetooth(text: &str) -> Option<BluetoothSpec> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let root = bluetooth_root(&value)?;
@@ -1541,6 +1563,7 @@ fn parse_bluetooth(text: &str) -> Option<BluetoothSpec> {
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_battery(text: &str) -> Option<String> {
     let mut power = None;
     let mut charge = None;

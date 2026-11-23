@@ -127,12 +127,11 @@ pub fn segments_with_gap(
     let mut current = Vec::new();
     let mut previous = None;
     for sample in history.samples() {
-        if previous.is_some_and(|at: Instant| sample.at.duration_since(at) >= gap)
-            || value(sample).is_none()
+        if (previous.is_some_and(|at: Instant| sample.at.duration_since(at) >= gap)
+            || value(sample).is_none())
+            && !current.is_empty()
         {
-            if !current.is_empty() {
-                result.push(std::mem::take(&mut current));
-            }
+            result.push(std::mem::take(&mut current));
         }
         if let Some(v) = value(sample) {
             current.push([sample.at.saturating_duration_since(origin).as_secs_f64(), v]);
@@ -170,7 +169,7 @@ pub fn temperature_keys(history: &History) -> Vec<String> {
     keys
 }
 
-pub fn temperature_value<'a>(sample: &'a Sample, key: &str) -> Option<f64> {
+pub fn temperature_value(sample: &Sample, key: &str) -> Option<f64> {
     sample
         .temperatures
         .iter()

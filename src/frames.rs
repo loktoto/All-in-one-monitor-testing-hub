@@ -120,7 +120,8 @@ fn parse(bytes: &[u8]) -> Result<FrameSummary, String> {
             mean.is_finite().then_some(mean)
         }
     };
-    let (application, process_id, swap_chain) = identity.expect("valid samples have identity");
+    let (application, process_id, swap_chain) =
+        identity.ok_or("No frame samples carried a process identity.")?;
     Ok(FrameSummary {
         application,
         process_id,

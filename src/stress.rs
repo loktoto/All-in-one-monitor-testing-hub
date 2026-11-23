@@ -831,6 +831,179 @@ fn combined(
     })
 }
 
+fn gpu(
+    config: &Config,
+    adapter: Option<&wgpu::Adapter>,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    live: &Mutex<State>,
+) -> Result<Outcome, TestError> {
+    use wgpu::util::DeviceExt;
+    let intensity = config.gpu_intensity;
+    let (words, steps) = intensity.params();
+    let adapter = adapter.ok_or_else(|| {
+        TestError::Unavailable("No GPU adapter was selected or discovered".into())
+    })?;
+    let info = adapter.get_info();
+    if info.device_type == wgpu::DeviceType::Cpu {
+        return Err(TestError::Unavailable(
+            "Only a software adapter was selected; GPU test unavailable".into(),
+        ));
+    }
+    let (device, queue) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .map_err(|e| TestError::Unavailable(format!("GPU device request failed: {e}")))?;
+    let errors = Arc::new(Mutex::new(None::<String>));
+    let error_out = errors.clone();
+    device.on_uncaptured_error(Box::new(move |e| {
+        if let Ok(mut value) = error_out.lock() {
+            *value = Some(e.to_string());
+        }
+    }));
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let shader_source = format!(
+        r#"
+@group(0) @binding(0) var<storage, read_write> output: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    var x = id.x;
+    for (var i = 0u; i < {steps}u; i = i + 1u) {{ x = x * 1664525u + 1013904223u; }}
+    output[id.x] = x;
+}}
+"#
+    );
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("verified compute"),
+        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("verified compute"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let bytes = vec![0u8; words * 4];
+    let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("compute output"),
+        contents: &bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: bytes.len() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: output.as_entire_binding(),
+        }],
+    });
+    if let Some(e) = pollster::block_on(device.pop_error_scope()) {
+        return Err(format!("GPU setup failed: {e}").into());
+    }
+    let mut expected = Vec::with_capacity(words);
+    for i in 0..words {
+        let mut x = i as u32;
+        for _ in 0..steps {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+        }
+        expected.push(x);
+    }
+    let mut rounds = 0u64;
+    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups((words / 64) as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes.len() as u64);
+        queue.submit(Some(encoder.finish()));
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let dispatch_started = Instant::now();
+        loop {
+            device.poll(wgpu::Maintain::Poll);
+            match rx.try_recv() {
+                Ok(result) => {
+                    result.map_err(|e| format!("GPU readback failed: {e}"))?;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("GPU readback callback disconnected".into())
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if let Some(e) = errors
+                .lock()
+                .map_err(|_| "GPU error state unavailable")?
+                .take()
+            {
+                return Err(format!("GPU error: {e}").into());
+            }
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                publish(live, rounds, 0, intensity.label());
+                return Ok(Outcome::new(
+                    rounds,
+                    format!(
+                    "{rounds} verified compute dispatches on {}; pending dispatch was not verified",
+                    info.name
+                ),
+                ));
+            }
+            if dispatch_started.elapsed() >= Duration::from_secs(15) {
+                return Err(
+                    format!("GPU readback timed out after {rounds} verified dispatches").into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        {
+            let data = slice.get_mapped_range();
+            for (index, chunk) in data.chunks_exact(4).enumerate() {
+                let value = u32::from_le_bytes(chunk.try_into().unwrap());
+                if value != expected[index] {
+                    publish(live, rounds, 1, intensity.label());
+                    return Err(format!(
+                        "GPU result mismatch at word {index} after {rounds} verified dispatches (expected {:#010x}, got {:#010x})",
+                        expected[index], value
+                    )
+                    .into());
+                }
+            }
+        }
+        staging.unmap();
+        if let Some(e) = errors
+            .lock()
+            .map_err(|_| "GPU error state unavailable")?
+            .take()
+        {
+            return Err(format!("GPU error: {e}").into());
+        }
+        rounds += 1;
+    }
+    publish(live, rounds, 0, intensity.label());
+    Ok(Outcome::new(
+        rounds,
+        format!(
+            "{rounds} verified compute dispatches on {} ({:?}) with {}; no mismatches detected",
+            info.name,
+            info.backend,
+            intensity.label()
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,177 +1351,4 @@ mod tests {
         .is_err());
         assert!(!s.lock().unwrap().running);
     }
-}
-
-fn gpu(
-    config: &Config,
-    adapter: Option<&wgpu::Adapter>,
-    cancel: &AtomicBool,
-    deadline: Instant,
-    live: &Mutex<State>,
-) -> Result<Outcome, TestError> {
-    use wgpu::util::DeviceExt;
-    let intensity = config.gpu_intensity;
-    let (words, steps) = intensity.params();
-    let adapter = adapter.ok_or_else(|| {
-        TestError::Unavailable("No GPU adapter was selected or discovered".into())
-    })?;
-    let info = adapter.get_info();
-    if info.device_type == wgpu::DeviceType::Cpu {
-        return Err(TestError::Unavailable(
-            "Only a software adapter was selected; GPU test unavailable".into(),
-        ));
-    }
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
-            .map_err(|e| TestError::Unavailable(format!("GPU device request failed: {e}")))?;
-    let errors = Arc::new(Mutex::new(None::<String>));
-    let error_out = errors.clone();
-    device.on_uncaptured_error(Box::new(move |e| {
-        if let Ok(mut value) = error_out.lock() {
-            *value = Some(e.to_string());
-        }
-    }));
-    device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let shader_source = format!(
-        r#"
-@group(0) @binding(0) var<storage, read_write> output: array<u32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
-    var x = id.x;
-    for (var i = 0u; i < {steps}u; i = i + 1u) {{ x = x * 1664525u + 1013904223u; }}
-    output[id.x] = x;
-}}
-"#
-    );
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("verified compute"),
-        source: wgpu::ShaderSource::Wgsl(shader_source.into()),
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("verified compute"),
-        layout: None,
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let bytes = vec![0u8; words * 4];
-    let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("compute output"),
-        contents: &bytes,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    });
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: bytes.len() as u64,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: output.as_entire_binding(),
-        }],
-    });
-    if let Some(e) = pollster::block_on(device.pop_error_scope()) {
-        return Err(format!("GPU setup failed: {e}").into());
-    }
-    let mut expected = Vec::with_capacity(words);
-    for i in 0..words {
-        let mut x = i as u32;
-        for _ in 0..steps {
-            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
-        }
-        expected.push(x);
-    }
-    let mut rounds = 0u64;
-    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
-        let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups((words / 64) as u32, 1, 1);
-        }
-        encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes.len() as u64);
-        queue.submit(Some(encoder.finish()));
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let dispatch_started = Instant::now();
-        loop {
-            device.poll(wgpu::Maintain::Poll);
-            match rx.try_recv() {
-                Ok(result) => {
-                    result.map_err(|e| format!("GPU readback failed: {e}"))?;
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("GPU readback callback disconnected".into())
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-            if let Some(e) = errors
-                .lock()
-                .map_err(|_| "GPU error state unavailable")?
-                .take()
-            {
-                return Err(format!("GPU error: {e}").into());
-            }
-            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                publish(live, rounds, 0, intensity.label());
-                return Ok(Outcome::new(
-                    rounds,
-                    format!(
-                    "{rounds} verified compute dispatches on {}; pending dispatch was not verified",
-                    info.name
-                ),
-                ));
-            }
-            if dispatch_started.elapsed() >= Duration::from_secs(15) {
-                return Err(
-                    format!("GPU readback timed out after {rounds} verified dispatches").into(),
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        {
-            let data = slice.get_mapped_range();
-            for (index, chunk) in data.chunks_exact(4).enumerate() {
-                let value = u32::from_le_bytes(chunk.try_into().unwrap());
-                if value != expected[index] {
-                    publish(live, rounds, 1, intensity.label());
-                    return Err(format!(
-                        "GPU result mismatch at word {index} after {rounds} verified dispatches (expected {:#010x}, got {:#010x})",
-                        expected[index], value
-                    )
-                    .into());
-                }
-            }
-        }
-        staging.unmap();
-        if let Some(e) = errors
-            .lock()
-            .map_err(|_| "GPU error state unavailable")?
-            .take()
-        {
-            return Err(format!("GPU error: {e}").into());
-        }
-        rounds += 1;
-    }
-    publish(live, rounds, 0, intensity.label());
-    Ok(Outcome::new(
-        rounds,
-        format!(
-            "{rounds} verified compute dispatches on {} ({:?}) with {}; no mismatches detected",
-            info.name,
-            info.backend,
-            intensity.label()
-        ),
-    ))
 }

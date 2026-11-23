@@ -2,6 +2,24 @@
 
 A local Rust desktop app that monitors a computer and runs small, bounded stability checks. It runs on **macOS, Windows and Linux**. No account, cloud service or automatic stress test is involved. The interface is in English; notes below are also provided in 繁體中文.
 
+## Highlights
+
+- **Production defaults** — the app remembers your last page, sampling interval, worker count, alert threshold and export paths in a per-user JSON file, and restores them on the next launch. A corrupt or missing file falls back to safe defaults instead of blocking startup.
+- **Quality gate** — `cargo fmt --check`, `cargo clippy -D warnings` and the full test suite run in CI on Linux and Windows (`.github/workflows/ci.yml`). The codebase builds without warnings.
+- **Panic-free hot paths** — no `unwrap`/`expect` on user or OS input; failures surface as messages or "Not available" rows.
+- **Self-contained packaging** — the window/taskbar icon is generated at startup, the release profile strips symbols, and no external asset files are required.
+
+## Build and test
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo run --release
+```
+
+`cargo build --release` produces a single `hardware-hub` binary (`hardware-hub.exe` on Windows). See [Development](#development) for the smoke and performance examples.
+
 ## Run on macOS
 
 1. Install the Xcode command line tools (`xcode-select --install`), then the stable Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).

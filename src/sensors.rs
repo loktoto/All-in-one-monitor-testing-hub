@@ -24,18 +24,10 @@ pub struct Sensor {
     pub unit: Unit,
 }
 
+#[derive(Default)]
 pub struct Readings {
     pub temps: Vec<Sensor>,
     pub fans: Vec<Sensor>,
-}
-
-impl Default for Readings {
-    fn default() -> Self {
-        Self {
-            temps: Vec::new(),
-            fans: Vec::new(),
-        }
-    }
 }
 
 pub struct Reader {

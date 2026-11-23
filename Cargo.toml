@@ -1,9 +1,15 @@
 [package]
 name = "hardware-hub"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.82"
 description = "A local hardware monitor and bounded manual test bench"
 license = "MIT"
+authors = ["Loktoto"]
+repository = "https://github.com/loktoto/All-in-one-monitor-testing-hub"
+readme = "README.md"
+keywords = ["hardware", "monitor", "diagnostics", "egui", "desktop"]
+categories = ["gui", "hardware-support", "visualization"]
 
 [dependencies]
 egui_plot = "0.31"
@@ -32,5 +38,8 @@ wmi = "0.18"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+# Thin LTO stalls for many minutes in the MSVC linker on some machines; keep
+# optimisation high but skip LTO so `cargo build --release` always finishes.
+lto = false
+codegen-units = 16
+strip = true

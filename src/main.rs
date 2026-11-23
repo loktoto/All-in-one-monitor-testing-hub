@@ -8,6 +8,7 @@ use hardware_hub::{
     logging::Recorder,
     netcheck::{self, State as NetworkCheckState},
     report::{self, Format},
+    settings::Settings,
     smart::{self, SmartReport},
     specs::{self, SystemSpecs},
     stress::{
@@ -71,6 +72,7 @@ fn main() -> eframe::Result {
             // logical points are available, so a fixed 1180x800 window was
             // clipped and pushed the status bar off-screen.
             .with_maximized(true)
+            .with_icon(app_icon())
             .with_min_inner_size([720.0, 420.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
@@ -82,7 +84,65 @@ fn main() -> eframe::Result {
     )
 }
 
-#[derive(PartialEq, Clone, Copy)]
+/// Generate a 64x64 RGBA window/taskbar icon at startup: a dark rounded tile
+/// with three readout bars, so no external asset file has to ship with the
+/// binary.
+fn app_icon() -> egui::IconData {
+    const N: u32 = 64;
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    let radius = 13.0_f32;
+    let edge = N as f32 - radius;
+    for y in 0..N {
+        for x in 0..N {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            let cx = fx.clamp(radius, edge);
+            let cy = fy.clamp(radius, edge);
+            let dx = fx - cx;
+            let dy = fy - cy;
+            if dx * dx + dy * dy <= radius * radius {
+                let idx = ((y * N + x) * 4) as usize;
+                rgba[idx] = 34;
+                rgba[idx + 1] = 34;
+                rgba[idx + 2] = 37;
+                rgba[idx + 3] = 255;
+            }
+        }
+    }
+    let mut put = |x0: u32, y0: u32, w: u32, h: u32, color: (u8, u8, u8)| {
+        for y in y0..(y0 + h).min(N) {
+            for x in x0..(x0 + w).min(N) {
+                let idx = ((y * N + x) * 4) as usize;
+                rgba[idx] = color.0;
+                rgba[idx + 1] = color.1;
+                rgba[idx + 2] = color.2;
+                rgba[idx + 3] = 255;
+            }
+        }
+    };
+    // Three bars of increasing height, bottom-aligned, in the app's accent
+    // palette (green, amber, blue).
+    let bottom = 50;
+    let bar_w = 9;
+    for (i, (height, color)) in [
+        (16u32, (48u8, 209u8, 88u8)),
+        (26, (255, 159, 10)),
+        (20, (10, 132, 255)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let x = 14 + i as u32 * 12;
+        put(x, bottom - height, bar_w, *height, *color);
+    }
+    egui::IconData {
+        rgba,
+        width: N,
+        height: N,
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Page {
     Overview,
     Cpu,
@@ -177,6 +237,29 @@ impl Page {
             Page::Reports => "Session results. Nothing leaves this window until you export.",
         }
     }
+
+    /// Resolve a page from a stored label or a short alias (case-insensitive).
+    fn from_label(label: &str) -> Option<Page> {
+        let key = label.trim().to_ascii_lowercase();
+        Some(match key.as_str() {
+            "overview" | "home" => Page::Overview,
+            "cpu" | "processor" => Page::Cpu,
+            "gpu" | "graphics" => Page::Gpu,
+            "memory" | "ram" => Page::Memory,
+            "storage" | "disk" | "volumes" => Page::Storage,
+            "thermal" | "thermals" | "thermals / fans" | "fans" => Page::Thermal,
+            "motherboard" | "board" | "parts" | "parts & board" => Page::Motherboard,
+            "drivers" => Page::Drivers,
+            "network" | "network / wi-fi" | "wifi" | "wi-fi" => Page::Network,
+            "bluetooth" => Page::Bluetooth,
+            "details" => Page::Details,
+            "processes" => Page::Processes,
+            "frames" | "frame analysis" => Page::Frames,
+            "tests" | "stress tests" | "stress" => Page::Tests,
+            "reports" => Page::Reports,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -186,23 +269,23 @@ struct BluetoothRefresh {
     value: Option<specs::BluetoothSpec>,
 }
 
-fn initial_page() -> Page {
-    match std::env::var("HH_START_PAGE").as_deref() {
-        Ok("details") => Page::Details,
-        Ok("cpu") => Page::Cpu,
-        Ok("gpu") => Page::Gpu,
-        Ok("memory") => Page::Memory,
-        Ok("drivers") => Page::Drivers,
-        Ok("thermal") | Ok("thermals") => Page::Thermal,
-        Ok("motherboard") | Ok("board") => Page::Motherboard,
-        Ok("network") => Page::Network,
-        Ok("bluetooth") => Page::Bluetooth,
-        Ok("frames") => Page::Frames,
-        Ok("tests") => Page::Tests,
-        Ok("reports") => Page::Reports,
-        Ok("processes") => Page::Processes,
-        Ok("overview") => Page::Overview,
-        _ => Page::Overview,
+fn initial_page(settings: &Settings) -> Page {
+    // An explicit HH_START_PAGE (used by scripts and screenshots) wins over the
+    // remembered page so automated runs always land where they expect.
+    if let Ok(value) = std::env::var("HH_START_PAGE") {
+        if let Some(page) = Page::from_label(&value) {
+            return page;
+        }
+    }
+    Page::from_label(&settings.page).unwrap_or(Page::Overview)
+}
+
+/// Use a restored path only when it is non-empty; otherwise fall back.
+fn non_empty(value: &str, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        fallback.to_owned()
+    } else {
+        value.to_owned()
     }
 }
 
@@ -291,16 +374,22 @@ struct App {
     /// Accessibility: disable page transitions and eased meters when enabled.
     reduce_motion: bool,
     show_widget: bool,
+    /// Whether the keyboard-shortcut help overlay is open.
+    show_help: bool,
     started: Instant,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_theme(&cc.egui_ctx);
+        // Restore the last session. Corrupt or missing files fall back to
+        // defaults, and every value is clamped before it is used.
+        let settings = Settings::load();
+        let start_page = initial_page(&settings);
         let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
         let stop = Arc::new(AtomicBool::new(false));
         let stats_reset = Arc::new(AtomicBool::new(false));
-        let poll_ms = Arc::new(AtomicU64::new(1000));
+        let poll_ms = Arc::new(AtomicU64::new(settings.poll_ms.clamp(250, 5000)));
         telemetry::spawn(
             snapshot.clone(),
             stop.clone(),
@@ -318,7 +407,7 @@ impl App {
             }
         });
         Self {
-            page: initial_page(),
+            page: start_page,
             snapshot,
             specs,
             poll_ms,
@@ -331,16 +420,18 @@ impl App {
             last_live_at: Instant::now(),
             rate_ema: 0.0,
             shown_progress: 0.0,
-            last_page: initial_page(),
+            last_page: start_page,
             page_enter_at: Instant::now(),
             kind: Kind::Cpu,
-            seconds: 15,
-            workers: std::thread::available_parallelism()
-                .map(|n| n.get().min(4))
-                .unwrap_or(1),
-            mib: 64,
-            disk_write_limit_mib: 64,
-            directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            seconds: settings.seconds.clamp(1, 3600),
+            workers: settings.workers.clamp(1, 64),
+            mib: settings.mib.clamp(1, 4096),
+            disk_write_limit_mib: settings.disk_write_limit_mib.clamp(1, 65_536),
+            directory: if settings.directory.trim().is_empty() {
+                std::env::temp_dir().to_string_lossy().into_owned()
+            } else {
+                settings.directory.clone()
+            },
             mem_pattern: MemPattern::Alternating,
             disk_pattern: DiskPattern::Constant,
             gpu_intensity: GpuIntensity::Standard,
@@ -355,8 +446,8 @@ impl App {
             gpu_initialized: false,
             message: String::new(),
             history: History::default(),
-            history_path: "hardware-hub-history.csv".into(),
-            log_path: "hardware-hub-session.csv".into(),
+            history_path: non_empty(&settings.history_path, "hardware-hub-history.csv"),
+            log_path: non_empty(&settings.log_path, "hardware-hub-session.csv"),
             all_sensor_log_path: "hardware-hub-all-sensors.csv".into(),
             recorder: None,
             process_query: String::new(),
@@ -375,16 +466,21 @@ impl App {
             frame_summary: None,
             frame_message: String::new(),
             alert: alerts::Monitor::default(),
-            alert_celsius: 85.0,
-            alert_hold_secs: 5,
+            alert_celsius: if settings.alert_celsius.is_finite() {
+                settings.alert_celsius.clamp(30.0, 120.0)
+            } else {
+                85.0
+            },
+            alert_hold_secs: settings.alert_hold_secs.clamp(1, 600),
             alert_severity: Severity::Warning,
             selected_temp_key: String::new(),
-            sensor_log_path: "hardware-hub-sensor.csv".into(),
+            sensor_log_path: non_empty(&settings.sensor_log_path, "hardware-hub-sensor.csv"),
             system_report_path: "hardware-hub-system.txt".into(),
             system_report_format: Format::Text,
             system_report_redact: true,
             reduce_motion: false,
             show_widget: false,
+            show_help: false,
             started: Instant::now(),
         }
     }
@@ -408,6 +504,84 @@ impl App {
             .saturating_mul(2)
             .max(1000) as f32
             / 1000.0
+    }
+
+    /// Snapshot the user-facing settings and write them to disk. Called on
+    /// exit; failures are surfaced in the status line rather than swallowed.
+    fn persist_settings(&mut self) {
+        let settings = Settings {
+            page: self.page.label().to_owned(),
+            poll_ms: self.poll_ms.load(std::sync::atomic::Ordering::Relaxed),
+            workers: self.workers,
+            seconds: self.seconds,
+            mib: self.mib,
+            disk_write_limit_mib: self.disk_write_limit_mib,
+            directory: self.directory.clone(),
+            alert_celsius: self.alert_celsius,
+            alert_hold_secs: self.alert_hold_secs,
+            auto_stop_on_heat: self.auto_stop_on_heat,
+            history_path: self.history_path.clone(),
+            log_path: self.log_path.clone(),
+            sensor_log_path: self.sensor_log_path.clone(),
+            report: self.report.clone(),
+        };
+        if let Err(error) = settings.save() {
+            self.message = format!("Could not save settings: {error}");
+        }
+    }
+
+    /// Keyboard shortcut cheat-sheet. Opened with ? or F1, closed with Escape
+    /// or the close button. Rendered as a centred modal above the content.
+    fn help_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let mut open = self.show_help;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                let rows: [(&str, &str); 4] = [
+                    (
+                        "Ctrl / Cmd + 1–9",
+                        "Overview, CPU, GPU, Memory, Storage, Thermals, Details, Processes, Reports",
+                    ),
+                    (
+                        "Ctrl / Cmd + Shift + 1–6",
+                        "Parts & board, Drivers, Network, Bluetooth, Frame analysis, Stress tests",
+                    ),
+                    ("Esc", "Cancel the running check, or close this help"),
+                    ("?  or  F1", "Toggle this help"),
+                ];
+                egui::Grid::new("help_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        for (keys, what) in rows {
+                            ui.label(RichText::new(keys).strong().color(ACCENT));
+                            ui.label(RichText::new(what).size(12.5).color(TEXT_DIM));
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(
+                        "Your page, sampling cadence and thresholds are saved when you close the window.",
+                    )
+                    .size(11.5)
+                    .color(MUTED),
+                );
+            });
+        self.show_help = open;
     }
 
     // ------------------------------------------------------------- navigation
@@ -1245,11 +1419,11 @@ impl App {
                                 let limits = adapter.handle.limits();
                                 spec_row(&mut rows, format!("Adapter {index}"), &adapter.name);
                                 spec_row(&mut rows, "Backend", &adapter.backend);
-                                spec_row(&mut rows, "Vendor / device ID", &format!("{:#06x} / {:#06x}", adapter.vendor_id, adapter.device_id));
-                                spec_row(&mut rows, "Max texture (2D)", &format!("{} px", limits.max_texture_dimension_2d));
-                                spec_row(&mut rows, "Max compute workgroup", &format!("{} × {} × {}", limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z));
-                                spec_row(&mut rows, "Max storage buffer binding", &format!("{} MiB", limits.max_storage_buffer_binding_size / (1024 * 1024)));
-                                spec_row(&mut rows, "Optional features", &adapter.handle.features().bits().count_ones().to_string());
+                                spec_row(&mut rows, "Vendor / device ID", format!("{:#06x} / {:#06x}", adapter.vendor_id, adapter.device_id));
+                                spec_row(&mut rows, "Max texture (2D)", format!("{} px", limits.max_texture_dimension_2d));
+                                spec_row(&mut rows, "Max compute workgroup", format!("{} × {} × {}", limits.max_compute_workgroup_size_x, limits.max_compute_workgroup_size_y, limits.max_compute_workgroup_size_z));
+                                spec_row(&mut rows, "Max storage buffer binding", format!("{} MiB", limits.max_storage_buffer_binding_size / (1024 * 1024)));
+                                spec_row(&mut rows, "Optional features", adapter.handle.features().bits().count_ones().to_string());
                             }
                             spec_grid(ui, "gpu-capabilities", &rows);
                             ui.weak("Limits come from the graphics API and describe capability, not current clocks or temperature.");
@@ -2969,13 +3143,13 @@ impl App {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!(
-                        "verified {} {}  ·  {}  ·  {}",
+                        "verified {} {}  ·  {}  ·  {}s limit",
                         r.verified_units
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| "unknown".into()),
                         r.verified_unit,
                         config_summary(&r.config),
-                        format!("{}s limit", r.config.seconds)
+                        r.config.seconds
                     ))
                     .size(10.5)
                     .color(MUTED),
@@ -3091,6 +3265,15 @@ impl App {
                         ui.label(RichText::new(&self.message).size(11.0).color(TEXT_DIM));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(6.0);
+                        if ui
+                            .small_button(RichText::new("? shortcuts").size(10.5))
+                            .on_hover_text("Keyboard shortcuts (? or F1)")
+                            .clicked()
+                        {
+                            self.show_help = true;
+                        }
+                        ui.add_space(10.0);
                         ui.label(
                             RichText::new(std::env::consts::OS.to_uppercase())
                                 .size(10.0)
@@ -3275,7 +3458,15 @@ impl eframe::App for App {
                 _ => self.page,
             };
         }
+        // ? or F1 opens a shortcut cheat-sheet; Escape closes it first.
+        if ctx.input(|i| i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1)) {
+            self.show_help = !self.show_help;
+        }
+        if self.show_help && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_help = false;
+        }
         if running
+            && !self.show_help
             && !self.cancel.load(Ordering::Relaxed)
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
@@ -3428,6 +3619,7 @@ impl eframe::App for App {
             );
             self.show_widget = keep_open;
         }
+        self.help_overlay(ctx);
         // While the window is focused the monitor needs a few redraws per second
         // for fresh readings. In the background telemetry keeps sampling but the
         // interface redraws once a second, which keeps idle CPU cost low.
@@ -3437,6 +3629,12 @@ impl eframe::App for App {
             Duration::from_millis(1000)
         };
         ctx.request_repaint_after(period);
+    }
+
+    /// Persist settings when the window closes so the next launch resumes the
+    /// same page, cadence and thresholds.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_settings();
     }
 }
 
@@ -4675,6 +4873,37 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_page_label_roundtrips_through_from_label() {
+        // Settings store the page as its display label; restoring must map
+        // every page back to itself, or a restart would silently reset the tab.
+        for page in [
+            Page::Overview,
+            Page::Cpu,
+            Page::Gpu,
+            Page::Memory,
+            Page::Storage,
+            Page::Thermal,
+            Page::Motherboard,
+            Page::Drivers,
+            Page::Network,
+            Page::Bluetooth,
+            Page::Details,
+            Page::Processes,
+            Page::Frames,
+            Page::Tests,
+            Page::Reports,
+        ] {
+            assert_eq!(
+                Page::from_label(page.label()),
+                Some(page),
+                "label {:?} did not round-trip",
+                page.label()
+            );
+        }
+        assert_eq!(Page::from_label("nonsense"), None);
+    }
 
     #[test]
     fn timestamps_render_as_utc_dates() {

@@ -5,6 +5,7 @@ pub mod logging;
 pub mod netcheck;
 pub mod report;
 pub mod sensors;
+pub mod settings;
 pub mod smart;
 pub mod specs;
 pub mod stress;
