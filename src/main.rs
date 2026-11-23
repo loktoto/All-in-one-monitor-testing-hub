@@ -1924,9 +1924,16 @@ impl App {
                 section_title(ui, "Check", Some(if running { "locked while running" } else if fixed.is_some() { "selected for this device" } else { "choose one" }));
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!running, |ui| {
-                    // Keep the primary action visible: scroll the configuration,
-                    // not the Start button (Apple HIG: consistent action location).
-                    let config_height = (ui.available_height() - 62.0).max(150.0);
+                    // On the standalone Tests page the card fills the viewport, so
+                    // the configuration scrolls while the Start button stays pinned
+                    // (Apple HIG: consistent action location). On the embedded
+                    // hardware pages the whole page already scrolls, so let the card
+                    // grow to its content instead of clipping the last control.
+                    let config_height = if fixed.is_some() {
+                        10_000.0
+                    } else {
+                        (ui.available_height() - 62.0).max(150.0)
+                    };
                     egui::ScrollArea::vertical()
                         .id_salt("stress-config")
                         .max_height(config_height)
