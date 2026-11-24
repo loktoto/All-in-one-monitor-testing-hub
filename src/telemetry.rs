@@ -319,6 +319,10 @@ pub fn spawn(
     stop: Arc<AtomicBool>,
     reset: Arc<AtomicBool>,
     interval_ms: Arc<AtomicU64>,
+    // Set while a page that lists processes is visible. Enumerating every
+    // process is the most expensive part of a sample, so it only runs on
+    // demand (with a slow background refresh to keep the list warm).
+    process_wanted: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = System::new_all();
@@ -336,6 +340,8 @@ pub fn spawn(
         let mut memory_bounds: Option<(f32, f32)> = None;
         thread::sleep(Duration::from_millis(250));
         let nvml = init_nvml();
+        let mut tick: u64 = 0;
+        let mut process_cache: Vec<Process> = Vec::new();
         while !stop.load(Ordering::Relaxed) {
             let batch_started = Instant::now();
             // Min/max survive for the session until the user clears them.
@@ -346,11 +352,28 @@ pub fn spawn(
                 memory_bounds = None;
             }
             system.refresh_cpu_all();
-            system.refresh_processes_specifics(
-                ProcessesToUpdate::All,
-                true,
-                ProcessRefreshKind::nothing().with_cpu().with_memory(),
-            );
+            // Process enumeration walks every PID and opens handles; on Windows
+            // with 300+ processes it was the most expensive part of an idle
+            // sample. Walk the table once at startup (so the first visit is
+            // instant) and afterwards only while the process page is open.
+            if process_wanted.load(Ordering::Relaxed) || tick == 0 {
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::All,
+                    true,
+                    ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                );
+                process_cache = system
+                    .processes()
+                    .iter()
+                    .map(|(pid, p)| Process {
+                        pid: pid.as_u32(),
+                        name: p.name().to_string_lossy().into_owned(),
+                        cpu_usage: p.cpu_usage(),
+                        memory: p.memory(),
+                    })
+                    .collect();
+            }
+            tick = tick.wrapping_add(1);
             system.refresh_memory();
             disks.refresh(true);
             networks.refresh(true);
@@ -541,16 +564,7 @@ pub fn spawn(
                 networks: network_list,
                 network_interval_seconds: (network_interval_seconds > 0.0)
                     .then_some(network_interval_seconds),
-                processes: system
-                    .processes()
-                    .iter()
-                    .map(|(pid, p)| Process {
-                        pid: pid.as_u32(),
-                        name: p.name().to_string_lossy().into_owned(),
-                        cpu_usage: p.cpu_usage(),
-                        memory: p.memory(),
-                    })
-                    .collect(),
+                processes: process_cache.clone(),
                 gpus,
                 adapters: adapters.clone(),
                 temperatures,

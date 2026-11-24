@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui::{self, Color32, CornerRadius, RichText, Stroke};
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotPoints};
 use hardware_hub::{
     alerts::{self, Severity, Threshold},
     frames::{self, FrameSummary},
@@ -41,7 +41,7 @@ const INPUT: Color32 = Color32::from_rgb(29, 29, 33);
 const TRACK: Color32 = Color32::from_rgb(70, 70, 77);
 const TEXT: Color32 = Color32::from_rgb(245, 245, 247);
 const TEXT_DIM: Color32 = Color32::from_rgb(176, 176, 181);
-const MUTED: Color32 = Color32::from_rgb(138, 138, 144);
+const MUTED: Color32 = Color32::from_rgb(152, 152, 158);
 const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
 const ACCENT_SOFT: Color32 = Color32::from_rgb(30, 58, 92);
 const ACCENT_INK: Color32 = Color32::from_rgb(8, 16, 28);
@@ -80,7 +80,7 @@ fn main() -> eframe::Result {
             // clipped and pushed the status bar off-screen.
             .with_maximized(true)
             .with_icon(app_icon())
-            .with_min_inner_size([720.0, 420.0]),
+            .with_min_inner_size([880.0, 560.0]),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -234,7 +234,7 @@ impl Page {
             Page::Network => "Network interfaces and operating-system traffic counters.",
             Page::Bluetooth => "Bluetooth availability and supported diagnostics.",
             Page::Details => "Specification sheet read once from local OS sources.",
-            Page::Processes => "Live CPU and memory usage by process, plus network interfaces.",
+            Page::Processes => "Live CPU and memory usage by process.",
             Page::Frames => {
                 "Inspect a saved PresentMon capture; no live game capture is performed."
             }
@@ -300,6 +300,9 @@ struct App {
     page: Page,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
     specs: Arc<Mutex<Option<Arc<SystemSpecs>>>>,
+    /// Set while the Processes page is visible, so the sampler only walks every
+    /// PID when the list is actually on screen.
+    process_wanted: Arc<AtomicBool>,
     /// True once the background inventory refresh has finished; until then the
     /// shown specs may come from the on-disk cache.
     specs_refreshed: Arc<AtomicBool>,
@@ -402,11 +405,13 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         let stats_reset = Arc::new(AtomicBool::new(false));
         let poll_ms = Arc::new(AtomicU64::new(settings.poll_ms.clamp(250, 5000)));
+        let process_wanted = Arc::new(AtomicBool::new(false));
         telemetry::spawn(
             snapshot.clone(),
             stop.clone(),
             stats_reset.clone(),
             poll_ms.clone(),
+            Arc::clone(&process_wanted),
         );
         // The inventory shells out to local tools once, so it must not block the
         // first frame. The previous result is loaded from disk immediately, then
@@ -438,6 +443,7 @@ impl App {
         Self {
             page: start_page,
             snapshot,
+            process_wanted,
             specs,
             specs_refreshed,
             inventory_cached_at,
@@ -721,6 +727,9 @@ impl App {
                     });
                 });
                 ui.add_space(24.0);
+                // On a short window the two footer lines would eat the space the
+                // page list needs, so they are dropped below this threshold.
+                let show_footer_lines = ui.available_height() > 470.0;
                 // Pin the footer and the controls to the bottom first, so the
                 // page list receives exactly the remaining height. A fixed
                 // reserve previously pushed eight pages below the fold and let
@@ -745,18 +754,20 @@ impl App {
                         // One compact line: local-only reassurance plus the
                         // graphics provider, so the footer never crowds the
                         // taskbar when a run adds status rows above it.
-                        let backend = if s.adapters.is_empty() {
-                            "local readings only".to_string()
-                        } else {
-                            format!("local only · wgpu · {}", s.gpu_backend)
-                        };
-                        ui.label(RichText::new(backend).size(10.0).color(MUTED));
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("⌘/Ctrl 1–9 pages · Shift 1–6 more · Esc stop")
-                                .size(10.0)
-                                .color(MUTED),
-                        );
+                        if show_footer_lines {
+                            let backend = if s.adapters.is_empty() {
+                                "local readings only".to_string()
+                            } else {
+                                format!("local only · wgpu · {}", s.gpu_backend)
+                            };
+                            ui.label(RichText::new(backend).size(10.0).color(MUTED));
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("⌘/Ctrl 1–9 pages · Shift 1–6 more · Esc stop")
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        }
                         ui.add_space(12.0);
                     });
                 egui::TopBottomPanel::bottom("nav-controls")
@@ -864,7 +875,7 @@ impl App {
 
     // ------------------------------------------------------------- overview
     fn overview(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        let specs = self.specs.lock().ok().and_then(|held| (*held).clone());
+        let specs: Option<Arc<SystemSpecs>> = self.specs.lock().ok().and_then(|held| held.clone());
         if !s.ready {
             card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1055,7 +1066,11 @@ impl App {
                     if ghost_button(ui, "Reset").clicked() {
                         self.history.clear();
                     }
+                    legend_dot(ui, "Memory %", VIOLET);
+                    ui.add_space(10.0);
+                    legend_dot(ui, "CPU %", ACCENT);
                     if let (Some((lo, hi, _)), Some((mem_lo, mem_hi, _))) = (history::range(&self.history, |v| v.cpu), history::range(&self.history, |v| v.memory)) {
+                        ui.add_space(14.0);
                         ui.label(RichText::new(format!("CPU {lo:.0}–{hi:.0}%  ·  MEM {mem_lo:.0}–{mem_hi:.0}%")).size(10.5).color(MUTED));
                     }
                 });
@@ -1074,7 +1089,6 @@ impl App {
             } else {
                 Plot::new("history")
                     .height(158.0)
-                    .legend(Legend::default())
                     .include_y(0.0)
                     .include_y(100.0)
                     .auto_bounds([true, true])
@@ -1368,7 +1382,7 @@ impl App {
     }
 
     fn hardware_page(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        let specs = self.specs.lock().ok().and_then(|held| (*held).clone());
+        let specs: Option<Arc<SystemSpecs>> = self.specs.lock().ok().and_then(|held| held.clone());
         let page = self.page;
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2083,29 +2097,9 @@ impl App {
                 ui.add_space(8.0);
                 let mut start_clicked = false;
                 ui.add_enabled_ui(!running, |ui| {
-                    // On the standalone Tests page the card fills the viewport, so
-                    // the configuration scrolls while the Start button stays pinned
-                    // (Apple HIG: consistent action location). A bottom panel
-                    // reserves the button's exact height, so the card always ends
-                    // flush with the viewport instead of being clipped.
-                    if fixed.is_none() {
-                        egui::TopBottomPanel::bottom("stress-start-bar")
-                            .frame(egui::Frame::NONE)
-                            .show_inside(ui, |ui| {
-                                ui.add_space(6.0);
-                                start_clicked =
-                                    primary_button(ui, "Start test", true, 34.0).clicked();
-                            });
-                    }
-                    egui::ScrollArea::vertical()
-                        .id_salt("stress-config")
-                        .max_height(if fixed.is_some() {
-                            f32::INFINITY
-                        } else {
-                            ui.available_height()
-                        })
-                        .auto_shrink([false, fixed.is_some()])
-                        .show(ui, |ui| {
+                    // The configuration itself: tiles (standalone only), the
+                    // selected check's limits and the duration controls.
+                    let mut content = |ui: &mut egui::Ui| {
                     if fixed.is_none() {
                     for pair in KINDS.chunks(2) {
                         ui.columns(2, |tiles| {
@@ -2258,8 +2252,45 @@ impl App {
                     duration_presets(ui, &mut self.seconds);
                     ui.add_space(4.0);
                     ui.add(egui::Slider::new(&mut self.seconds, 1..=600).text("max seconds"));
-                        });
-                    if fixed.is_some() {
+                    };
+                    if fixed.is_none() {
+                        // Fill the column exactly: the pinned action bar sits at
+                        // the bottom of this region, so the card ends flush with
+                        // the viewport instead of hanging past it.
+                        let target = egui::vec2(
+                            ui.available_width(),
+                            (ui.available_height() - 16.0).max(160.0),
+                        );
+                        ui.allocate_ui_with_layout(
+                            target,
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_size(target);
+                                egui::TopBottomPanel::bottom("stress-start-bar")
+                                    .frame(egui::Frame::NONE)
+                                    .show_inside(ui, |ui| {
+                                        ui.add_space(6.0);
+                                        start_clicked = primary_button(
+                                            ui,
+                                            "Start test",
+                                            true,
+                                            34.0,
+                                        )
+                                        .clicked();
+                                    });
+                                egui::ScrollArea::vertical()
+                                    .id_salt("stress-config")
+                                    .max_height(ui.available_height())
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| content(ui));
+                            },
+                        );
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .id_salt("stress-config-embedded")
+                            .max_height(f32::INFINITY)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| content(ui));
                         ui.add_space(6.0);
                         start_clicked = primary_button(ui, "Start test", true, 34.0).clicked();
                     }
@@ -2374,7 +2405,7 @@ impl App {
                             .desired_height(8.0),
                     );
                     ui.add_space(14.0);
-                    ui.label(RichText::new("WORK PROGRESS").size(9.5).strong().color(MUTED));
+                    ui.label(RichText::new("WORK PROGRESS").size(10.0).strong().color(MUTED));
                     ui.add_space(4.0);
                     {
                         let live = self.state.lock().ok().map(|s| s.live.clone()).unwrap_or_default();
@@ -2432,7 +2463,7 @@ impl App {
                         });
                     }
                     ui.add_space(12.0);
-                    ui.label(RichText::new("LIVE READINGS").size(9.5).strong().color(MUTED));
+                    ui.label(RichText::new("LIVE READINGS").size(10.0).strong().color(MUTED));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("CPU").size(11.0).color(MUTED));
@@ -2591,7 +2622,7 @@ impl App {
     // CPU-Z-style specification sheet: identity, caches, memory modules, adapter
     // driver details and CrystalDiskInfo-style drive health, from local sources.
     fn details(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        let specs = self.specs.lock().ok().and_then(|held| (*held).clone());
+        let specs: Option<Arc<SystemSpecs>> = self.specs.lock().ok().and_then(|held| held.clone());
         let Some(specs) = specs else {
             card_frame().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -3026,35 +3057,8 @@ impl App {
 
     // -------------------------------------------------------------- reports
     fn processes(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_title(
-                ui,
-                "Network interfaces",
-                Some("average since previous refresh"),
-            );
-            ui.add_space(8.0);
-            if s.networks.is_empty() {
-                ui.weak("No interfaces reported.");
-            }
-            for n in &s.networks {
-                let rate = |bytes: u64| match (bytes, s.network_interval_seconds) {
-                    (0, _) => "0 or unavailable".to_owned(),
-                    (_, Some(seconds)) if seconds > 0.0 => {
-                        format!("{:.1} KiB/s", bytes as f64 / seconds / 1024.0)
-                    }
-                    _ => "unavailable".into(),
-                };
-                ui.label(format!(
-                    "{}  ·  received {}  ·  sent {}",
-                    n.name,
-                    rate(n.received),
-                    rate(n.transmitted)
-                ));
-            }
-            ui.weak("OS counters may include virtual interfaces; zero can also mean unavailable.");
-        });
-        ui.add_space(12.0);
+        // Interface counters live on the Network page; repeating them here only
+        // pushed the process table below the fold.
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "Processes", Some("OS-reported"));
@@ -3640,6 +3644,9 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        // Only the process page needs a full PID walk every second.
+        self.process_wanted
+            .store(self.page == Page::Processes, Ordering::Relaxed);
         // Detect a page change once and start the enter transition.
         if self.last_page != self.page {
             self.last_page = self.page;
@@ -3961,10 +3968,14 @@ impl eframe::App for App {
         // While the window is focused the monitor needs a few redraws per second
         // for fresh readings. In the background telemetry keeps sampling but the
         // interface redraws once a second, which keeps idle CPU cost low.
-        let period = if ctx.input(|input| input.viewport().focused.unwrap_or(true)) {
-            Duration::from_millis(250)
-        } else {
-            Duration::from_millis(1000)
+        // Readings arrive once a second, so idle pages only need two frames per
+        // second; a running check and its progress readout get four. egui still
+        // animates hover and page transitions at full rate while they happen.
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
+        let period = match (focused, running || self.page == Page::Tests) {
+            (false, _) => Duration::from_millis(1000),
+            (true, true) => Duration::from_millis(250),
+            (true, false) => Duration::from_millis(500),
         };
         ctx.request_repaint_after(period);
     }
@@ -4352,6 +4363,28 @@ fn segmented<T: PartialEq + Copy>(
     changed
 }
 
+/// Inline legend: a colour dot plus a quiet label, so the chart itself needs
+/// no floating legend box over the data.
+fn legend_dot(ui: &mut egui::Ui, label: &str, color: Color32) {
+    let galley = ui.fonts(|fonts| {
+        fonts.layout_no_wrap(label.to_owned(), egui::FontId::proportional(10.5), TEXT_DIM)
+    });
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 17.0, 16.0),
+        egui::Sense::hover(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    painter.circle_filled(egui::pos2(rect.left() + 4.0, rect.center().y), 3.2, color);
+    painter.galley(
+        egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        TEXT_DIM,
+    );
+}
+
 /// Small keycap used in the shortcut sheet and status bar hints.
 fn keycap(ui: &mut egui::Ui, text: &str) {
     let font = egui::FontId::proportional(10.5);
@@ -4519,7 +4552,7 @@ fn sensor_table(ui: &mut egui::Ui, id: &str, heading: &str, rows: Vec<RowView<'_
         let right = header.right();
         {
             let painter = ui.painter();
-            let font = egui::FontId::proportional(9.5);
+            let font = egui::FontId::proportional(10.0);
             painter.text(
                 egui::pos2(header.left() + 6.0, header.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -4609,7 +4642,7 @@ fn driver_table(ui: &mut egui::Ui, drivers: &[&specs::DriverSpec]) {
     let (header, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
     if ui.is_rect_visible(header) {
         let painter = ui.painter();
-        let font = egui::FontId::proportional(9.5);
+        let font = egui::FontId::proportional(10.0);
         painter.text(
             egui::pos2(header.left() + 8.0, header.center().y),
             egui::Align2::LEFT_CENTER,
@@ -4742,7 +4775,7 @@ fn process_table(ui: &mut egui::Ui, processes: &[&telemetry::Process]) {
     let (header, _) = ui.allocate_exact_size(egui::vec2(width, header_h), egui::Sense::hover());
     if ui.is_rect_visible(header) {
         let painter = ui.painter();
-        let font = egui::FontId::proportional(9.5);
+        let font = egui::FontId::proportional(10.0);
         painter.text(
             egui::pos2(header.left() + 8.0, header.center().y),
             egui::Align2::LEFT_CENTER,
@@ -5356,20 +5389,20 @@ fn kind_tile(ui: &mut egui::Ui, selected: bool, title: &str, hint: &str) -> egui
             ),
             egui::StrokeKind::Inside,
         );
-        painter.text(
-            rect.left_top() + egui::vec2(12.0, 10.0),
-            egui::Align2::LEFT_TOP,
+        let title_galley = elided(
+            ui,
             title,
-            egui::FontId::proportional(12.5),
+            12.5,
+            if selected { TEXT } else { TEXT_DIM },
+            width - 22.0,
+        );
+        painter.galley(
+            rect.left_top() + egui::vec2(12.0, 10.0),
+            title_galley,
             if selected { TEXT } else { TEXT_DIM },
         );
-        painter.text(
-            rect.left_top() + egui::vec2(12.0, 29.0),
-            egui::Align2::LEFT_TOP,
-            hint,
-            egui::FontId::proportional(10.0),
-            MUTED,
-        );
+        let hint_galley = elided(ui, hint, 10.0, MUTED, width - 24.0);
+        painter.galley(rect.left_top() + egui::vec2(12.0, 29.0), hint_galley, MUTED);
         if selected {
             painter.circle_filled(
                 egui::pos2(rect.right() - 13.0, rect.top() + 13.0),
@@ -5406,7 +5439,23 @@ fn metric(
             ui.label(RichText::new(label).size(10.5).strong().color(MUTED));
         });
         ui.add_space(10.0);
-        ui.label(RichText::new(value).size(27.0).strong().color(TEXT));
+        // Shrink the headline figure until it fits the card, so a narrow window
+        // never wraps "19.0 / 28.8 GiB" over three lines and out of the card.
+        let avail = ui.available_width();
+        let mut size = 27.0_f32;
+        while size > 17.0 {
+            let width = ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(value.to_owned(), egui::FontId::proportional(size), TEXT)
+                    .size()
+                    .x
+            });
+            if width <= avail {
+                break;
+            }
+            size -= 1.0;
+        }
+        ui.add(egui::Label::new(RichText::new(value).size(size).strong().color(TEXT)).truncate());
         ui.add_space(9.0);
         match fraction {
             Some(f) => bar(ui, label, f, accent, 6.0),
@@ -5530,11 +5579,11 @@ fn tint(color: Color32) -> Color32 {
 
 /// Compact label/value pair used by the overview status band.
 fn stat(ui: &mut egui::Ui, label: &str, value: &str, color: Color32, hint: &str) {
-    ui.label(RichText::new(label).size(9.5).strong().color(MUTED));
+    ui.label(RichText::new(label).size(10.0).strong().color(MUTED));
     ui.add_space(4.0);
     ui.add(egui::Label::new(RichText::new(value).size(15.0).strong().color(color)).truncate());
     ui.add_space(2.0);
-    ui.label(RichText::new(hint).size(9.5).color(MUTED));
+    ui.label(RichText::new(hint).size(10.0).color(MUTED));
 }
 
 fn load_color(fraction: f32) -> Color32 {

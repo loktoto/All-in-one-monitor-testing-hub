@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stop.clone(),
         reset.clone(),
         interval.clone(),
+        Arc::new(AtomicBool::new(true)),
     );
     let until = Instant::now() + Duration::from_secs(20);
     while !snapshot.lock().unwrap().ready && Instant::now() < until {
