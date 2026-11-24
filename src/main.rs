@@ -8,7 +8,7 @@ use hardware_hub::{
     logging::Recorder,
     netcheck::{self, State as NetworkCheckState},
     report::{self, Format},
-    settings::Settings,
+    settings::{OverviewOpen, Settings},
     smart::{self, SmartReport},
     specs::{self, SystemSpecs},
     stress::{
@@ -303,6 +303,9 @@ struct App {
     /// Set while the Processes page is visible, so the sampler only walks every
     /// PID when the list is actually on screen.
     process_wanted: Arc<AtomicBool>,
+    /// Expanded/collapsed state of the Overview sections, persisted with the
+    /// rest of the settings.
+    overview: OverviewOpen,
     /// True once the background inventory refresh has finished; until then the
     /// shown specs may come from the on-disk cache.
     specs_refreshed: Arc<AtomicBool>,
@@ -443,6 +446,7 @@ impl App {
         Self {
             page: start_page,
             snapshot,
+            overview: settings.overview.clone(),
             process_wanted,
             specs,
             specs_refreshed,
@@ -561,6 +565,7 @@ impl App {
             log_path: self.log_path.clone(),
             sensor_log_path: self.sensor_log_path.clone(),
             report: self.report.clone(),
+            overview: self.overview.clone(),
         };
         if let Err(error) = settings.save() {
             self.message = format!("Could not save settings: {error}");
@@ -1060,24 +1065,29 @@ impl App {
         // ---------------------------------------------------------- live chart
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                section_title(ui, "Recent activity", Some("up to 60 samples"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut open = self.overview.activity;
+            let toggled = collapsible_header(
+                ui,
+                "Recent activity",
+                Some("up to 60 samples"),
+                open,
+                |ui| {
                     if ghost_button(ui, "Reset").clicked() {
                         self.history.clear();
                     }
                     legend_dot(ui, "Memory %", VIOLET);
                     ui.add_space(10.0);
                     legend_dot(ui, "CPU %", ACCENT);
-                    if let (Some((lo, hi, _)), Some((mem_lo, mem_hi, _))) = (history::range(&self.history, |v| v.cpu), history::range(&self.history, |v| v.memory)) {
-                        ui.add_space(14.0);
-                        ui.label(RichText::new(format!("CPU {lo:.0}–{hi:.0}%  ·  MEM {mem_lo:.0}–{mem_hi:.0}%")).size(10.5).color(MUTED));
-                    }
-                });
-            });
+                },
+            );
+            if toggled {
+                open = !open;
+                self.overview.activity = open;
+            }
+            if open {
             ui.add_space(6.0);
             if self.history.is_empty() {
-                ui.allocate_ui(egui::vec2(ui.available_width(), 150.0), |ui| {
+                ui.allocate_ui(egui::vec2(ui.available_width(), 130.0), |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new("Waiting for the first samples…")
@@ -1088,7 +1098,7 @@ impl App {
                 });
             } else {
                 Plot::new("history")
-                    .height(158.0)
+                    .height(132.0)
                     .include_y(0.0)
                     .include_y(100.0)
                     .auto_bounds([true, true])
@@ -1106,41 +1116,19 @@ impl App {
                             p.line(Line::new(PlotPoints::from(points)).name(if i == 0 { "Memory %" } else { "" }).color(VIOLET).width(1.8_f32));
                         }
                     });
-                ui.weak("Gaps indicate missing or delayed samples. Statistics cover the retained window.");
-                egui::CollapsingHeader::new("Record session to CSV").show(ui, |ui| {
-                    ui.weak("Optional local log: CPU, memory, temperature and fan readings, with sensor keys. No process names are recorded. A new file is required; logging stops at 1,000,000 rows.");
-                    let active = self.recorder.as_ref().is_some_and(|r| r.active());
-                    let finishing = self.recorder.as_ref().is_some_and(|r| !r.active() && !r.status().closed);
-                    ui.horizontal_wrapped(|ui| {
-                        text_field_enabled(ui, !active && !finishing, &mut self.log_path, "CSV path for a new log", 330.0);
-                        if ui.add_enabled(!active && !finishing, egui::Button::new("Start recording")).clicked() {
-                            match Recorder::start(std::path::Path::new(&self.log_path)) {
-                                Ok(recorder) => { self.recorder = Some(recorder); self.message = format!("Recording to {}", self.log_path); }
-                                Err(error) => self.message = format!("Recording failed: {error}"),
-                            }
-                        }
-                        if active && ghost_button(ui, "Stop recording").clicked() { if let Some(r) = &mut self.recorder { r.stop(); } }
-                    });
-                    if let Some(recorder) = &self.recorder {
-                        let status = recorder.status();
-                        let state = if recorder.active() { "Recording" } else if status.closed { "Stopped" } else { "Finishing" };
-                        ui.label(format!("{state} · {} batches written · {} dropped", status.batches, status.dropped));
-                        if let Some(error) = status.error { ui.colored_label(AMBER, format!("Recording error: {error}")); }
-                    }
-                    ui.weak("Times are when the app recorded each batch, not individual sensor timestamps. Disk errors or forced termination may leave a partial file.");
-                });
-                egui::CollapsingHeader::new("Export recent history").show(ui, |ui| {
-                    ui.weak("CSV contains up to 60 samples, with elapsed seconds since launch. Missing values are blank; existing files are never overwritten.");
-                    ui.horizontal(|ui| {
-                        text_field(ui, &mut self.history_path, "CSV path", 330.0);
-                        if ghost_button(ui, "Export CSV").clicked() {
-                            self.message = match history::export_csv(std::path::Path::new(&self.history_path), &self.history, self.started) {
-                                Ok(()) => format!("Saved {}", self.history_path),
-                                Err(e) => format!("Export failed: {e}"),
-                            };
-                        }
-                    });
-                });
+                let window_range = match (
+                    history::range(&self.history, |v| v.cpu),
+                    history::range(&self.history, |v| v.memory),
+                ) {
+                    (Some((lo, hi, _)), Some((mem_lo, mem_hi, _))) => format!(
+                        "CPU {lo:.0}–{hi:.0}% · MEM {mem_lo:.0}–{mem_hi:.0}% over the retained window. "
+                    ),
+                    _ => String::new(),
+                };
+                ui.weak(format!(
+                    "{window_range}Gaps indicate missing or delayed samples."
+                ));
+            }
             }
         });
 
@@ -1149,30 +1137,42 @@ impl App {
         // ------------------------------------------------------------ core grid
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(
-                ui,
-                "Per-core load",
-                Some(&format!("{} logical cores", s.cores.len())),
-            );
-            ui.add_space(4.0);
-            if s.cores.is_empty() {
-                empty_note(ui, "This provider does not report per-core usage.");
-            } else {
-                let width = ui.available_width();
-                let columns = ((width / 190.0).floor() as usize).clamp(1, 6);
-                let cell = ((width - 10.0 * columns.saturating_sub(1) as f32) / columns as f32)
-                    .clamp(120.0, 180.0);
-                egui::Grid::new("cores")
-                    .num_columns(columns)
-                    .spacing([10.0, 6.0])
-                    .show(ui, |ui| {
-                        for (i, usage) in s.cores.iter().enumerate() {
-                            core_meter(ui, i, *usage, cell);
-                            if (i + 1) % columns == 0 {
-                                ui.end_row();
+            let cores_hint = format!("{} logical cores", s.cores.len());
+            let mut open = self.overview.cores;
+            if collapsible_header(ui, "Per-core load", Some(cores_hint.as_str()), open, |ui| {
+                if s.cores.is_empty() {
+                    return;
+                }
+                ui.label(
+                    RichText::new(format!("{:.0}% average", s.cpu_usage))
+                        .size(10.5)
+                        .color(load_color(s.cpu_usage / 100.0)),
+                );
+            }) {
+                open = !open;
+                self.overview.cores = open;
+            }
+            if open {
+                ui.add_space(6.0);
+                if s.cores.is_empty() {
+                    empty_note(ui, "This provider does not report per-core usage.");
+                } else {
+                    let width = ui.available_width();
+                    let columns = ((width / 190.0).floor() as usize).clamp(1, 6);
+                    let cell = ((width - 10.0 * columns.saturating_sub(1) as f32) / columns as f32)
+                        .clamp(120.0, 180.0);
+                    egui::Grid::new("cores")
+                        .num_columns(columns)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            for (i, usage) in s.cores.iter().enumerate() {
+                                core_meter(ui, i, *usage, cell);
+                                if (i + 1) % columns == 0 {
+                                    ui.end_row();
+                                }
                             }
-                        }
-                    });
+                        });
+                }
             }
         });
 
@@ -1181,22 +1181,48 @@ impl App {
         // ------------------------------------------------------------- sensors
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                section_title(
-                    ui,
-                    "Sensors",
-                    Some(&format!(
-                        "{} temperatures · {} fans · min/max since launch",
-                        s.temperatures.len(),
-                        s.fans.len()
-                    )),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let sensors_hint = format!(
+                "{} {} · {} {} · min/max since launch",
+                s.temperatures.len(),
+                if s.temperatures.len() == 1 {
+                    "temperature"
+                } else {
+                    "temperatures"
+                },
+                s.fans.len(),
+                if s.fans.len() == 1 { "fan" } else { "fans" },
+            );
+            let mut open = self.overview.sensors;
+            if collapsible_header(
+                ui,
+                "Sensors",
+                Some(sensors_hint.as_str()),
+                open,
+                |ui| {
                     if ghost_button(ui, "Reset min/max").clicked() {
                         self.stats_reset.store(true, Ordering::Relaxed);
                     }
-                });
-            });
+                    if let Some(peak) = s
+                        .temperatures
+                        .iter()
+                        .filter_map(|t| t.celsius)
+                        .fold(None::<f32>, |peak, v| {
+                            Some(peak.map_or(v, |p: f32| p.max(v)))
+                        })
+                    {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("{peak:.0} °C peak"))
+                                .size(10.5)
+                                .color(temperature_color(peak)),
+                        );
+                    }
+                },
+            ) {
+                open = !open;
+                self.overview.sensors = open;
+            }
+            if open {
             ui.add_space(8.0);
             if s.temperatures.is_empty() && s.fans.is_empty() {
                 empty_note(ui, sensor_unavailable_note());
@@ -1249,6 +1275,7 @@ impl App {
                 .size(10.0)
                 .color(MUTED),
             );
+            }
         });
 
         ui.add_space(12.0);
@@ -1256,27 +1283,41 @@ impl App {
         // -------------------------------------------------------------- devices
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(
+            let mut open = self.overview.graphics;
+            if collapsible_header(
                 ui,
-                "Graphics adapters and sensor sources",
-                Some("Sources may overlap; mappings are not verified"),
-            );
-            ui.add_space(6.0);
-            if s.gpus.is_empty() {
-                empty_note(
-                    ui,
-                    "No adapter detected, or graphics discovery is unavailable.",
-                );
+                "Graphics adapters",
+                Some("sensor sources · mappings not verified"),
+                open,
+                |ui| {
+                    ui.label(
+                        RichText::new(format!("{} reported", s.gpus.len()))
+                            .size(10.5)
+                            .color(MUTED),
+                    );
+                },
+            ) {
+                open = !open;
+                self.overview.graphics = open;
             }
-            for g in &s.gpus {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&g.name).strong().color(TEXT).size(12.5));
-                    if g.detail.contains("software") {
-                        chip(ui, "SOFTWARE", AMBER);
-                    }
-                });
-                ui.label(RichText::new(&g.detail).size(11.0).color(MUTED));
+            if open {
                 ui.add_space(6.0);
+                if s.gpus.is_empty() {
+                    empty_note(
+                        ui,
+                        "No adapter detected, or graphics discovery is unavailable.",
+                    );
+                }
+                for g in &s.gpus {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&g.name).strong().color(TEXT).size(12.5));
+                        if g.detail.contains("software") {
+                            chip(ui, "SOFTWARE", AMBER);
+                        }
+                    });
+                    ui.label(RichText::new(&g.detail).size(11.0).color(MUTED));
+                    ui.add_space(6.0);
+                }
             }
         });
 
@@ -1284,7 +1325,34 @@ impl App {
 
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(ui, "Storage volumes", Some("volume capacity, not physical drives"));
+            let mut open = self.overview.storage;
+            if collapsible_header(
+                ui,
+                "Storage volumes",
+                Some("volume capacity, not physical drives"),
+                open,
+                |ui| {
+                    let fullest = s
+                        .disks
+                        .iter()
+                        .filter(|d| d.total > 0)
+                        .map(|d| {
+                            (d.total.saturating_sub(d.available)) as f32 / d.total as f32
+                        })
+                        .fold(0.0_f32, f32::max);
+                    if !s.disks.is_empty() {
+                        ui.label(
+                            RichText::new(format!("{:.0}% used", fullest * 100.0))
+                                .size(10.5)
+                                .color(if fullest > 0.9 { AMBER } else { MUTED }),
+                        );
+                    }
+                },
+            ) {
+                open = !open;
+                self.overview.storage = open;
+            }
+            if open {
             ui.add_space(6.0);
             if s.disks.is_empty() {
                 empty_note(ui, "No volumes available.");
@@ -1364,6 +1432,75 @@ impl App {
                     });
                 });
                 ui.add_space(8.0);
+            }
+            }
+        });
+
+        ui.add_space(10.0);
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut open = self.overview.log;
+            if collapsible_header(
+                ui,
+                "Session log and export",
+                Some("local CSV files · nothing is uploaded"),
+                open,
+                |_| {},
+            ) {
+                open = !open;
+                self.overview.log = open;
+            }
+            if open {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("Record session to CSV")
+                        .size(11.5)
+                        .strong()
+                        .color(TEXT_DIM),
+                );
+                ui.add_space(4.0);
+                {
+                    ui.weak("Optional local log: CPU, memory, temperature and fan readings, with sensor keys. No process names are recorded. A new file is required; logging stops at 1,000,000 rows.");
+                    let active = self.recorder.as_ref().is_some_and(|r| r.active());
+                    let finishing = self.recorder.as_ref().is_some_and(|r| !r.active() && !r.status().closed);
+                    ui.horizontal_wrapped(|ui| {
+                        text_field_enabled(ui, !active && !finishing, &mut self.log_path, "CSV path for a new log", 330.0);
+                        if ui.add_enabled(!active && !finishing, egui::Button::new("Start recording")).clicked() {
+                            match Recorder::start(std::path::Path::new(&self.log_path)) {
+                                Ok(recorder) => { self.recorder = Some(recorder); self.message = format!("Recording to {}", self.log_path); }
+                                Err(error) => self.message = format!("Recording failed: {error}"),
+                            }
+                        }
+                        if active && ghost_button(ui, "Stop recording").clicked() { if let Some(r) = &mut self.recorder { r.stop(); } }
+                    });
+                    if let Some(recorder) = &self.recorder {
+                        let status = recorder.status();
+                        let state = if recorder.active() { "Recording" } else if status.closed { "Stopped" } else { "Finishing" };
+                        ui.label(format!("{state} · {} batches written · {} dropped", status.batches, status.dropped));
+                        if let Some(error) = status.error { ui.colored_label(AMBER, format!("Recording error: {error}")); }
+                    }
+                    ui.weak("Times are when the app recorded each batch, not individual sensor timestamps. Disk errors or forced termination may leave a partial file.");
+                }
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Export recent history")
+                        .size(11.5)
+                        .strong()
+                        .color(TEXT_DIM),
+                );
+                ui.add_space(4.0);
+                {
+                    ui.weak("CSV contains up to 60 samples, with elapsed seconds since launch. Missing values are blank; existing files are never overwritten.");
+                    ui.horizontal(|ui| {
+                        text_field(ui, &mut self.history_path, "CSV path", 330.0);
+                        if ghost_button(ui, "Export CSV").clicked() {
+                            self.message = match history::export_csv(std::path::Path::new(&self.history_path), &self.history, self.started) {
+                                Ok(()) => format!("Saved {}", self.history_path),
+                                Err(e) => format!("Export failed: {e}"),
+                            };
+                        }
+                    });
+                }
             }
         });
 
@@ -4940,6 +5077,63 @@ fn decimal_bytes(v: u64) -> String {
     }
 }
 
+/// Disclosure chevron for a collapsible card header.
+fn chevron(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let c = rect.center();
+        let color = if response.hovered() { TEXT } else { MUTED };
+        let points = if open {
+            vec![
+                c + egui::vec2(-4.0, -2.0),
+                c + egui::vec2(4.0, -2.0),
+                c + egui::vec2(0.0, 2.6),
+            ]
+        } else {
+            vec![
+                c + egui::vec2(-2.0, -4.0),
+                c + egui::vec2(2.6, 0.0),
+                c + egui::vec2(-2.0, 4.0),
+            ]
+        };
+        ui.painter()
+            .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Card header that folds its body away. Clicking the chevron, the title or the
+/// hint toggles it; `right` draws optional controls (reset buttons, legends) at
+/// the far end of the same row. Returns true when the state was toggled.
+fn collapsible_header(
+    ui: &mut egui::Ui,
+    title: &str,
+    hint: Option<&str>,
+    open: bool,
+    right: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut toggled = false;
+    ui.horizontal(|ui| {
+        toggled |= chevron(ui, open).clicked();
+        let title = ui.add(
+            egui::Label::new(RichText::new(title).size(13.0).strong().color(TEXT))
+                .sense(egui::Sense::click()),
+        );
+        toggled |= title.clicked();
+        if let Some(hint) = hint {
+            let hint = ui.add(
+                egui::Label::new(RichText::new(hint).size(10.5).color(MUTED))
+                    .sense(egui::Sense::click()),
+            );
+            toggled |= hint.clicked();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right(ui);
+        });
+    });
+    toggled
+}
+
 fn section_title(ui: &mut egui::Ui, title: &str, hint: Option<&str>) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).size(13.0).strong().color(TEXT));
@@ -5427,7 +5621,7 @@ fn metric(
 ) {
     card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.set_min_height(142.0);
+        ui.set_min_height(122.0);
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
             if ui.is_rect_visible(rect) {
@@ -5438,11 +5632,11 @@ fn metric(
             ui.add_space(2.0);
             ui.label(RichText::new(label).size(10.5).strong().color(MUTED));
         });
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         // Shrink the headline figure until it fits the card, so a narrow window
         // never wraps "19.0 / 28.8 GiB" over three lines and out of the card.
         let avail = ui.available_width();
-        let mut size = 27.0_f32;
+        let mut size = 25.0_f32;
         while size > 17.0 {
             let width = ui.fonts(|fonts| {
                 fonts
@@ -5462,7 +5656,7 @@ fn metric(
             // No meaningful ratio: keep the caption baseline without faking 0%.
             None => ui.add_space(6.0),
         }
-        ui.add_space(9.0);
+        ui.add_space(7.0);
         ui.add(egui::Label::new(RichText::new(footnote).size(10.5).color(MUTED)).truncate());
     });
 }

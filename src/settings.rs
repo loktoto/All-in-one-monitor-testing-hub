@@ -9,6 +9,35 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Which Overview sections are expanded. Every section can be folded away so a
+/// smaller window can show the parts a person actually watches.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct OverviewOpen {
+    pub activity: bool,
+    pub cores: bool,
+    pub sensors: bool,
+    pub graphics: bool,
+    pub storage: bool,
+    pub log: bool,
+}
+
+impl Default for OverviewOpen {
+    fn default() -> Self {
+        Self {
+            // The first screen shows the live picture: load, the chart and the
+            // sensor table. Detail lists start folded but still show a summary
+            // on their header, so nothing is hidden without a hint.
+            activity: true,
+            cores: false,
+            sensors: true,
+            graphics: false,
+            storage: false,
+            log: false,
+        }
+    }
+}
+
 /// Everything worth remembering between runs. Kept deliberately small and
 /// scalar so it can never hold a value that would be unsafe to restore.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -39,6 +68,8 @@ pub struct Settings {
     pub log_path: String,
     pub sensor_log_path: String,
     pub report: String,
+    /// Expanded/collapsed state of the Overview cards.
+    pub overview: OverviewOpen,
 }
 
 impl Default for Settings {
@@ -60,6 +91,7 @@ impl Default for Settings {
             log_path: "hardware-hub-session.csv".into(),
             sensor_log_path: "hardware-hub-sensor.csv".into(),
             report: "hardware-hub-report.txt".into(),
+            overview: OverviewOpen::default(),
         }
     }
 }
