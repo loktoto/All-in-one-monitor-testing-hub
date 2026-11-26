@@ -13,7 +13,7 @@ use hardware_hub::{
     history::History,
     specs::{DriverSpec, MemoryProfile},
     stress::{Config, ErrorDetail, Kind, RunMode},
-    telemetry::{Process, Snapshot},
+    telemetry::{Fan, Process, Snapshot, Temperature},
 };
 use std::{f32::consts::TAU, sync::Arc};
 
@@ -628,6 +628,8 @@ pub fn liquid_core_grid(ui: &mut egui::Ui, id_prefix: &str, snapshot: &Snapshot,
     let has_core_temperature = snapshot.core_celsius.iter().any(Option::is_some);
     let description = if has_core_temperature {
         "Load by logical processor. Threads on the same physical core share its temperature."
+    } else if snapshot.temperatures.iter().any(|sensor| sensor.cpu_core) {
+        "Load by logical processor. Measured CPU core temperatures are listed in the sensor table."
     } else if snapshot
         .temperatures
         .iter()
@@ -1136,7 +1138,38 @@ pub struct RowView<'a> {
     pub current: Option<f32>,
     pub min: Option<f32>,
     pub max: Option<f32>,
+    pub average: Option<f32>,
     pub unit: &'a str,
+}
+
+impl<'a> From<&'a Temperature> for RowView<'a> {
+    fn from(sensor: &'a Temperature) -> Self {
+        Self {
+            label: &sensor.label,
+            key: &sensor.key,
+            source: sensor.source,
+            current: sensor.celsius,
+            min: sensor.min,
+            max: sensor.max,
+            average: sensor.average,
+            unit: "°C",
+        }
+    }
+}
+
+impl<'a> From<&'a Fan> for RowView<'a> {
+    fn from(sensor: &'a Fan) -> Self {
+        Self {
+            label: &sensor.label,
+            key: &sensor.key,
+            source: sensor.source,
+            current: sensor.rpm,
+            min: sensor.min,
+            max: sensor.max,
+            average: None,
+            unit: "RPM",
+        }
+    }
 }
 
 pub struct SensorTableOutcome {
@@ -1165,12 +1198,16 @@ pub fn sensor_table(
         ui.add_space(4.0);
     }
     ui.push_id(id, |ui| {
-        let width = ui.available_width().max(260.0);
-        let show_range_bar = width >= 430.0;
-        let show_minmax = width >= 330.0;
+        let large_table = rows.len() > 18;
+        let width = (ui.available_width() - if large_table { 12.0 } else { 0.0 }).max(260.0);
+        let show_range_bar = width >= 460.0;
+        let show_minmax = width >= 270.0;
+        let show_average = pro_density && width >= 286.0 && rows.iter().any(|row| row.unit == "°C");
         let pin_w = 24.0;
-        let max_w = if show_minmax { 46.0 } else { 0.0 };
-        let min_w = if show_minmax { 46.0 } else { 0.0 };
+        let stat_w = if width >= 430.0 { 44.0 } else { 32.0 };
+        let minmax_w = if show_minmax { stat_w * 2.0 } else { 0.0 };
+        let average_w = if show_average { stat_w } else { 0.0 };
+        let stats_w = minmax_w + average_w;
         let bar_w = if show_range_bar { 98.0 } else { 0.0 };
         let cur_w = 68.0;
 
@@ -1188,23 +1225,32 @@ pub fn sensor_table(
             );
             if show_minmax {
                 painter.text(
-                    Pos2::new(right - 4.0, header.center().y),
+                    Pos2::new(right - average_w - 4.0, header.center().y),
                     egui::Align2::RIGHT_CENTER,
                     "MAX",
                     font.clone(),
                     MUTED,
                 );
                 painter.text(
-                    Pos2::new(right - max_w - 4.0, header.center().y),
+                    Pos2::new(right - average_w - stat_w - 4.0, header.center().y),
                     egui::Align2::RIGHT_CENTER,
                     "MIN",
                     font.clone(),
                     MUTED,
                 );
             }
+            if show_average {
+                painter.text(
+                    Pos2::new(right - 4.0, header.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    "AVG",
+                    font.clone(),
+                    MUTED,
+                );
+            }
             if show_range_bar {
                 painter.text(
-                    Pos2::new(right - max_w - min_w - bar_w * 0.5 - 6.0, header.center().y),
+                    Pos2::new(right - stats_w - bar_w * 0.5 - 6.0, header.center().y),
                     egui::Align2::CENTER_CENTER,
                     "RANGE",
                     font.clone(),
@@ -1212,7 +1258,7 @@ pub fn sensor_table(
                 );
             }
             painter.text(
-                Pos2::new(right - max_w - min_w - bar_w - 10.0, header.center().y),
+                Pos2::new(right - stats_w - bar_w - 10.0, header.center().y),
                 egui::Align2::RIGHT_CENTER,
                 "CURRENT",
                 font,
@@ -1222,11 +1268,11 @@ pub fn sensor_table(
 
         let row_h = if pro_density { 25.0 } else { 30.0 };
         ui.spacing_mut().item_spacing.y = 0.0;
-        for (index, row) in rows.iter().enumerate() {
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(width, row_h), egui::Sense::click());
+        let mut draw_row = |ui: &mut egui::Ui, index: usize| {
+            let row = &rows[index];
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, row_h), egui::Sense::hover());
             if !ui.is_rect_visible(rect) {
-                continue;
+                return;
             }
             let is_selected = selected_key == Some(row.key);
             let is_pinned = pinned.iter().any(|k| k == row.key);
@@ -1234,11 +1280,35 @@ pub fn sensor_table(
             // Pin hit region on far right
             let pin_rect =
                 Rect::from_min_max(Pos2::new(rect.right() - pin_w, rect.top()), rect.max);
-            let pin_clicked = response.clicked()
-                && response
-                    .interact_pointer_pos()
-                    .is_some_and(|p| pin_rect.contains(p));
-            if pin_clicked {
+            let label_rect =
+                Rect::from_min_max(rect.min, Pos2::new(pin_rect.left(), rect.bottom()));
+            let response = ui.interact(
+                label_rect,
+                ui.make_persistent_id((row.key, "plot")),
+                egui::Sense::click(),
+            );
+            let pin = ui.interact(
+                pin_rect,
+                ui.make_persistent_id((row.key, "pin")),
+                egui::Sense::click(),
+            );
+            let pin_label = if is_pinned {
+                "Unpin from HUD"
+            } else {
+                "Pin to HUD"
+            };
+            pin.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Checkbox,
+                    ui.is_enabled(),
+                    is_pinned,
+                    format!("{pin_label}: {}", row.label),
+                )
+            });
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), row.label)
+            });
+            if pin.clicked() {
                 outcome.toggled_pin = Some(row.key.to_owned());
             } else if response.clicked() {
                 outcome.clicked_key = Some(row.key.to_owned());
@@ -1255,7 +1325,7 @@ pub fn sensor_table(
                     CornerRadius::same(2),
                     ACCENT,
                 );
-            } else if response.hovered() {
+            } else if response.hovered() || response.has_focus() {
                 painter.rect_filled(
                     rect,
                     CornerRadius::same(6),
@@ -1263,7 +1333,7 @@ pub fn sensor_table(
                 );
             }
 
-            let label_max_w = (width - pin_w - max_w - min_w - bar_w - cur_w - 20.0).max(80.0);
+            let label_max_w = (width - pin_w - stats_w - bar_w - cur_w - 20.0).max(52.0);
             let label_galley = elided(
                 ui,
                 row.label,
@@ -1318,7 +1388,7 @@ pub fn sensor_table(
                 None => MUTED,
             };
             painter.text(
-                Pos2::new(right - max_w - min_w - bar_w - 10.0, rect.center().y),
+                Pos2::new(right - stats_w - bar_w - 10.0, rect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 current_text,
                 egui::FontId::monospace(11.5),
@@ -1328,7 +1398,7 @@ pub fn sensor_table(
             // Visual Min–Current–Max thermal/fan range bar
             if show_range_bar {
                 let bar_rect = Rect::from_min_size(
-                    Pos2::new(right - max_w - min_w - bar_w - 4.0, rect.center().y - 3.0),
+                    Pos2::new(right - stats_w - bar_w - 4.0, rect.center().y - 3.0),
                     Vec2::new(bar_w - 8.0, 6.0),
                 );
                 draw_thermal_range_bar(
@@ -1341,8 +1411,12 @@ pub fn sensor_table(
                 );
             }
 
-            if show_minmax {
-                for (offset, val) in [(max_w + 4.0, row.min), (4.0, row.max)] {
+            for (visible, offset, val) in [
+                (show_minmax, average_w + stat_w + 4.0, row.min),
+                (show_minmax, average_w + 4.0, row.max),
+                (show_average, 4.0, row.average),
+            ] {
+                if visible {
                     painter.text(
                         Pos2::new(right - offset, rect.center().y),
                         egui::Align2::RIGHT_CENTER,
@@ -1358,9 +1432,11 @@ pub fn sensor_table(
             if is_pinned {
                 painter.circle_filled(pin_c, 3.6, ACCENT);
                 painter.circle_stroke(pin_c, 5.5, Stroke::new(1.0_f32, tint_alpha(ACCENT, 130)));
-            } else if response.hovered() {
+            } else if pin.hovered() || pin.has_focus() || response.hovered() {
                 painter.circle_stroke(pin_c, 3.6, Stroke::new(1.2_f32, MUTED));
             }
+            pin.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(pin_label);
 
             if index + 1 < rows.len() {
                 painter.hline(
@@ -1372,10 +1448,36 @@ pub fn sensor_table(
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            response.on_hover_text(format!(
-                "Key: {} ({}) · Click row to plot · Click dot on right to pin to HUD",
-                row.key, row.source
-            ));
+            response.on_hover_ui(|ui| {
+                let value = |v: Option<f32>| {
+                    v.map(|v| format!("{v:.1} {}", row.unit))
+                        .unwrap_or_else(|| "Unavailable".into())
+                };
+                ui.label(format!(
+                    "{} ({})\n{}\nCurrent {} · Min {} · Max {} · Avg {}",
+                    row.label,
+                    row.source,
+                    row.key,
+                    value(row.current),
+                    value(row.min),
+                    value(row.max),
+                    value(row.average)
+                ));
+            });
+        };
+        if large_table {
+            egui::ScrollArea::vertical()
+                .id_salt("rows")
+                .max_height(row_h * 12.0)
+                .show_rows(ui, row_h, rows.len(), |ui, visible| {
+                    for i in visible {
+                        draw_row(ui, i);
+                    }
+                });
+        } else {
+            for i in 0..rows.len() {
+                draw_row(ui, i);
+            }
         }
     });
     outcome

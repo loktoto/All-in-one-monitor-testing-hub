@@ -8,6 +8,7 @@ use hardware_hub::{
 };
 use std::{
     fs,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -16,7 +17,21 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let test_gpu = std::env::args().skip(1).any(|arg| arg == "--gpu");
+    let mut test_gpu = false;
+    let mut worker_executable = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--gpu" {
+            test_gpu = true;
+        } else if arg == "--gpu-worker-exe" {
+            test_gpu = true;
+            worker_executable = Some(PathBuf::from(
+                args.next().ok_or("Missing GPU worker executable path")?,
+            ));
+        } else {
+            return Err(format!("Unknown smoke option: {}", arg.to_string_lossy()).into());
+        }
+    }
     let root = std::env::temp_dir().join(format!(
         "hub-smoke-{}-{}",
         std::process::id(),
@@ -145,13 +160,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             ..Config::default()
         };
-        stress::start(
-            cfg,
-            state.clone(),
-            cancel.clone(),
-            adapter.map(|a| a.handle.clone()),
-            context.clone(),
-        )?;
+        if let (Some(adapter), Some(executable)) = (adapter, worker_executable.as_ref()) {
+            stress::start_gpu_in_worker(
+                cfg,
+                state.clone(),
+                cancel.clone(),
+                Some(adapter.handle.clone()),
+                context.clone(),
+                executable.clone(),
+            )?;
+        } else {
+            stress::start(
+                cfg,
+                state.clone(),
+                cancel.clone(),
+                adapter.map(|a| a.handle.clone()),
+                context.clone(),
+            )?;
+        }
         let until = Instant::now() + Duration::from_secs(20);
         while state.lock().unwrap().running && Instant::now() < until {
             thread::sleep(Duration::from_millis(20));
@@ -172,6 +198,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("{kind:?}: expected {expected}, got {}", result.status).into());
         }
     }
+    if let (Some(executable), Some(adapter)) = (worker_executable, physical_gpu) {
+        stress::start_gpu_in_worker(
+            Config {
+                kind: Kind::Gpu,
+                run_mode: stress::RunMode::Continuous,
+                gpu_intensity: GpuIntensity::Light,
+                ..Config::default()
+            },
+            state.clone(),
+            cancel.clone(),
+            Some(adapter.handle.clone()),
+            context.clone(),
+            executable,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while state.lock().unwrap().live.units == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let made_progress = state.lock().unwrap().live.units > 0;
+        cancel.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.lock().unwrap().running && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let guard = state.lock().unwrap();
+        if !made_progress
+            || guard.running
+            || !guard
+                .results
+                .last()
+                .is_some_and(|result| result.status == Status::Stopped)
+        {
+            return Err("Isolated GPU worker did not stop after verified work".into());
+        }
+        println!("Isolated GPU cancellation: Stopped after verified work");
+    }
     if fs::read_dir(&root)?.next().is_some() {
         return Err("Scratch file was not removed".into());
     }
@@ -180,8 +242,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report::export(&report_path, Format::Json, &records)?;
     let bytes = fs::read(&report_path)?;
     let report_json: serde_json::Value = serde_json::from_slice(&bytes)?;
-    if report_json["results"].as_array().map(Vec::len) != Some(6) {
-        return Err("report did not contain six results".into());
+    if report_json["results"].as_array().map(Vec::len) != Some(records.len()) {
+        return Err("report did not contain all results".into());
     }
     if report::export(&report_path, Format::Json, &records).is_ok()
         || fs::read(&report_path)? != bytes

@@ -55,6 +55,8 @@ pub struct Settings {
     pub reduce_motion: bool,
     /// Telemetry sampling interval in milliseconds.
     pub poll_ms: u64,
+    pub libre_monitor_enabled: bool,
+    pub libre_monitor_port: u16,
     /// Worker threads for the software checks.
     pub workers: usize,
     /// Default duration for a timed check, in seconds.
@@ -99,6 +101,8 @@ impl Default for Settings {
             pro_density: false,
             reduce_motion: false,
             poll_ms: 1000,
+            libre_monitor_enabled: false,
+            libre_monitor_port: 8085,
             workers: logical,
             seconds: 1800,
             stress_mode: "timed".into(),

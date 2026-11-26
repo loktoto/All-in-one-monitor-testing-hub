@@ -34,6 +34,8 @@ fn main() {
             celsius: Some(40.0 + (i % 45) as f32),
             min: Some(32.0),
             max: Some(78.0),
+            average: Some(61.0),
+            cpu_core: i < 64,
         })
         .collect();
     let shared = Arc::new(snapshot.clone());

@@ -1,8 +1,9 @@
+use crate::sensors::{ExternalThermals, Sensor};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -49,7 +50,7 @@ pub struct Adapter {
     pub vendor_id: u32,
     pub device_id: u32,
 }
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Temperature {
     /// Provider key, so an unfamiliar sensor stays traceable.
     pub key: String,
@@ -59,6 +60,9 @@ pub struct Temperature {
     pub celsius: Option<f32>,
     pub min: Option<f32>,
     pub max: Option<f32>,
+    /// Arithmetic mean of valid samples since the last reset.
+    pub average: Option<f32>,
+    pub cpu_core: bool,
 }
 #[derive(Clone)]
 pub struct Fan {
@@ -97,6 +101,7 @@ pub struct Snapshot {
     pub gpus: Vec<Gpu>,
     pub adapters: Vec<Adapter>,
     pub temperatures: Vec<Temperature>,
+    pub external_thermals: ExternalThermals,
     pub fans: Vec<Fan>,
     pub cpu_range: Range,
     pub memory_range: Range,
@@ -161,7 +166,7 @@ fn is_synthetic_volume(_mount: &str) -> bool {
 
 // A single platform-preferred backend prevents the same GPU appearing once per API.
 // Adapter handles are retained and reused for test selection; identical models stay distinct.
-fn discover_adapters() -> Vec<Adapter> {
+pub(crate) fn discover_adapters() -> Vec<Adapter> {
     std::panic::catch_unwind(|| {
         let instance = wgpu::Instance::default();
         let preferred = preferred_backends();
@@ -201,6 +206,54 @@ fn discover_adapters() -> Vec<Adapter> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// Native Dx12 adapter identity and reported video memory limits.
+#[cfg(target_os = "windows")]
+pub(crate) fn dxgi_adapter_details(adapter: &wgpu::Adapter) -> Option<(u64, u64, u64)> {
+    // Borrow the existing HAL handle and read its description without changing it.
+    unsafe {
+        adapter.as_hal::<wgpu::hal::api::Dx12, _, _>(|adapter| {
+            let desc = adapter?.raw_adapter().GetDesc1().ok()?;
+            let luid = (u64::from(desc.AdapterLuid.HighPart as u32) << 32)
+                | u64::from(desc.AdapterLuid.LowPart);
+            Some((
+                luid,
+                desc.DedicatedVideoMemory as u64,
+                desc.SharedSystemMemory as u64,
+            ))
+        })
+    }
+}
+
+fn describe_adapters(adapters: &[Adapter]) -> Vec<Gpu> {
+    adapters
+        .iter()
+        .enumerate()
+        .map(|(index, adapter)| {
+            let detail = format!(
+                "Adapter {index} · {}{} · wgpu inventory",
+                adapter.backend,
+                if adapter.software { " · software" } else { "" }
+            );
+            #[cfg(target_os = "windows")]
+            let detail = if let Some((_, dedicated, shared)) = dxgi_adapter_details(&adapter.handle)
+            {
+                let gib = (1024 * 1024 * 1024) as f64;
+                format!(
+                    "{detail} · DXGI {:.2} GiB dedicated / {:.2} GiB shared",
+                    dedicated as f64 / gib,
+                    shared as f64 / gib
+                )
+            } else {
+                detail
+            };
+            Gpu {
+                name: adapter.name.clone(),
+                detail,
+            }
+        })
+        .collect()
 }
 
 // Match NVML to an adapter only when the name is unique on both sides. Ambiguous
@@ -345,39 +398,125 @@ pub fn spawn_with_notification(
     process_wanted: Arc<AtomicBool>,
     notify: impl Fn() + Send + 'static,
 ) -> thread::JoinHandle<()> {
+    spawn_inner(
+        shared,
+        stop,
+        reset,
+        interval_ms,
+        process_wanted,
+        None,
+        notify,
+    )
+}
+
+#[derive(Default)]
+pub struct SamplingControl {
+    pub paused: AtomicBool,
+    /// Zero disables the local LibreHardwareMonitor feed.
+    pub lhm_port: AtomicU16,
+    sampler: OnceLock<thread::Thread>,
+}
+
+impl SamplingControl {
+    pub fn wake(&self) {
+        if let Some(sampler) = self.sampler.get() {
+            sampler.unpark();
+        }
+    }
+}
+
+pub fn spawn_with_control(
+    shared: Arc<Mutex<Arc<Snapshot>>>,
+    stop: Arc<AtomicBool>,
+    reset: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU64>,
+    process_wanted: Arc<AtomicBool>,
+    control: Arc<SamplingControl>,
+    notify: impl Fn() + Send + 'static,
+) -> thread::JoinHandle<()> {
+    spawn_inner(
+        shared,
+        stop,
+        reset,
+        interval_ms,
+        process_wanted,
+        Some(control),
+        notify,
+    )
+}
+
+fn spawn_inner(
+    shared: Arc<Mutex<Arc<Snapshot>>>,
+    stop: Arc<AtomicBool>,
+    reset: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU64>,
+    process_wanted: Arc<AtomicBool>,
+    control: Option<Arc<SamplingControl>>,
+    notify: impl Fn() + Send + 'static,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut system = System::new_all();
+        if let Some(control) = &control {
+            let _ = control.sampler.set(thread::current());
+        }
+        let mut system = System::new();
+        system.refresh_cpu_all();
         let mut disks = Disks::new_with_refreshed_list();
         let mut networks = Networks::new_with_refreshed_list();
         let mut network_refreshed_at = Instant::now();
+        let mut network_interval_seconds = 0.0;
+        let mut medium_at = None;
+        let mut mac_gpu_sample = Vec::new();
         let adapters = discover_adapters();
+        let adapter_inventory = describe_adapters(&adapters);
         // The SMC exposes many more sensors than sysinfo does; keep the reader
         // open so the enumeration cost is paid once, and fall back to sysinfo
         // when the platform has no provider.
         let mut sensors = crate::sensors::open();
-        let mut temp_bounds: HashMap<String, (f32, f32)> = HashMap::new();
+        let mut temp_stats = HashMap::new();
+        #[cfg(target_os = "windows")]
+        let mut external_feed = crate::sensors::lhm::Feed::new();
         let mut fan_bounds: HashMap<String, (f32, f32)> = HashMap::new();
         let mut cpu_bounds: Option<(f32, f32)> = None;
         let mut memory_bounds: Option<(f32, f32)> = None;
         thread::sleep(Duration::from_millis(250));
         let nvml = init_nvml();
-        let mut tick: u64 = 0;
         let mut process_cache: Vec<Process> = Vec::new();
+        let mut last_processes = None;
+        let mut was_process_wanted = false;
+        let mut last_frequency = Instant::now();
         while !stop.load(Ordering::Relaxed) {
+            if control
+                .as_ref()
+                .is_some_and(|c| c.paused.load(Ordering::Relaxed))
+            {
+                thread::park_timeout(Duration::from_secs(5));
+                medium_at = None;
+                continue;
+            }
             let batch_started = Instant::now();
             // Min/max survive for the session until the user clears them.
             if reset.swap(false, Ordering::Relaxed) {
-                temp_bounds.clear();
+                temp_stats.clear();
                 fan_bounds.clear();
                 cpu_bounds = None;
                 memory_bounds = None;
             }
-            system.refresh_cpu_all();
+            if sample_due(Some(last_frequency), batch_started, Duration::from_secs(2)) {
+                system.refresh_cpu_all();
+                last_frequency = batch_started;
+            } else {
+                system.refresh_cpu_usage();
+            }
             // Process enumeration walks every PID and opens handles; on Windows
             // with 300+ processes it was the most expensive part of an idle
             // sample. Walk the table once at startup (so the first visit is
             // instant) and afterwards only while the process page is open.
-            if process_wanted.load(Ordering::Relaxed) || tick == 0 {
+            let wants_processes = process_wanted.load(Ordering::Relaxed);
+            if last_processes.is_none()
+                || (wants_processes
+                    && (!was_process_wanted
+                        || sample_due(last_processes, batch_started, Duration::from_secs(1))))
+            {
                 system.refresh_processes_specifics(
                     ProcessesToUpdate::All,
                     true,
@@ -393,16 +532,21 @@ pub fn spawn_with_notification(
                         memory: p.memory(),
                     })
                     .collect();
+                last_processes = Some(batch_started);
             }
-            tick = tick.wrapping_add(1);
+            was_process_wanted = wants_processes;
             system.refresh_memory();
-            disks.refresh(true);
-            networks.refresh(true);
-            let network_now = Instant::now();
-            let network_interval_seconds = network_now
-                .duration_since(network_refreshed_at)
-                .as_secs_f64();
-            network_refreshed_at = network_now;
+            if sample_due(medium_at, batch_started, Duration::from_secs(2)) {
+                disks.refresh(true);
+                networks.refresh(true);
+                let network_now = Instant::now();
+                network_interval_seconds = network_now
+                    .duration_since(network_refreshed_at)
+                    .as_secs_f64();
+                network_refreshed_at = network_now;
+                mac_gpu_sample = mac_gpu_sources();
+                medium_at = Some(batch_started);
+            }
             // Built only when the platform sensor provider is missing: on
             // Windows this list costs a per-second WMI query and never supplies
             // a reading anyway.
@@ -454,18 +598,6 @@ pub fn spawn_with_notification(
                     }
                 }
             }
-            let adapter_gpus = adapters
-                .iter()
-                .enumerate()
-                .map(|(i, a)| Gpu {
-                    name: a.name.clone(),
-                    detail: format!(
-                        "Adapter {i} · {}{} · wgpu inventory",
-                        a.backend,
-                        if a.software { " · software" } else { "" }
-                    ),
-                })
-                .collect();
             let cpu_usage = system.global_cpu_usage();
             let memory_total = system.total_memory();
             let memory_used = system.used_memory();
@@ -496,15 +628,7 @@ pub fn spawn_with_notification(
             match readings {
                 Some(readings) if !readings.temps.is_empty() || !readings.fans.is_empty() => {
                     for sensor in readings.temps {
-                        let (min, max) = note(&mut temp_bounds, &sensor.key, sensor.value);
-                        temperatures.push(Temperature {
-                            key: sensor.key,
-                            label: sensor.label,
-                            source: sensor.source,
-                            celsius: sensor.value,
-                            min,
-                            max,
-                        });
+                        temperatures.push(track_temperature(&mut temp_stats, sensor));
                     }
                     for sensor in readings.fans {
                         let (min, max) = note(&mut fan_bounds, &sensor.key, sensor.value);
@@ -533,25 +657,45 @@ pub fn spawn_with_notification(
                             .filter(|value| value.is_finite() && *value > 0.0);
                         let label = component.label().to_owned();
                         let duplicate = counts.get(&label).copied().unwrap_or(0) > 1;
-                        let (key, min, max) = if duplicate {
+                        let stats = if duplicate {
                             // Name-only keys cannot safely track multiple identical labels.
-                            temp_bounds.remove(&label);
-                            (format!("{label} · ambiguous #{index}"), None, None)
+                            temp_stats.remove(&label);
+                            None
                         } else {
-                            let (min, max) = note(&mut temp_bounds, &label, celsius);
-                            (label.clone(), min, max)
+                            temperature_stats(&mut temp_stats, &label, celsius)
                         };
                         temperatures.push(Temperature {
-                            key,
+                            key: if duplicate {
+                                format!("{label} · ambiguous #{index}")
+                            } else {
+                                label.clone()
+                            },
                             label,
                             source: "sysinfo",
                             celsius,
-                            min,
-                            max,
+                            min: stats.map(|value| value.min),
+                            max: stats.map(|value| value.max),
+                            average: stats.map(|value| value.mean as f32),
+                            cpu_core: false,
                         });
                     }
                 }
             }
+            #[cfg(target_os = "windows")]
+            let external_thermals = {
+                let port = control
+                    .as_ref()
+                    .map_or(0, |c| c.lhm_port.load(Ordering::Relaxed));
+                let (status, readings) = external_feed.sample(port);
+                temperatures.extend(
+                    readings
+                        .into_iter()
+                        .map(|sensor| track_temperature(&mut temp_stats, sensor)),
+                );
+                status
+            };
+            #[cfg(not(target_os = "windows"))]
+            let external_thermals = ExternalThermals::Disabled;
             let mut network_list: Vec<Network> = networks
                 .iter()
                 .map(|(name, data)| Network {
@@ -561,8 +705,8 @@ pub fn spawn_with_notification(
                 })
                 .collect();
             network_list.sort_by(|a, b| a.name.cmp(&b.name));
-            let mut gpus = merge_gpu_lists(adapter_gpus, nvidia);
-            gpus.extend(mac_gpu_sources());
+            let mut gpus = merge_gpu_lists(adapter_inventory.clone(), nvidia);
+            gpus.extend(mac_gpu_sample.iter().cloned());
             let snapshot = Snapshot {
                 cpu_name: system
                     .cpus()
@@ -601,6 +745,7 @@ pub fn spawn_with_notification(
                 gpus,
                 adapters: adapters.clone(),
                 temperatures,
+                external_thermals,
                 fans,
                 cpu_range,
                 memory_range,
@@ -612,15 +757,23 @@ pub fn spawn_with_notification(
             // a slow provider cannot turn into two stacked one-second polls.
             let period =
                 Duration::from_millis(interval_ms.load(Ordering::Relaxed).clamp(250, 5000));
-            while !stop.load(Ordering::Relaxed) {
-                let remaining = period.saturating_sub(batch_started.elapsed());
-                if remaining.is_zero() {
-                    break;
+            if control.is_some() {
+                thread::park_timeout(period.saturating_sub(batch_started.elapsed()));
+            } else {
+                while !stop.load(Ordering::Relaxed) {
+                    let remaining = period.saturating_sub(batch_started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(25)));
                 }
-                thread::sleep(remaining.min(Duration::from_millis(25)));
             }
         }
     })
+}
+
+fn sample_due(last: Option<Instant>, now: Instant, period: Duration) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= period)
 }
 
 fn publish(shared: &Mutex<Arc<Snapshot>>, snapshot: Snapshot, notify: impl FnOnce()) {
@@ -628,6 +781,54 @@ fn publish(shared: &Mutex<Arc<Snapshot>>, snapshot: Snapshot, notify: impl FnOnc
         *out = Arc::new(snapshot);
         drop(out);
         notify();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TemperatureStats {
+    min: f32,
+    max: f32,
+    mean: f64,
+    count: u64,
+}
+
+fn temperature_stats(
+    session: &mut HashMap<String, TemperatureStats>,
+    key: &str,
+    current: Option<f32>,
+) -> Option<TemperatureStats> {
+    if let Some(value) = current.filter(|v| v.is_finite()) {
+        let stats = session.entry(key.to_owned()).or_insert(TemperatureStats {
+            min: value,
+            max: value,
+            mean: 0.0,
+            count: 0,
+        });
+        stats.min = stats.min.min(value);
+        stats.max = stats.max.max(value);
+        stats.count = stats.count.saturating_add(1);
+        stats.mean += (f64::from(value) - stats.mean) / stats.count as f64;
+        Some(*stats)
+    } else {
+        session.get(key).copied()
+    }
+}
+
+fn track_temperature(
+    session: &mut HashMap<String, TemperatureStats>,
+    sensor: Sensor,
+) -> Temperature {
+    let celsius = sensor.value.filter(|value| value.is_finite());
+    let stats = temperature_stats(session, &sensor.key, celsius);
+    Temperature {
+        key: sensor.key,
+        label: sensor.label,
+        source: sensor.source,
+        celsius,
+        min: stats.map(|value| value.min),
+        max: stats.map(|value| value.max),
+        average: stats.map(|value| value.mean as f32),
+        cpu_core: sensor.cpu_core,
     }
 }
 
@@ -662,6 +863,42 @@ fn observe(bounds: &mut Option<(f32, f32)>, value: f32) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_channels_keep_separate_session_stats_through_gaps_and_reset() {
+        let mut session = HashMap::new();
+        let sample = |session: &mut _, suffix, value| {
+            track_temperature(
+                session,
+                Sensor {
+                    key: format!("lhm:/intelcpu/{suffix}/temperature/2"),
+                    label: "Core #1".into(),
+                    source: "LHM",
+                    value,
+                    unit: crate::sensors::Unit::Celsius,
+                    cpu_core: true,
+                },
+            )
+        };
+        let _ = sample(&mut session, 0, Some(40.0));
+        let _ = sample(&mut session, 0, Some(60.0));
+        let _ = sample(&mut session, 1, Some(70.0));
+        let first = sample(&mut session, 0, None);
+        assert_eq!(first.celsius, None);
+        assert_eq!(
+            (first.min, first.max, first.average),
+            (Some(40.0), Some(60.0), Some(50.0))
+        );
+        assert!(first.cpu_core);
+        let second = sample(&mut session, 1, Some(f32::NAN));
+        assert_eq!((second.celsius, second.average), (None, Some(70.0)));
+        session.clear();
+        let reset = sample(&mut session, 0, Some(42.0));
+        assert_eq!(
+            (reset.min, reset.max, reset.average),
+            (Some(42.0), Some(42.0), Some(42.0))
+        );
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

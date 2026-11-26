@@ -350,6 +350,7 @@ mod tests {
             celsius: Some(61.5),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         sample.temperatures.push(Temperature {
             key: "TCSF".into(),
@@ -358,6 +359,7 @@ mod tests {
             celsius: Some(40.0),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         history.record(&sample, now);
         let mut later = snapshot(now + Duration::from_secs(1));
@@ -368,6 +370,7 @@ mod tests {
             celsius: None,
             min: None,
             max: None,
+            ..Temperature::default()
         });
         history.record(&later, now + Duration::from_secs(1));
         assert_eq!(temperature_keys(&history), vec!["TC0P", "TCSF"]);
@@ -408,6 +411,7 @@ mod tests {
             celsius: Some(61.5),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         sample.temperatures.push(Temperature {
             key: "TCSF".into(),
@@ -416,6 +420,7 @@ mod tests {
             celsius: Some(40.0),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         history.record(&sample, now);
         let mut later = snapshot(now + Duration::from_secs(1));
@@ -426,6 +431,7 @@ mod tests {
             celsius: Some(63.0),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         // TCSF missing in the second sample: blank, never zero.
         history.record(&later, now + Duration::from_secs(1));

@@ -499,13 +499,23 @@ impl App {
             os: sysinfo::System::long_os_version().unwrap_or_else(|| "unavailable".into()),
             snapshot_age_seconds: s.updated_at.map(|t| t.elapsed().as_secs_f64()),
         };
-        self.message = match stress::start(
-            cfg,
-            self.state.clone(),
-            self.cancel.clone(),
-            adapter.map(|a| a.handle.clone()),
-            context,
-        ) {
+        let result = if cfg.kind == Kind::Gpu {
+            std::env::current_exe()
+                .map_err(|e| format!("GPU worker path is unavailable: {e}"))
+                .and_then(|executable| {
+                    stress::start_gpu_in_worker(
+                        cfg,
+                        self.state.clone(),
+                        self.cancel.clone(),
+                        adapter.map(|a| a.handle.clone()),
+                        context,
+                        executable,
+                    )
+                })
+        } else {
+            stress::start(cfg, self.state.clone(), self.cancel.clone(), None, context)
+        };
+        self.message = match result {
             Ok(()) => {
                 self.thermal_stop = Default::default();
                 self.run_thermal_rule =

@@ -23,7 +23,11 @@ impl App {
         let narrow = self.compact_mode || ui.available_width() < 740.0;
 
         match page {
-            Page::Cpu => self.view_cpu_dive(ui, snapshot, specs.as_deref(), narrow),
+            Page::Cpu => {
+                self.view_core_temperatures(ui, snapshot);
+                ui.add_space(10.0);
+                self.view_cpu_dive(ui, snapshot, specs.as_deref(), narrow);
+            }
             Page::Gpu => self.view_gpu_dive(ui, snapshot, specs.as_deref(), narrow),
             Page::Memory => self.view_memory_dive(ui, snapshot, specs.as_deref(), narrow),
             Page::Storage => self.view_storage_dive(ui, snapshot, specs.as_deref()),

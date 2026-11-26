@@ -25,7 +25,7 @@ use hardware_hub::{
         CpuWorkload, DiskPattern, GpuIntensity, Kind, MemPattern, RunMode, State,
         MAX_DISK_WRITE_CAP_MIB, MAX_TIMED_SECONDS, MAX_WORKERS,
     },
-    telemetry::{self, Snapshot},
+    telemetry::{self, SamplingControl, Snapshot},
 };
 use std::{
     sync::{
@@ -36,6 +36,13 @@ use std::{
 };
 
 fn main() -> eframe::Result {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == hardware_hub::stress::GPU_WORKER_FLAG)
+    {
+        return hardware_hub::stress::run_gpu_worker()
+            .map_err(|error| eframe::Error::AppCreation(std::io::Error::other(error).into()));
+    }
     let settings = Settings::load();
     let compact = env_bool("HH_COMPACT").unwrap_or(settings.compact_mode);
     let initial_size = if compact {
@@ -179,6 +186,8 @@ pub(crate) struct App {
     pub palette_query: String,
     pub palette_index: usize,
     pub sensor_filter: String,
+    pub core_sensor_filter: String,
+    pub focus_temperature_chart: bool,
     pub pinned_sensors: Vec<String>,
     pub dark_titlebar_ticks: u8,
 
@@ -188,6 +197,9 @@ pub(crate) struct App {
     pub overview: OverviewOpen,
     pub specs_refreshed: Arc<AtomicBool>,
     pub poll_ms: Arc<AtomicU64>,
+    pub sampling_control: Arc<SamplingControl>,
+    pub libre_monitor_enabled: bool,
+    pub libre_monitor_port: u16,
     pub stop: Arc<AtomicBool>,
     pub stats_reset: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
@@ -271,12 +283,13 @@ impl App {
         set_reduce_motion(&cc.egui_ctx, settings.reduce_motion);
         let app = Self::from_settings(settings, compact_mode);
         let telemetry_ctx = cc.egui_ctx.clone();
-        telemetry::spawn_with_notification(
+        telemetry::spawn_with_control(
             Arc::clone(&app.snapshot),
             Arc::clone(&app.stop),
             Arc::clone(&app.stats_reset),
             Arc::clone(&app.poll_ms),
             Arc::clone(&app.process_wanted),
+            Arc::clone(&app.sampling_control),
             // A short delay keeps the wake within a frame and avoids egui's
             // extra settling repaint for immediate requests.
             move || {
@@ -329,6 +342,8 @@ impl App {
             palette_query: String::new(),
             palette_index: 0,
             sensor_filter: String::new(),
+            core_sensor_filter: String::new(),
+            focus_temperature_chart: false,
             pinned_sensors: settings.pinned_sensors.clone(),
             dark_titlebar_ticks: 0,
 
@@ -338,6 +353,13 @@ impl App {
             specs: Arc::new(Mutex::new(None)),
             specs_refreshed: Arc::new(AtomicBool::new(false)),
             poll_ms: Arc::new(AtomicU64::new(settings.poll_ms.clamp(250, 5000))),
+            sampling_control: Arc::new(SamplingControl::default()),
+            libre_monitor_enabled: settings.libre_monitor_enabled,
+            libre_monitor_port: if settings.libre_monitor_port == 0 {
+                8085
+            } else {
+                settings.libre_monitor_port
+            },
             stop: Arc::new(AtomicBool::new(false)),
             stats_reset: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -446,6 +468,8 @@ impl App {
             pro_density: self.pro_density,
             reduce_motion: self.reduce_motion,
             poll_ms: self.poll_ms.load(Ordering::Relaxed),
+            libre_monitor_enabled: self.libre_monitor_enabled,
+            libre_monitor_port: self.libre_monitor_port,
             workers: self.workers,
             seconds: self.seconds,
             stress_mode: run_mode_key(self.stress_mode).to_owned(),
@@ -878,12 +902,23 @@ impl App {
 
         // Stress progress and the CSV writer can change between telemetry
         // batches. The idle dashboard wakes on input, animation or new data.
-        if running
-            || self
-                .recorder
-                .as_ref()
-                .is_some_and(|recorder| !recorder.status().closed)
-        {
+        let recording = self
+            .recorder
+            .as_ref()
+            .is_some_and(|recorder| !recorder.status().closed);
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        let paused = minimized && !running && !recording && !self.show_widget;
+        let port = if self.libre_monitor_enabled {
+            self.libre_monitor_port
+        } else {
+            0
+        };
+        let previous_pause = self.sampling_control.paused.swap(paused, Ordering::Relaxed);
+        let previous_port = self.sampling_control.lhm_port.swap(port, Ordering::Relaxed);
+        if paused != previous_pause || port != previous_port {
+            self.sampling_control.wake();
+        }
+        if running || recording {
             let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
             ctx.request_repaint_after(if focused {
                 Duration::from_millis(250)
@@ -901,6 +936,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop.store(true, Ordering::Relaxed);
+        self.sampling_control.wake();
         self.persist_settings();
     }
 }
@@ -940,6 +976,8 @@ mod tests {
                     celsius: Some(37.0),
                     min: Some(32.0),
                     max: Some(48.0),
+                    average: Some(42.0),
+                    cpu_core: n < 64,
                     source: "fixture",
                 })
                 .collect(),
@@ -1029,6 +1067,7 @@ mod tests {
                 celsius: Some(42.0),
                 min: None,
                 max: None,
+                ..telemetry::Temperature::default()
             }],
             ..Snapshot::default()
         });
@@ -1059,6 +1098,34 @@ mod tests {
         assert_eq!(app.page, Page::Thermal);
         assert_eq!(app.selected_temp_key, "TZ01");
         assert!(!app.show_palette);
+    }
+
+    #[test]
+    fn minimized_window_keeps_sampling_for_an_active_check() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let mut app = App::from_settings(Settings::default(), true);
+        app.dark_titlebar_ticks = 3;
+        app.show_widget = false;
+        for (minimized, running, expected_pause) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            app.state.lock().unwrap().running = running;
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .minimized = Some(minimized);
+            let _ = ctx.run(input, |ctx| app.render(ctx));
+            assert_eq!(
+                app.sampling_control.paused.load(Ordering::Relaxed),
+                expected_pause
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod gpu_worker;
+pub use gpu_worker::{run_gpu_worker, GPU_WORKER_FLAG};
+
 /// Maximum duration for timed runs (24 hours). Continuous mode has no timer cutoff.
 pub const MAX_TIMED_SECONDS: u64 = 86_400;
 /// Maximum supported CPU worker threads.
@@ -57,7 +60,7 @@ impl Kind {
 }
 
 /// How a stress run decides when to finish.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RunMode {
     /// Stop after `Config::seconds` elapses (up to 24 hours).
     #[default]
@@ -203,7 +206,7 @@ impl DiskPattern {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GpuIntensity {
     /// 1024 words, 64 LCG steps — a quick sanity check.
     Light,
@@ -381,7 +384,7 @@ pub struct ReportContext {
 }
 /// One recorded mismatch, in the style of memory-diagnostic tools: where it
 /// happened, what was expected and what was read back. Bounded per run.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ErrorDetail {
     pub location: String,
     pub expected: String,
@@ -428,7 +431,7 @@ pub struct ResultRecord {
     /// First few mismatches, kept for diagnosis.
     pub errors: Vec<ErrorDetail>,
 }
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Outcome {
     verified: u64,
     detail: String,
@@ -445,7 +448,7 @@ impl Outcome {
         }
     }
 }
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 enum TestError {
     Failed(String),
     Unavailable(String),
@@ -527,6 +530,49 @@ pub fn start(
     adapter: Option<wgpu::Adapter>,
     context: ReportContext,
 ) -> Result<(), String> {
+    start_with(
+        config,
+        state,
+        cancel,
+        context,
+        move |config, cancel, deadline, state| {
+            gpu(config, adapter.as_ref(), cancel, deadline, state)
+        },
+    )
+}
+
+pub fn start_gpu_in_worker(
+    config: Config,
+    state: Arc<Mutex<State>>,
+    cancel: Arc<AtomicBool>,
+    adapter: Option<wgpu::Adapter>,
+    context: ReportContext,
+    executable: PathBuf,
+) -> Result<(), String> {
+    if config.kind != Kind::Gpu {
+        return Err("The GPU worker can only run a GPU check.".into());
+    }
+    let adapter = adapter.as_ref().map(gpu_worker::AdapterKey::from);
+    start_with(
+        config,
+        state,
+        cancel,
+        context,
+        move |config, cancel, deadline, state| {
+            gpu_worker::supervise(&executable, config, adapter, cancel, deadline, state)
+        },
+    )
+}
+
+fn start_with(
+    config: Config,
+    state: Arc<Mutex<State>>,
+    cancel: Arc<AtomicBool>,
+    context: ReportContext,
+    run_gpu: impl FnOnce(&Config, &AtomicBool, Option<Instant>, &Mutex<State>) -> Result<Outcome, TestError>
+        + Send
+        + 'static,
+) -> Result<(), String> {
     let mode_valid = match config.run_mode {
         RunMode::Timed => (1..=MAX_TIMED_SECONDS).contains(&config.seconds),
         RunMode::Continuous => true,
@@ -593,7 +639,7 @@ pub fn start(
         };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match config.kind {
             Kind::Cpu => cpu(&config, &cancel, deadline, &state),
-            Kind::Gpu => gpu(&config, adapter.as_ref(), &cancel, deadline, &state),
+            Kind::Gpu => run_gpu(&config, &cancel, deadline, &state),
             Kind::Memory => memory(&config, &cancel, deadline, &state),
             Kind::Disk => disk(&config, &cancel, deadline, &state),
             Kind::Combined => combined(&config, &cancel, deadline, &state),

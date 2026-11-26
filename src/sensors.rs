@@ -11,6 +11,17 @@
 //! Every reading is tagged with its raw provider key and provenance source; a
 //! value is only reported when it decodes to a plausible number.
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod lhm;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExternalThermals {
+    #[default]
+    Disabled,
+    Unavailable,
+    Connected,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
     Celsius,
@@ -26,6 +37,8 @@ pub struct Sensor {
     pub source: &'static str,
     pub value: Option<f32>,
     pub unit: Unit,
+    /// Identified as a core by the provider's hardware channel identity.
+    pub cpu_core: bool,
 }
 
 #[derive(Default, Debug)]
@@ -124,6 +137,7 @@ impl Reader {
                     source: "SMC",
                     value: Some(value as f32),
                     unit: entry.unit,
+                    cpu_core: entry.unit == Unit::Celsius && apple_core_key(&entry.key),
                 };
                 match entry.unit {
                     Unit::Celsius => out.temps.push(sensor),
@@ -139,6 +153,11 @@ impl Reader {
             Readings::default()
         }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apple_core_key(key: &str) -> bool {
+    matches!(key.as_bytes(), [b'T', b'p' | b'e', a, b] if a.is_ascii_digit() && b.is_ascii_digit())
 }
 
 /// `MSAcpi_ThermalZoneTemperature` reports tenths of a degree Kelvin.
@@ -331,6 +350,7 @@ mod linux {
                     source: "hwmon",
                     value: Some(value),
                     unit: entry.unit,
+                    cpu_core: entry.physical_core.is_some(),
                 };
                 match entry.unit {
                     Unit::Celsius => out.temps.push(sensor),
@@ -466,6 +486,7 @@ mod win {
             source: "ACPI",
             value: Some(celsius),
             unit: Unit::Celsius,
+            cpu_core: false,
         });
     }
 }
@@ -794,6 +815,15 @@ mod tests {
         assert_eq!(label_for("F0Ac", Unit::Rpm), "Fan 0");
         assert_eq!(label_for("F1Ac", Unit::Rpm), "Fan 1");
         assert_eq!(label_for("ZZ1Z", Unit::Celsius), "ZZ1Z");
+    }
+
+    #[test]
+    fn apple_core_group_keeps_other_smc_channels_separate() {
+        assert!(apple_core_key("Tp01"));
+        assert!(apple_core_key("Te05"));
+        assert!(!apple_core_key("TC0P"));
+        assert!(!apple_core_key("Tp0P"));
+        assert!(!apple_core_key("Té05"));
     }
 
     #[test]

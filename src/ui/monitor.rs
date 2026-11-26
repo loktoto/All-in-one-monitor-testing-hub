@@ -441,7 +441,7 @@ impl App {
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ghost_button(ui, "Reset min/max").clicked() {
+                    if ghost_button(ui, "Reset statistics").clicked() {
                         self.stats_reset.store(true, Ordering::Relaxed);
                     }
                 });
@@ -467,15 +467,7 @@ impl App {
                         || t.key.to_ascii_lowercase().contains(&query)
                         || t.source.to_ascii_lowercase().contains(&query)
                 })
-                .map(|t| RowView {
-                    label: &t.label,
-                    key: &t.key,
-                    source: t.source,
-                    current: t.celsius,
-                    min: t.min,
-                    max: t.max,
-                    unit: "°C",
-                })
+                .map(RowView::from)
                 .collect();
 
             let mut open = self.overview.sensors;
@@ -522,15 +514,7 @@ impl App {
                                 || f.label.to_ascii_lowercase().contains(&query)
                                 || f.key.to_ascii_lowercase().contains(&query)
                         })
-                        .map(|f| RowView {
-                            label: &f.label,
-                            key: &f.key,
-                            source: f.source,
-                            current: f.rpm,
-                            min: f.min,
-                            max: f.max,
-                            unit: "RPM",
-                        })
+                        .map(RowView::from)
                         .collect();
                     if !fan_rows.is_empty() {
                         ui.add_space(8.0);
@@ -563,6 +547,7 @@ impl App {
                         .then_some(s.cpu_usage),
                     min: s.cpu_range.min,
                     max: s.cpu_range.max,
+                    average: None,
                     unit: "%",
                 },
                 RowView {
@@ -572,6 +557,7 @@ impl App {
                     current: mem_pct,
                     min: s.memory_range.min,
                     max: s.memory_range.max,
+                    average: None,
                     unit: "%",
                 },
             ];
@@ -1007,6 +993,82 @@ impl App {
         });
     }
 
+    pub fn view_core_temperatures(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                section_title(ui, "CPU core temperatures", None);
+                if ghost_button(ui, "Reset statistics").clicked() {
+                    self.stats_reset.store(true, Ordering::Relaxed);
+                }
+            });
+            ui.add_space(6.0);
+            #[cfg(target_os = "windows")]
+            {
+                use hardware_hub::sensors::ExternalThermals;
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.libre_monitor_enabled, "Read LibreHardwareMonitor");
+                    if self.libre_monitor_enabled {
+                        ui.add(
+                            egui::DragValue::new(&mut self.libre_monitor_port)
+                                .range(1..=u16::MAX)
+                                .prefix("Port "),
+                        );
+                    }
+                });
+                if self.libre_monitor_enabled {
+                    let (status, color) = match snapshot.external_thermals {
+                        ExternalThermals::Connected => ("Local feed connected", GREEN),
+                        ExternalThermals::Unavailable => ("Waiting for local feed", AMBER),
+                        ExternalThermals::Disabled => ("Connecting to local feed", MUTED),
+                    };
+                    pill(ui, status, color);
+                    if snapshot.external_thermals != ExternalThermals::Connected {
+                        ui.label(format!(
+                            "Run LibreHardwareMonitor’s web server on 127.0.0.1:{}.",
+                            self.libre_monitor_port,
+                        ));
+                    }
+                    ui.add_space(5.0);
+                }
+            }
+            let count = snapshot.temperatures.iter().filter(|sensor| sensor.cpu_core).count();
+            if count == 0 {
+                empty_note(ui, if snapshot.ready {
+                    "No per-core temperature channels reported. Package and zone readings are in Thermals / fans."
+                } else {
+                    "Waiting for the first temperature sample."
+                });
+                return;
+            }
+            let sampled = snapshot.temperatures.iter()
+                .filter(|sensor| sensor.cpu_core && sensor.celsius.is_some()).count();
+            ui.label(RichText::new(format!("{sampled} of {count} channels reporting · session statistics"))
+                .size(10.5).color(TEXT_DIM));
+            text_field(ui, &mut self.core_sensor_filter, "Filter by core name or sensor key…", f32::INFINITY);
+            let query = self.core_sensor_filter.trim().to_ascii_lowercase();
+            let rows: Vec<_> = snapshot.temperatures.iter().filter(|sensor| sensor.cpu_core)
+                .filter(|sensor| query.is_empty()
+                    || sensor.label.to_ascii_lowercase().contains(&query)
+                    || sensor.key.to_ascii_lowercase().contains(&query)
+                    || sensor.source.to_ascii_lowercase().contains(&query))
+                .map(RowView::from).collect();
+            if rows.is_empty() {
+                empty_note(ui, "No core temperatures match this filter.");
+                return;
+            }
+            let action = sensor_table(ui, "physical-core-sensors", "", &rows, Some(&self.selected_temp_key), &self.pinned_sensors, true);
+            if let Some(key) = action.clicked_key {
+                self.selected_temp_key = key;
+                self.focus_temperature_chart = true;
+                self.page = Page::Thermal;
+            }
+            if let Some(key) = action.toggled_pin {
+                self.toggle_pin_sensor(&key);
+            }
+        });
+    }
+
     // ---------------------------------------------------------------- Thermals & Alerts page
     pub fn view_thermal(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let peak_c = snapshot
@@ -1051,18 +1113,15 @@ impl App {
                 ) {
                     self.poll_ms.store(poll, Ordering::Relaxed);
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ghost_button(ui, "Reset min/max").clicked() {
-                        self.stats_reset.store(true, Ordering::Relaxed);
-                    }
-                });
             });
         });
 
         ui.add_space(10.0);
 
-        // Temperature history graph
-        card_frame().show(ui, |ui| {
+        self.view_core_temperatures(ui, snapshot);
+        ui.add_space(10.0);
+
+        let chart = card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(
                 ui,
@@ -1078,11 +1137,24 @@ impl App {
                 }
                 let selected = self.selected_temp_key.clone();
                 ui.horizontal_wrapped(|ui| {
+                    let display_name = |key: &str| -> String {
+                        snapshot
+                            .temperatures
+                            .iter()
+                            .find(|sensor| sensor.key == key)
+                            .map(|sensor| format!("{} · {}", sensor.label, sensor.source))
+                            .unwrap_or_else(|| key.to_owned())
+                    };
                     egui::ComboBox::from_id_salt("thermal-series")
-                        .selected_text(&selected)
+                        .selected_text(display_name(&selected))
                         .show_ui(ui, |ui| {
                             for key in &keys {
-                                ui.selectable_value(&mut self.selected_temp_key, key.clone(), key);
+                                ui.selectable_value(
+                                    &mut self.selected_temp_key,
+                                    key.clone(),
+                                    display_name(key),
+                                )
+                                .on_hover_text(key);
                             }
                         });
                     if let Some((low, high, mean)) = history::range(&self.history, |sample| {
@@ -1166,17 +1238,16 @@ impl App {
                 });
             }
         });
+        if std::mem::take(&mut self.focus_temperature_chart) {
+            chart.response.scroll_to_me(Some(egui::Align::Min));
+        }
 
         ui.add_space(10.0);
 
         // Full HWMonitor sensor table
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(
-                ui,
-                "Live Thermal Sensors & Fans",
-                Some("click row to graph · click right dot to pin to HUD"),
-            );
+            section_title(ui, "Other temperatures & fans", None);
             ui.add_space(6.0);
             if snapshot.temperatures.is_empty() && snapshot.fans.is_empty() {
                 empty_note(ui, sensor_unavailable_note());
@@ -1184,21 +1255,14 @@ impl App {
                 let temps: Vec<RowView<'_>> = snapshot
                     .temperatures
                     .iter()
-                    .map(|t| RowView {
-                        label: &t.label,
-                        key: &t.key,
-                        source: t.source,
-                        current: t.celsius,
-                        min: t.min,
-                        max: t.max,
-                        unit: "°C",
-                    })
+                    .filter(|sensor| !sensor.cpu_core)
+                    .map(RowView::from)
                     .collect();
                 if !temps.is_empty() {
                     let out = sensor_table(
                         ui,
                         "thermal-page-temps",
-                        "Temperatures",
+                        "",
                         &temps,
                         (!self.selected_temp_key.is_empty())
                             .then_some(self.selected_temp_key.as_str()),
@@ -1207,24 +1271,14 @@ impl App {
                     );
                     if let Some(k) = out.clicked_key {
                         self.selected_temp_key = k;
+                        self.focus_temperature_chart = true;
+                        ui.ctx().request_repaint();
                     }
                     if let Some(k) = out.toggled_pin {
                         self.toggle_pin_sensor(&k);
                     }
                 }
-                let fans: Vec<RowView<'_>> = snapshot
-                    .fans
-                    .iter()
-                    .map(|f| RowView {
-                        label: &f.label,
-                        key: &f.key,
-                        source: f.source,
-                        current: f.rpm,
-                        min: f.min,
-                        max: f.max,
-                        unit: "RPM",
-                    })
-                    .collect();
+                let fans: Vec<RowView<'_>> = snapshot.fans.iter().map(RowView::from).collect();
                 if !fans.is_empty() {
                     ui.add_space(8.0);
                     let out = sensor_table(

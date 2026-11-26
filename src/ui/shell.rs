@@ -778,6 +778,7 @@ impl App {
                                     }
                                     JumpTarget::Temperature(key) => {
                                         self.selected_temp_key = key.to_owned();
+                                        self.focus_temperature_chart = true;
                                         Page::Thermal
                                     }
                                     JumpTarget::Process(name) => {
