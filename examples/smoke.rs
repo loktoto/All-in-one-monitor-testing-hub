@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let test_gpu = std::env::args().skip(1).any(|arg| arg == "--gpu");
     let root = std::env::temp_dir().join(format!(
         "hub-smoke-{}-{}",
         std::process::id(),
@@ -40,6 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample = snapshot.lock().unwrap().clone();
     if !sample.ready {
         return Err("No telemetry sample within 20 seconds".into());
+    }
+    let physical_gpu = sample.adapters.iter().find(|adapter| !adapter.software);
+    if test_gpu && physical_gpu.is_none() {
+        return Err("--gpu requested, but the platform reported no hardware adapter".into());
     }
     println!("Telemetry: CPU {}, {} logical CPUs, {} bytes RAM, {} volumes, {} adapters, {} temperature sensors, {} fans",sample.cpu_name,sample.cores.len(),sample.memory_total,sample.disks.len(),sample.adapters.len(),sample.temperatures.len(),sample.fans.len());
     println!(
@@ -91,6 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mem_pattern: MemPattern::Alternating,
         disk_pattern: DiskPattern::Constant,
         gpu_intensity: GpuIntensity::Standard,
+        ..Config::default()
     };
     stress::start(
         cancel_config,
@@ -119,20 +125,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Kind::Gpu,
         Kind::Combined,
     ] {
+        let adapter = (test_gpu && kind == Kind::Gpu)
+            .then_some(physical_gpu)
+            .flatten();
         let cfg = Config {
             kind,
-            seconds: 1,
+            seconds: if adapter.is_some() { 3 } else { 1 },
             workers: 1,
             mib: 1,
             directory: root.clone(),
-            gpu_adapter: None,
+            gpu_adapter: adapter.map(|a| format!("{} · {}", a.name, a.backend)),
             disk_write_limit_mib: 1,
             mem_pattern: MemPattern::Alternating,
             disk_pattern: DiskPattern::Constant,
-            gpu_intensity: GpuIntensity::Standard,
+            gpu_intensity: if adapter.is_some() {
+                GpuIntensity::Light
+            } else {
+                GpuIntensity::Standard
+            },
+            ..Config::default()
         };
-        // No physical GPU workload is launched by this smoke test.
-        stress::start(cfg, state.clone(), cancel.clone(), None, context.clone())?;
+        stress::start(
+            cfg,
+            state.clone(),
+            cancel.clone(),
+            adapter.map(|a| a.handle.clone()),
+            context.clone(),
+        )?;
         let until = Instant::now() + Duration::from_secs(20);
         while state.lock().unwrap().running && Instant::now() < until {
             thread::sleep(Duration::from_millis(20));
@@ -143,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("{kind:?} did not stop").into());
         }
         let result = guard.results.last().ok_or("missing result")?;
-        let expected = if kind == Kind::Gpu {
+        let expected = if kind == Kind::Gpu && adapter.is_none() {
             Status::Unavailable
         } else {
             Status::Completed

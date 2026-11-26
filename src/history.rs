@@ -346,6 +346,7 @@ mod tests {
         sample.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: Some(61.5),
             min: None,
             max: None,
@@ -353,6 +354,7 @@ mod tests {
         sample.temperatures.push(Temperature {
             key: "TCSF".into(),
             label: "Skin".into(),
+            source: "SMC",
             celsius: Some(40.0),
             min: None,
             max: None,
@@ -362,6 +364,7 @@ mod tests {
         later.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: None,
             min: None,
             max: None,
@@ -401,6 +404,7 @@ mod tests {
         sample.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: Some(61.5),
             min: None,
             max: None,
@@ -408,6 +412,7 @@ mod tests {
         sample.temperatures.push(Temperature {
             key: "TCSF".into(),
             label: "Skin".into(),
+            source: "SMC",
             celsius: Some(40.0),
             min: None,
             max: None,
@@ -417,6 +422,7 @@ mod tests {
         later.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: Some(63.0),
             min: None,
             max: None,

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hardware Hub — 2026 UI/UX Redesign Concepts</title>
+<style>
+  :root {
+    --bg: #0f1014;
+    --card: #171920;
+    --border: #262933;
+    --text: #f3f4f6;
+    --muted: #9ca3af;
+    --accent: #3b82f6;
+    --green: #30d158;
+    --amber: #ff9f0a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 32px 24px 64px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    line-height: 1.55;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 16px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 28px;
+  }
+  h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.02em; }
+  .subtitle { color: var(--muted); margin: 6px 0 0; font-size: 14px; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(59,130,246,0.14);
+    border: 1px solid rgba(59,130,246,0.35);
+    color: #93c5fd;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+    margin-bottom: 28px;
+  }
+  .section-head {
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .section-head h2 { margin: 0; font-size: 18px; font-weight: 600; }
+  .section-head p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  .tag {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(48,209,88,0.12);
+    color: var(--green);
+    border: 1px solid rgba(48,209,88,0.3);
+  }
+  .img-box { background: #0a0b0e; padding: 16px; }
+  .img-box img {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 10px;
+    border: 1px solid #20232d;
+  }
+  .notes {
+    padding: 16px 22px 20px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+  }
+  .note {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 13px;
+    color: #d1d5db;
+  }
+  .note strong { display: block; color: var(--text); margin-bottom: 3px; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Hardware Hub — 2026 UI/UX Redesign Concepts</h1>
+        <p class="subtitle">Generated visual direction mockups for approval before modifying <code>src/main.rs</code> (egui 0.31)</p>
+      </div>
+      <span class="badge">3 Concept Screens · Awaiting Approval</span>
+    </header>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>01 · Overview — Bento Telemetry Dashboard</h2>
+          <p>Eliminates sidebar overflow and brings live charts + per-core equalizer above the fold.</p>
+        </div>
+        <span class="tag">01-overview-redesign.webp</span>
+      </div>
+      <div class="img-box">
+        <img src="./01-overview-redesign.webp" alt="Overview Redesign Concept">
+      </div>
+      <div class="notes">
+        <div class="note"><strong>Consolidated 6-Item Sidebar</strong>Groups 15 flat pages into 6 unclipped destinations (Overview, Hardware w/ sub-tabs, Thermals, Stress Lab, Processes, Reports).</div>
+        <div class="note"><strong>4 Radial Arc KPI Cards</strong>CPU, Memory, GPU, and System Health sit cleanly in Row 1 with semantic emerald/blue/violet status tokens.</div>
+        <div class="note"><strong>Above-the-Fold Charts</strong>Pairs the live telemetry curve (left) with a vertical per-core equalizer (right) and compact thermal range bars below.</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>02 · Stress Lab — 2-Column Live Supervision Cockpit</h2>
+          <p>Replaces clipped 2x2 tiles and buried Stop button with an OCCT-inspired active test cockpit.</p>
+        </div>
+        <span class="tag">02-stress-lab-redesign.webp</span>
+      </div>
+      <div class="img-box">
+        <img src="./02-stress-lab-redesign.webp" alt="Stress Lab Redesign Concept">
+      </div>
+      <div class="notes">
+        <div class="note"><strong>Horizontal 5-Mode Pill Bar</strong>CPU Compute, GPU Check, Memory Patterns, File I/O, and Combined Load in one compact top bar.</div>
+        <div class="note"><strong>In-Place Crimson Stop CTA</strong>While running, the primary button flips to a high-contrast red <code>Stop Check (Esc)</code> button—no hunting in the sidebar.</div>
+        <div class="note"><strong>Live Supervision Cockpit</strong>Circular progress arc, bold <code>0 ERRORS VERIFIED</code> pill, throughput counters, and an unclipped live chart with an 85°C dashed limit line.</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>03 · Thermals &amp; Sensors + Floating Monitor HUD</h2>
+          <p>Upgrades plain sensor tables with Min–Current–Max visual range bars and a compact floating HUD.</p>
+        </div>
+        <span class="tag">03-thermals-hud-redesign.webp</span>
+      </div>
+      <div class="img-box">
+        <img src="./03-thermals-hud-redesign.webp" alt="Thermals and Floating HUD Redesign Concept">
+      </div>
+      <div class="notes">
+        <div class="note"><strong>Top Telemetry Toolbar</strong>Peak temp, thermal headroom, alert limit, polling cadence selector (250ms–2s), and one-click Record CSV.</div>
+        <div class="note"><strong>Visual Min–Current–Max Bars</strong>Color-graded range bars with a crisp current-value marker dot plus monospace hardware key pills (<code>TZ00</code>, <code>TZ01</code>, <code>TC0D</code>).</div>
+        <div class="note"><strong>Compact Floating HUD</strong>Sleek always-on-top mini overlay displaying CPU %, RAM %, Peak °C, and a live sparkline.</div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

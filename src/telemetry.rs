@@ -54,6 +54,8 @@ pub struct Temperature {
     /// Provider key, so an unfamiliar sensor stays traceable.
     pub key: String,
     pub label: String,
+    /// Short provenance tag (`SMC`, `ACPI`, `hwmon`, `sysinfo`).
+    pub source: &'static str,
     pub celsius: Option<f32>,
     pub min: Option<f32>,
     pub max: Option<f32>,
@@ -62,6 +64,8 @@ pub struct Temperature {
 pub struct Fan {
     pub key: String,
     pub label: String,
+    /// Short provenance tag (`SMC`, `hwmon`, `sysinfo`).
+    pub source: &'static str,
     pub rpm: Option<f32>,
     pub min: Option<f32>,
     pub max: Option<f32>,
@@ -79,6 +83,10 @@ pub struct Snapshot {
     pub gpu_backend: String,
     pub cpu_usage: f32,
     pub cores: Vec<f32>,
+    /// Per-logical-core frequency in MHz as reported by the OS (0 when unavailable).
+    pub core_mhz: Vec<u64>,
+    /// Sensors the OS can associate with a physical core behind each logical CPU.
+    pub core_celsius: Vec<Option<f32>>,
     pub memory_total: u64,
     pub memory_used: u64,
     pub memory_available: u64,
@@ -324,6 +332,19 @@ pub fn spawn(
     // demand (with a slow background refresh to keep the list warm).
     process_wanted: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
+    spawn_with_notification(shared, stop, reset, interval_ms, process_wanted, || {})
+}
+
+/// Like `spawn`, with a notification on the sampling thread after each
+/// snapshot becomes available to readers.
+pub fn spawn_with_notification(
+    shared: Arc<Mutex<Arc<Snapshot>>>,
+    stop: Arc<AtomicBool>,
+    reset: Arc<AtomicBool>,
+    interval_ms: Arc<AtomicU64>,
+    process_wanted: Arc<AtomicBool>,
+    notify: impl Fn() + Send + 'static,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = System::new_all();
         let mut disks = Disks::new_with_refreshed_list();
@@ -449,6 +470,7 @@ pub fn spawn(
             let memory_total = system.total_memory();
             let memory_used = system.used_memory();
             let cores: Vec<f32> = system.cpus().iter().map(|c| c.cpu_usage()).collect();
+            let core_mhz: Vec<u64> = system.cpus().iter().map(|c| c.frequency()).collect();
             let cpu_range = if cores.is_empty() {
                 Range::default()
             } else {
@@ -463,15 +485,22 @@ pub fn spawn(
                 )
             };
             let readings = sensors.as_mut().map(|reader| reader.readings());
+            let core_celsius = sensors
+                .as_ref()
+                .zip(readings.as_ref())
+                .map_or_else(Vec::new, |(reader, readings)| {
+                    reader.core_temperatures(readings, system.cpus())
+                });
             let mut temperatures: Vec<Temperature> = Vec::new();
             let mut fans: Vec<Fan> = Vec::new();
             match readings {
-                Some(readings) if !readings.temps.is_empty() => {
+                Some(readings) if !readings.temps.is_empty() || !readings.fans.is_empty() => {
                     for sensor in readings.temps {
                         let (min, max) = note(&mut temp_bounds, &sensor.key, sensor.value);
                         temperatures.push(Temperature {
                             key: sensor.key,
                             label: sensor.label,
+                            source: sensor.source,
                             celsius: sensor.value,
                             min,
                             max,
@@ -482,6 +511,7 @@ pub fn spawn(
                         fans.push(Fan {
                             key: sensor.key,
                             label: sensor.label,
+                            source: sensor.source,
                             rpm: sensor.value,
                             min,
                             max,
@@ -514,6 +544,7 @@ pub fn spawn(
                         temperatures.push(Temperature {
                             key,
                             label,
+                            source: "sysinfo",
                             celsius,
                             min,
                             max,
@@ -541,6 +572,8 @@ pub fn spawn(
                 gpu_backend: backend_label().to_owned(),
                 cpu_usage,
                 cores,
+                core_mhz,
+                core_celsius,
                 memory_total,
                 memory_used,
                 memory_available: system.available_memory(),
@@ -574,9 +607,7 @@ pub fn spawn(
                 updated_at: Some(Instant::now()),
                 ready: true,
             };
-            if let Ok(mut out) = shared.lock() {
-                *out = Arc::new(snapshot);
-            }
+            publish(&shared, snapshot, &notify);
             // Measure the whole collection and sleep only for the remainder, so
             // a slow provider cannot turn into two stacked one-second polls.
             let period =
@@ -591,6 +622,15 @@ pub fn spawn(
         }
     })
 }
+
+fn publish(shared: &Mutex<Arc<Snapshot>>, snapshot: Snapshot, notify: impl FnOnce()) {
+    if let Ok(mut out) = shared.lock() {
+        *out = Arc::new(snapshot);
+        drop(out);
+        notify();
+    }
+}
+
 /// Tracks an all-time low/high for a named sensor. A missing sample never
 /// becomes a zero, and never clears what was already observed.
 fn note(
@@ -622,6 +662,71 @@ fn observe(bounds: &mut Option<(f32, f32)>, value: f32) -> Range {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "runs a bounded single-thread workload on each of the first two logical CPUs"]
+    fn first_two_logical_processors_respond_under_affinity() {
+        use std::{ffi::c_void, sync::mpsc};
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentThread() -> *mut c_void;
+            fn SetThreadAffinityMask(thread: *mut c_void, mask: usize) -> usize;
+        }
+
+        let mut system = System::new();
+        system.refresh_cpu_all();
+        assert!(system.cpus().len() >= 2);
+        for index in 0..2 {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (ready, wait) = mpsc::sync_channel(0);
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                let pinned = unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << index) };
+                if ready.send(pinned != 0).is_err() || pinned == 0 {
+                    return;
+                }
+                let until = Instant::now() + Duration::from_secs(4);
+                let mut value = 1_u64;
+                while !worker_stop.load(Ordering::Relaxed) && Instant::now() < until {
+                    value = std::hint::black_box(value.wrapping_mul(2_654_435_761).wrapping_add(1));
+                }
+            });
+            assert!(wait.recv_timeout(Duration::from_secs(2)).unwrap());
+            thread::sleep(Duration::from_millis(300));
+            system.refresh_cpu_all();
+            thread::sleep(Duration::from_secs(1));
+            system.refresh_cpu_all();
+            let load = system.cpus()[index].cpu_usage();
+            stop.store(true, Ordering::Relaxed);
+            worker.join().unwrap();
+            println!("Logical processor {index} with one pinned worker: {load:.1}%");
+            assert!(load >= 50.0, "logical processor {index} read {load:.1}%");
+        }
+    }
+
+    #[test]
+    fn publish_notifies_after_readers_can_access_the_new_snapshot() {
+        let shared = Mutex::new(Arc::new(Snapshot::default()));
+        let updated_at = Instant::now();
+        let mut notified = false;
+        publish(
+            &shared,
+            Snapshot {
+                updated_at: Some(updated_at),
+                ready: true,
+                ..Snapshot::default()
+            },
+            || {
+                let snapshot = shared.try_lock().expect("snapshot lock must be released");
+                assert!(snapshot.ready);
+                assert_eq!(snapshot.updated_at, Some(updated_at));
+                notified = true;
+            },
+        );
+        assert!(notified);
+    }
 
     #[test]
     fn min_and_max_follow_samples_and_ignore_gaps() {

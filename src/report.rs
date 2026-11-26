@@ -17,14 +17,19 @@ pub fn export(path: &Path, format: Format, records: &[ResultRecord]) -> Result<(
             let mut out=format!("Hardware Hub report · version {}\n\n",env!("CARGO_PKG_VERSION"));
             for r in records {
                 let settings=match r.kind {
-                    crate::stress::Kind::Cpu=>format!("workers {}",r.config.workers),
+                    crate::stress::Kind::Cpu=>format!("workers {}, workload {}",r.config.workers,r.config.cpu_workload.label()),
                     crate::stress::Kind::Gpu=>format!("GPU {}",r.config.gpu_adapter.as_deref().unwrap_or("not selected")),
                     crate::stress::Kind::Memory=>format!("memory {} MiB",r.config.mib),
                     crate::stress::Kind::Disk=>format!("file {} MiB, write cap {} MiB, directory {}",r.config.mib,r.config.disk_write_limit_mib,r.config.directory.display()),
                     crate::stress::Kind::Combined=>format!("workers {}, memory {} MiB, pattern {}",r.config.workers,r.config.mib,r.config.mem_pattern.label()),
                 };
+                let run_limit = match r.config.run_mode {
+                    crate::stress::RunMode::Timed => format!("duration {}", crate::stress::format_duration(r.config.seconds)),
+                    crate::stress::RunMode::Continuous => "continuous (until stopped)".into(),
+                    crate::stress::RunMode::Passes => format!("{} target pass(es)", r.config.target_passes),
+                };
                 let age=r.context.snapshot_age_seconds.map(|v|format!("{v:.1} s")).unwrap_or_else(||"unavailable".into());
-                out.push_str(&format!("{:?} | {} | {:.1}s | Unix {}\n{}\nVerified {}: {}\nSettings: duration {}s, {}\nSystem: {}, {} logical CPUs, {} bytes RAM, OS {}, adapters: {}; snapshot age at start: {}\n\n",r.kind,r.status,r.elapsed,r.timestamp,r.detail,r.verified_unit,r.verified_units.map(|n|n.to_string()).unwrap_or_else(||"unknown".into()),r.config.seconds,settings,r.context.cpu,r.context.logical_cpus,r.context.memory_total,r.context.os,r.context.adapters.join(", "),age));
+                out.push_str(&format!("{:?} | {} | {:.1}s | Unix {}\n{}\nVerified {}: {}\nSettings: {}, {}\nSystem: {}, {} logical CPUs, {} bytes RAM, OS {}, adapters: {}; snapshot age at start: {}\n\n",r.kind,r.status,r.elapsed,r.timestamp,r.detail,r.verified_unit,r.verified_units.map(|n|n.to_string()).unwrap_or_else(||"unknown".into()),run_limit,settings,r.context.cpu,r.context.logical_cpus,r.context.memory_total,r.context.os,r.context.adapters.join(", "),age));
             }
             out.into_bytes()
         }
@@ -81,6 +86,16 @@ pub fn render_certificate(record: &ResultRecord, peak_c: Option<f32>) -> String 
     let timestamp = format!("Unix {}", record.timestamp);
     let check = format!("{:?}", record.kind);
     let gib = record.context.memory_total as f64 / 1073741824.0;
+    let limit_desc = match record.config.run_mode {
+        crate::stress::RunMode::Timed => {
+            format!(
+                "limit {}",
+                crate::stress::format_duration(record.config.seconds)
+            )
+        }
+        crate::stress::RunMode::Continuous => "continuous".into(),
+        crate::stress::RunMode::Passes => format!("{} pass(es)", record.config.target_passes),
+    };
     format!(
         "HARDWARE HUB · RUN SUMMARY\n\
          version {version} · generated {timestamp}\n\
@@ -88,7 +103,7 @@ pub fn render_certificate(record: &ResultRecord, peak_c: Option<f32>) -> String 
          Result:      {verdict}\n\
          Check:       {check}\n\
          Run at:      {timestamp}\n\
-         Duration:    {elapsed:.1}s (limit {limit}s)\n\
+         Duration:    {elapsed:.1}s ({limit_desc})\n\
          \n\
          Verified:    {verified} {unit}\n\
          Detail:      {detail}\n\
@@ -105,7 +120,6 @@ pub fn render_certificate(record: &ResultRecord, peak_c: Option<f32>) -> String 
          still required before relying on any component.\n",
         version = env!("CARGO_PKG_VERSION"),
         elapsed = record.elapsed,
-        limit = record.config.seconds,
         unit = record.verified_unit,
         detail = record.detail,
         errors = record.error_count,
@@ -171,6 +185,7 @@ mod tests {
                 mem_pattern: MemPattern::Alternating,
                 disk_pattern: DiskPattern::Constant,
                 gpu_intensity: GpuIntensity::Standard,
+                ..Config::default()
             },
             context: ReportContext::default(),
             error_count: 0,
@@ -218,6 +233,7 @@ mod tests {
                 mem_pattern: MemPattern::Alternating,
                 disk_pattern: DiskPattern::Constant,
                 gpu_intensity: GpuIntensity::Standard,
+                ..Config::default()
             },
             context: ReportContext::default(),
             error_count: 0,
