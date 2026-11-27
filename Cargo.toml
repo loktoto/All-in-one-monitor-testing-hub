@@ -44,3 +44,8 @@ opt-level = 3
 lto = false
 codegen-units = 16
 strip = true
+
+# Naga translates the benchmark shaders during setup. Keep the generated shader
+# and the rest of the test workload at the usual release optimisation level.
+[profile.release.package.naga]
+opt-level = "s"

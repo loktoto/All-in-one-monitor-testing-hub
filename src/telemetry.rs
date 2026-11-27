@@ -168,16 +168,22 @@ fn is_synthetic_volume(_mount: &str) -> bool {
 // Adapter handles are retained and reused for test selection; identical models stay distinct.
 pub(crate) fn discover_adapters() -> Vec<Adapter> {
     std::panic::catch_unwind(|| {
-        let instance = wgpu::Instance::default();
         let preferred = preferred_backends();
-        let mut found = instance.enumerate_adapters(preferred);
-        if found.is_empty()
-            || found
+        let enumerate = |backend| {
+            wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: backend,
+                ..Default::default()
+            })
+            .enumerate_adapters(backend)
+        };
+        let mut found = enumerate(preferred);
+        if wgpu::Instance::enabled_backend_features().contains(wgpu::Backends::GL)
+            && found
                 .iter()
                 .all(|a| a.get_info().device_type == wgpu::DeviceType::Cpu)
         {
             let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                instance.enumerate_adapters(wgpu::Backends::GL)
+                enumerate(wgpu::Backends::GL)
             }))
             .unwrap_or_default();
             if found.is_empty()
@@ -862,6 +868,22 @@ fn observe(bounds: &mut Option<(f32, f32)>, value: f32) -> Range {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a hardware adapter and a working graphics driver"]
+    fn discovered_hardware_adapter_opens_a_device() {
+        let adapter = super::discover_adapters()
+            .into_iter()
+            .find(|adapter| !adapter.software)
+            .expect("a hardware graphics adapter");
+        println!("{} ({})", adapter.name, adapter.backend);
+        pollster::block_on(
+            adapter
+                .handle
+                .request_device(&wgpu::DeviceDescriptor::default(), None),
+        )
+        .expect("adapter remains usable after enumeration");
+    }
+
     use super::*;
 
     #[test]
