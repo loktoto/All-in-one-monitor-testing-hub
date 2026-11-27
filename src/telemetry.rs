@@ -110,6 +110,19 @@ pub struct Snapshot {
     pub ready: bool,
 }
 
+impl Snapshot {
+    pub fn advisory_temperature(&self, sensor_key: &str, hottest: Option<f32>) -> Option<f32> {
+        if sensor_key.is_empty() {
+            return hottest;
+        }
+        self.temperatures
+            .iter()
+            .find(|sensor| sensor.key == sensor_key)
+            .and_then(|sensor| sensor.celsius)
+            .filter(|value| value.is_finite())
+    }
+}
+
 // Each platform has one native graphics API to enumerate. Asking for Vulkan on
 // macOS returns nothing (Metal is the only native API there), so the backend is
 // selected per target instead of assuming DX12-or-Vulkan.

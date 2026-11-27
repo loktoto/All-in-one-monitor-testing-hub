@@ -74,6 +74,8 @@ pub struct Settings {
     pub directory: String,
     /// Advisory alert threshold in Celsius.
     pub alert_celsius: f32,
+    /// An empty key watches the hottest available temperature.
+    pub alert_sensor_key: String,
     /// Seconds a reading must stay above the threshold before it fires.
     pub alert_hold_secs: u64,
     /// Opt-in: stop the software check when fresh samples meet the heat limit for the hold time.
@@ -113,6 +115,7 @@ impl Default for Settings {
             disk_write_limit_mib: 256,
             directory: std::env::temp_dir().to_string_lossy().into_owned(),
             alert_celsius: 85.0,
+            alert_sensor_key: String::new(),
             alert_hold_secs: 5,
             auto_stop_on_heat: false,
             pinned_sensors: Vec::new(),
@@ -209,6 +212,7 @@ mod tests {
         assert_eq!(s.workers, Settings::default().workers);
         assert_eq!(s.window_width, Settings::default().window_width);
         assert_eq!(s.stress_mode, "timed");
+        assert!(s.alert_sensor_key.is_empty());
     }
 
     #[test]
@@ -221,6 +225,7 @@ mod tests {
             pro_density: false,
             poll_ms: 750,
             alert_celsius: 90.0,
+            alert_sensor_key: "TZ01".into(),
             stress_mode: "continuous".into(),
             pinned_sensors: vec!["TZ01".into()],
             ..Settings::default()

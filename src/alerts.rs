@@ -23,7 +23,7 @@ impl Severity {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
     pub celsius: f32,
     pub hold: Duration,
@@ -76,6 +76,7 @@ impl ThermalStop {
 
 #[derive(Default)]
 pub struct Monitor {
+    rule: Option<Threshold>,
     breached_since: Option<Instant>,
     active_since: Option<Instant>,
     recovered_since: Option<Instant>,
@@ -104,10 +105,16 @@ impl Monitor {
         }
     }
 
-    /// Feed the highest currently available temperature. `None` means no fresh
-    /// reading; it pauses the streak rather than treating the sensor as cold.
+    /// Feed the currently watched temperature. `None` means no fresh reading
+    /// and clears the streak.
     /// Returns true on the frame the alert first becomes active.
     pub fn observe(&mut self, temperature: Option<f32>, now: Instant, rule: Threshold) -> bool {
+        if self.rule != Some(rule) {
+            self.rule = Some(rule);
+            self.breached_since = None;
+            self.active_since = None;
+            self.recovered_since = None;
+        }
         if let Some(value) = temperature.filter(|v| v.is_finite() && *v > 0.0) {
             self.peak_celsius = Some(self.peak_celsius.map_or(value, |peak| peak.max(value)));
         }
@@ -211,6 +218,19 @@ mod tests {
         assert!(monitor.active_since().is_some());
         assert!(!monitor.observe(None, now + Duration::from_secs(5), rule()));
         assert!(monitor.active_since().is_none());
+    }
+
+    #[test]
+    fn changing_the_limit_restarts_an_existing_streak() {
+        let now = Instant::now();
+        let mut monitor = Monitor::default();
+        monitor.observe(Some(95.0), now, rule());
+        let changed = Threshold {
+            celsius: 90.0,
+            ..rule()
+        };
+        assert!(!monitor.observe(Some(95.0), now + rule().hold, changed));
+        assert!(monitor.observe(Some(95.0), now + rule().hold * 2, changed));
     }
 
     #[test]

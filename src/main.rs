@@ -269,9 +269,11 @@ pub(crate) struct App {
     pub frame_path: String,
     pub frame_summary: Option<FrameSummary>,
     pub frame_message: String,
+    frame_update: Option<std::sync::mpsc::Receiver<Result<FrameSummary, String>>>,
 
     pub alert: alerts::Monitor,
     pub alert_celsius: f32,
+    pub alert_sensor_key: String,
     pub alert_hold_secs: u64,
     pub alert_severity: Severity,
     pub selected_temp_key: String,
@@ -442,12 +444,14 @@ impl App {
             frame_path: String::new(),
             frame_summary: None,
             frame_message: String::new(),
+            frame_update: None,
             alert: alerts::Monitor::default(),
             alert_celsius: if settings.alert_celsius.is_finite() {
                 settings.alert_celsius.clamp(30.0, 125.0)
             } else {
                 85.0
             },
+            alert_sensor_key: settings.alert_sensor_key,
             alert_hold_secs: settings.alert_hold_secs.clamp(1, 120),
             alert_severity: Severity::Warning,
             selected_temp_key: String::new(),
@@ -499,6 +503,7 @@ impl App {
             disk_write_limit_mib: self.disk_write_limit_mib,
             directory: self.directory.clone(),
             alert_celsius: self.alert_celsius,
+            alert_sensor_key: self.alert_sensor_key.clone(),
             alert_hold_secs: self.alert_hold_secs,
             auto_stop_on_heat: self.auto_stop_on_heat,
             pinned_sensors: self.pinned_sensors.clone(),
@@ -651,9 +656,16 @@ impl App {
             hold: Duration::from_secs(self.alert_hold_secs),
             severity: self.alert_severity,
         };
-        if self.alert.observe(hottest, now, rule) {
+        let advisory_temperature = fresh_until
+            .and_then(|_| snapshot.advisory_temperature(&self.alert_sensor_key, hottest));
+        if self.alert.observe(advisory_temperature, now, rule) {
+            let source = snapshot
+                .temperatures
+                .iter()
+                .find(|sensor| sensor.key == self.alert_sensor_key)
+                .map_or("Hottest sensor", |sensor| sensor.label.as_str());
             self.message = format!(
-                "{} temperature alert: at or above {:.0} °C for {}s. Advisory only.",
+                "{} · {source} stayed at or above {:.0} °C for {} s.",
                 rule.severity.label(),
                 rule.celsius,
                 self.alert_hold_secs
@@ -1160,6 +1172,22 @@ mod tests {
                 "Missing {value:?} from compact Overview"
             );
         }
+    }
+
+    #[test]
+    fn advisory_alert_tracks_the_selected_sensor_and_never_substitutes_a_hotter_one() {
+        let snapshot = Snapshot {
+            temperatures: vec![telemetry::Temperature {
+                key: "core-0".into(),
+                celsius: Some(52.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let hottest = Some(93.0);
+        assert_eq!(snapshot.advisory_temperature("", hottest), hottest);
+        assert_eq!(snapshot.advisory_temperature("core-0", hottest), Some(52.0));
+        assert_eq!(snapshot.advisory_temperature("missing", hottest), None);
     }
 
     #[test]

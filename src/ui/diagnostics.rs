@@ -5,6 +5,7 @@
 use crate::ui::{kind_label, theme::*, widgets::*};
 use crate::App;
 use eframe::egui::{self, RichText};
+use egui_plot::{HLine, LineStyle, Plot, Points};
 use hardware_hub::{
     frames,
     report::{self, Format},
@@ -12,6 +13,7 @@ use hardware_hub::{
     system_report,
     telemetry::Snapshot,
 };
+use std::{path::PathBuf, sync::mpsc};
 
 impl App {
     pub fn view_processes(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -82,33 +84,38 @@ impl App {
     }
 
     pub fn view_frames(&mut self, ui: &mut egui::Ui) {
+        self.poll_frame_analysis();
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(ui, "PresentMon Frame Analysis", Some("offline CSV · Avg FPS / 1% Low / P99"));
+            section_title(ui, "Frame Analysis", Some("PresentMon CSV"));
             ui.add_space(6.0);
             ui.label(
-                RichText::new("Load a saved PresentMon CSV capture (one process, one swap chain). Hardware Hub does not inject into games.")
+                RichText::new("Choose a saved capture with one process and one swap chain.")
                     .size(11.0)
                     .color(MUTED),
             );
             ui.add_space(8.0);
-            text_field(ui, &mut self.frame_path, "Path to PresentMon CSV", f32::INFINITY);
+            text_field(
+                ui,
+                &mut self.frame_path,
+                "Path to PresentMon CSV",
+                f32::INFINITY,
+            );
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if primary_button(ui, "Analyze capture", false, 30.0).clicked() {
-                    match frames::read(std::path::Path::new(&self.frame_path)) {
-                        Ok(summary) => {
-                            self.frame_summary = Some(summary);
-                            self.frame_message.clear();
+            let loading = self.frame_update.is_some();
+            ui.horizontal_wrapped(|ui| {
+                if loading {
+                    ui.spinner();
+                    ui.label("Analyzing capture…");
+                } else {
+                    ui.add_enabled_ui(!self.frame_path.trim().is_empty(), |ui| {
+                        if primary_button(ui, "Analyze capture", false, 30.0).clicked() {
+                            self.begin_frame_analysis(ui.ctx());
                         }
-                        Err(error) => {
-                            self.frame_summary = None;
-                            self.frame_message = error;
-                        }
+                    });
+                    if self.frame_summary.is_some() && ghost_button(ui, "Clear").clicked() {
+                        self.frame_summary = None;
                     }
-                }
-                if self.frame_summary.is_some() && ghost_button(ui, "Clear").clicked() {
-                    self.frame_summary = None;
                 }
             });
             if !self.frame_message.is_empty() {
@@ -118,22 +125,37 @@ impl App {
             if let Some(r) = &self.frame_summary {
                 ui.add_space(12.0);
                 ui.label(
-                    RichText::new(format!("{} · PID {} · swap chain {}", r.application, r.process_id, r.swap_chain))
-                        .size(12.5)
-                        .strong()
-                        .color(TEXT),
+                    RichText::new(format!(
+                        "{} · PID {} · swap chain {}",
+                        r.application, r.process_id, r.swap_chain
+                    ))
+                    .size(12.5)
+                    .strong()
+                    .color(TEXT),
                 );
                 ui.label(
-                    RichText::new(format!("{} valid intervals · {} skipped · {}", r.valid, r.skipped, r.column))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
+                    RichText::new(format!(
+                        "{} valid intervals · {} skipped · {}",
+                        r.valid, r.skipped, r.column
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(MUTED),
                 );
                 ui.add_space(8.0);
                 let mut rows = vec![
-                    ("Average displayed FPS".into(), format!("{:.1} FPS", r.average_fps)),
-                    ("Slowest 1% FPS".into(), format!("{:.1} FPS", r.one_percent_low_fps)),
-                    ("99th percentile frame time".into(), format!("{:.2} ms", r.p99_ms)),
+                    (
+                        "Average displayed FPS".into(),
+                        format!("{:.1} FPS", r.average_fps),
+                    ),
+                    (
+                        "Slowest 1% FPS".into(),
+                        format!("{:.1} FPS", r.one_percent_low_fps),
+                    ),
+                    (
+                        "99th percentile frame time".into(),
+                        format!("{:.2} ms", r.p99_ms),
+                    ),
                 ];
                 if let Some(v) = r.average_cpu_ms {
                     rows.push(("Mean CPU busy".into(), format!("{v:.2} ms")));
@@ -142,8 +164,45 @@ impl App {
                     rows.push(("Mean GPU busy".into(), format!("{v:.2} ms")));
                 }
                 spec_grid(ui, "frame-summary-grid", &rows);
+                ui.add_space(10.0);
+                frame_timeline(ui, r);
             }
         });
+    }
+
+    fn begin_frame_analysis(&mut self, ctx: &egui::Context) {
+        let path = PathBuf::from(&self.frame_path);
+        let ctx = ctx.clone();
+        let (send, receive) = mpsc::channel();
+        self.frame_summary = None;
+        self.frame_message.clear();
+        match std::thread::Builder::new()
+            .name("frame-analysis".into())
+            .spawn(move || {
+                let _ = send.send(frames::read(&path));
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            }) {
+            Ok(_) => self.frame_update = Some(receive),
+            Err(error) => self.frame_message = format!("Cannot start frame analysis: {error}"),
+        }
+    }
+
+    fn poll_frame_analysis(&mut self) {
+        let Some(receiver) = &self.frame_update else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Frame analysis ended without a result.".into())
+            }
+        };
+        self.frame_update = None;
+        match result {
+            Ok(summary) => self.frame_summary = Some(summary),
+            Err(error) => self.frame_message = error,
+        }
     }
 
     pub fn view_reports(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
@@ -435,5 +494,108 @@ impl App {
             });
             ui.add_space(8.0);
         }
+    }
+}
+
+fn frame_timeline(ui: &mut egui::Ui, capture: &frames::FrameSummary) {
+    section_title(ui, "Frame-time timeline", Some("milliseconds"));
+    Plot::new("frame-timeline")
+        .height(155.0)
+        .include_x(1.0)
+        .include_x((capture.valid + capture.skipped) as f64)
+        .include_y(0.0)
+        .x_axis_label("CSV data row")
+        .allow_drag(false)
+        .allow_zoom(false)
+        .allow_boxed_zoom(false)
+        .allow_scroll(false)
+        .label_formatter(|name, point| {
+            if name == "Frame time" {
+                format!("Row {:.0}: {:.2} ms", point.x, point.y)
+            } else {
+                String::new()
+            }
+        })
+        .show(ui, |plot| {
+            plot.hline(
+                HLine::new(capture.p99_ms)
+                    .color(AMBER)
+                    .style(LineStyle::Dashed { length: 6.0 }),
+            );
+            plot.points(
+                Points::new(capture.timeline.clone())
+                    .name("Frame time")
+                    .color(CYAN)
+                    .radius(2.0_f32),
+            );
+        });
+    let caption = if capture.rows_per_point > 1 {
+        format!(
+            "Each point shows the slowest displayed frame per {} rows. Dashes mark P99.",
+            capture.rows_per_point
+        )
+    } else {
+        "Each point is a valid displayed frame. Dashes mark P99.".into()
+    };
+    ui.label(RichText::new(caption).size(10.0).color(MUTED));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn analyzes_a_saved_capture_in_the_background_and_renders_its_timeline() {
+        let dir = std::env::temp_dir().join(format!(
+            "hardware-hub-frames-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("capture.csv");
+        std::fs::write(
+            &path,
+            "Application,ProcessID,SwapChainAddress,DisplayedTime\nGame,1,0x1,10\nGame,1,0x1,25\n",
+        )
+        .unwrap();
+        let mut app = App::from_settings(crate::Settings::default(), true);
+        let ctx = egui::Context::default();
+        app.frame_path = path.to_string_lossy().into_owned();
+        app.begin_frame_analysis(&ctx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.frame_update.is_some() && Instant::now() < deadline {
+            app.poll_frame_analysis();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+        assert_eq!(
+            app.frame_summary
+                .as_ref()
+                .expect(&app.frame_message)
+                .timeline,
+            [[1.0, 10.0], [2.0, 25.0]]
+        );
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 550.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.view_frames(ui));
+            },
+        );
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::Text(text) => text.galley.job.text == "Frame-time timeline",
+            _ => false,
+        }));
     }
 }

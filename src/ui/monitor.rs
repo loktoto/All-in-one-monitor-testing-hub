@@ -60,6 +60,11 @@ fn overview_reading(
 }
 
 impl App {
+    fn advisory_limit_for(&self, sensor_key: &str) -> Option<f64> {
+        (self.alert_sensor_key.is_empty() || self.alert_sensor_key == sensor_key)
+            .then_some(f64::from(self.alert_celsius))
+    }
+
     pub fn view_overview(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
         let specs: Option<Arc<SystemSpecs>> = self.specs.lock().ok().and_then(|held| held.clone());
         if !s.ready {
@@ -820,11 +825,11 @@ impl App {
                     "Click any temperature row or wait for thermal samples to plot.",
                 );
             } else {
-                let limit = self.alert_celsius as f64;
+                let limit = self.advisory_limit_for(&selected);
                 Plot::new("inspector-temp-plot")
                     .height(126.0)
                     .include_y(25.0)
-                    .include_y((limit + 5.0).max(90.0))
+                    .include_y((limit.unwrap_or_default() + 5.0).max(90.0))
                     .auto_bounds([true, true])
                     .show_x(false)
                     .show_axes(egui::Vec2b::new(false, true))
@@ -833,12 +838,14 @@ impl App {
                     .allow_zoom(false)
                     .allow_scroll(false)
                     .show(ui, |plot| {
-                        plot.hline(
-                            HLine::new(limit)
-                                .color(tint_alpha(AMBER, 160))
-                                .style(egui_plot::LineStyle::Dashed { length: 6.0 })
-                                .width(1.2_f32),
-                        );
+                        if let Some(limit) = limit {
+                            plot.hline(
+                                HLine::new(limit)
+                                    .color(tint_alpha(AMBER, 160))
+                                    .style(egui_plot::LineStyle::Dashed { length: 6.0 })
+                                    .width(1.2_f32),
+                            );
+                        }
                         for (i, pts) in history::segments_with_gap(
                             &self.history,
                             self.started,
@@ -858,14 +865,13 @@ impl App {
                         }
                     });
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "Dashed line: {:.0} °C advisory limit",
-                            self.alert_celsius
-                        ))
-                        .size(10.0)
-                        .color(MUTED),
-                    );
+                    if let Some(limit) = limit {
+                        ui.label(
+                            RichText::new(format!("Dashed line marks the {limit:.0} °C limit"))
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .link(RichText::new("Alerts & CSV >").size(10.5).color(ACCENT))
@@ -1219,8 +1225,9 @@ impl App {
                     &peak_str,
                     peak_c.map(temperature_color).unwrap_or(MUTED),
                 );
-                if let Some(p) = peak_c {
-                    let headroom = self.alert_celsius - p;
+                if let Some(reading) = snapshot.advisory_temperature(&self.alert_sensor_key, peak_c)
+                {
+                    let headroom = self.alert_celsius - reading;
                     chip(
                         ui,
                         &format!("Headroom {headroom:+.0}°C"),
@@ -1299,23 +1306,25 @@ impl App {
                     }
                 });
                 ui.add_space(6.0);
-                let limit = self.alert_celsius as f64;
+                let limit = self.advisory_limit_for(&selected);
                 Plot::new("thermal-history-main")
                     .height(160.0)
                     .include_y(20.0)
-                    .include_y((limit + 5.0).max(90.0))
+                    .include_y((limit.unwrap_or_default() + 5.0).max(90.0))
                     .auto_bounds([true, true])
                     .allow_drag(false)
                     .allow_zoom(false)
                     .allow_scroll(false)
                     .show_x(false)
                     .show(ui, |plot| {
-                        plot.hline(
-                            HLine::new(limit)
-                                .color(tint_alpha(AMBER, 175))
-                                .style(egui_plot::LineStyle::Dashed { length: 6.0 })
-                                .width(1.3_f32),
-                        );
+                        if let Some(limit) = limit {
+                            plot.hline(
+                                HLine::new(limit)
+                                    .color(tint_alpha(AMBER, 175))
+                                    .style(egui_plot::LineStyle::Dashed { length: 6.0 })
+                                    .width(1.3_f32),
+                            );
+                        }
                         for points in history::segments_with_gap(
                             &self.history,
                             self.started,
@@ -1432,12 +1441,47 @@ impl App {
         // Advisory alert configuration + fine sampling slider
         card_frame().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(
-                ui,
-                "Advisory Temperature Alert & Polling",
-                Some("never alters fans or clocks"),
-            );
+            section_title(ui, "Temperature Alert & Polling", Some("advisory alert"));
             ui.add_space(6.0);
+            let target = snapshot
+                .temperatures
+                .iter()
+                .find(|sensor| sensor.key == self.alert_sensor_key);
+            let target_label = if self.alert_sensor_key.is_empty() {
+                "Hottest available sensor"
+            } else {
+                target.map_or("Selected sensor unavailable", |sensor| {
+                    sensor.label.as_str()
+                })
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Watch");
+                let previous = self.alert_sensor_key.clone();
+                egui::ComboBox::from_id_salt("advisory-sensor")
+                    .selected_text(target_label)
+                    .truncate()
+                    .height(250.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.alert_sensor_key,
+                            String::new(),
+                            "Hottest available sensor",
+                        );
+                        for sensor in &snapshot.temperatures {
+                            ui.selectable_value(
+                                &mut self.alert_sensor_key,
+                                sensor.key.clone(),
+                                format!("{} · {}", sensor.label, sensor.source),
+                            )
+                            .on_hover_text(&sensor.key);
+                        }
+                    });
+                if self.alert_sensor_key != previous {
+                    self.alert.clear();
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Alert at").size(11.5).color(TEXT_DIM));
                 ui.add(
@@ -1491,7 +1535,7 @@ impl App {
                     }
                 });
             } else {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!(
                             "No active alert · Session peak: {}",
