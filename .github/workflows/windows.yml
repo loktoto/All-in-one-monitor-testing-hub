@@ -23,6 +23,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Record portable executable size
+        shell: pwsh
+        run: |
+          $size = (Get-Item target/release/hardware-hub.exe).Length
+          "Portable executable: $size bytes" >> $env:GITHUB_STEP_SUMMARY
       - uses: actions/upload-artifact@v4
         with:
           name: hardware-hub-windows-${{ matrix.arch }}
