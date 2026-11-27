@@ -80,7 +80,9 @@ Anything the platform does not expose is listed under **Not available** rather t
 
 **Drivers** lists the installed-driver records from the OS driver store with class, version, provider and signature status. It can be filtered by name/provider and by class. It is a read-only inventory of what the OS reports, not a driver update tool and not a verification that a driver is correct or current.
 
-**Import S.M.A.R.T. report** in Storage or Details reads a user-selected local `smartctl -a -j` JSON report (maximum 4 MiB). It displays reported ATA attributes, selected NVMe fields, the smartctl exit status and messages. Hardware Hub does not run smartctl, install it or access a drive for this view. The report may be stale or for a different device; its source is not verified. A nonzero smartctl exit status can indicate errors or health warnings. See the [smartctl manual](https://github.com/smartmontools/smartmontools/blob/main/src/smartctl.8.in) for device names, permissions and exit status meanings.
+**S.M.A.R.T. diagnostics** in Storage and Details can discover drives and read their health on demand when [smartmontools](https://github.com/smartmontools/smartmontools/releases) is installed. Choose **Find drives**, select a device and choose **Read drive health**. The app runs read-only `smartctl` discovery and health queries. It shows firmware-reported health, temperature, power-on data, ATA attributes and NVMe endurance and error counters where available. Drive, controller and OS permissions determine which readings are available.
+
+**Import report from file** accepts local `smartctl -a -j` JSON reports (up to 4 MiB) and marks them as imported. Firmware warnings and the smartctl exit status remain visible for both sources. See the [smartctl manual](https://github.com/smartmontools/smartmontools/blob/main/src/smartctl.8.in) for exit codes and the [CrystalDiskInfo health guide](https://crystalmark.info/en/software/crystaldiskinfo/crystaldiskinfo-health-status/) for the distinction between ATA attributes and vendor-specific endurance thresholds.
 
 ## Measurements and limitations
 
