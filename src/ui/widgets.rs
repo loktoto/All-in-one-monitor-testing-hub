@@ -1401,14 +1401,7 @@ pub fn sensor_table(
                     Pos2::new(right - stats_w - bar_w - 4.0, rect.center().y - 3.0),
                     Vec2::new(bar_w - 8.0, 6.0),
                 );
-                draw_thermal_range_bar(
-                    painter,
-                    bar_rect,
-                    row.current,
-                    row.min,
-                    row.max,
-                    row.unit == "°C",
-                );
+                draw_thermal_range_bar(painter, bar_rect, row.current, row.min, row.max, row.unit);
             }
 
             for (visible, offset, val) in [
@@ -1489,13 +1482,17 @@ fn draw_thermal_range_bar(
     current: Option<f32>,
     min: Option<f32>,
     max: Option<f32>,
-    is_temp: bool,
+    unit: &str,
 ) {
     painter.rect_filled(rect, CornerRadius::same(3), TRACK);
+    let is_temp = unit == "°C";
+    let is_pct = unit == "%";
     let (scale_lo, scale_hi) = if is_temp {
         (20.0_f32, 105.0_f32)
+    } else if is_pct {
+        (0.0_f32, 100.0_f32)
     } else {
-        (0.0, 5000.0)
+        (0.0_f32, 5000.0_f32)
     };
     let norm = |v: f32| ((v - scale_lo) / (scale_hi - scale_lo)).clamp(0.0, 1.0);
 
@@ -1506,10 +1503,18 @@ fn draw_thermal_range_bar(
         let span = Rect::from_min_max(Pos2::new(x0, rect.top()), Pos2::new(x1, rect.bottom()));
         let c_lo = if is_temp {
             temperature_color(lo)
+        } else if is_pct {
+            load_color(lo / 100.0)
         } else {
             ACCENT
         };
-        let c_hi = if is_temp { temperature_color(hi) } else { CYAN };
+        let c_hi = if is_temp {
+            temperature_color(hi)
+        } else if is_pct {
+            load_color(hi / 100.0)
+        } else {
+            CYAN
+        };
         let mut mesh = egui::Mesh::default();
         mesh.colored_vertex(span.left_top(), c_lo);
         mesh.colored_vertex(span.left_bottom(), c_lo);
@@ -1680,9 +1685,9 @@ pub fn driver_table(ui: &mut egui::Ui, drivers: &[&DriverSpec]) {
                 );
                 if let Some(signed) = driver.signed {
                     let (lbl, col) = if signed {
-                        ("✓ SIGNED", GREEN)
+                        ("SIGNED", GREEN)
                     } else {
-                        ("▲ UNSIGNED", AMBER)
+                        ("UNSIGNED", AMBER)
                     };
                     let g = ui.fonts(|f| {
                         f.layout_no_wrap(lbl.to_owned(), egui::FontId::proportional(9.5), col)
@@ -1867,14 +1872,15 @@ pub fn mini_temperature_graph(
     }
     let span = (max - min).max(1.0);
     let pad_x = 10.0;
-    let pad_y = 10.0;
+    let pad_top = 22.0;
+    let pad_bottom = 8.0;
     let inner_w = (rect.width() - pad_x * 2.0).max(10.0);
-    let inner_h = (rect.height() - pad_y * 2.0).max(10.0);
-    let y_for = |val: f64| rect.bottom() - pad_y - inner_h * ((val - min) / span) as f32;
+    let inner_h = (rect.height() - pad_top - pad_bottom).max(10.0);
+    let y_for = |val: f64| rect.bottom() - pad_bottom - inner_h * ((val - min) / span) as f32;
 
     // Dashed amber advisory threshold line
     if let Some(lim) = limit_c {
-        let ly = y_for(lim as f64).clamp(rect.top() + 4.0, rect.bottom() - 4.0);
+        let ly = y_for(lim as f64).clamp(rect.top() + pad_top, rect.bottom() - pad_bottom);
         let mut x = rect.left() + pad_x;
         while x < rect.right() - pad_x {
             let x2 = (x + 6.0).min(rect.right() - pad_x);

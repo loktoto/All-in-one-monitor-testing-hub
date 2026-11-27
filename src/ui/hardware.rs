@@ -106,7 +106,7 @@ impl App {
                             .physical_cores
                             .is_some_and(|p| sp.cpu.logical_cores.unwrap_or(0) > p)
                     {
-                        chip(ui, "✓ SMT ENABLED", GREEN);
+                        chip(ui, "SMT ENABLED", GREEN);
                     }
                     if let Some(true) = sp.cpu.virtualization {
                         chip(ui, "VT / VIRT", ACCENT);
@@ -309,7 +309,7 @@ impl App {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .link(RichText::new("Open Memory →").size(10.5).color(VIOLET))
+                                .link(RichText::new("Open Memory >").size(10.5).color(VIOLET))
                                 .clicked()
                             {
                                 self.page = Page::Memory;
@@ -623,11 +623,7 @@ impl App {
                                     |ui| {
                                         if !drive.smart.is_empty() {
                                             let col = smart_color(&drive.smart);
-                                            chip(
-                                                ui,
-                                                &format!("✓ {}", drive.smart.to_uppercase()),
-                                                col,
-                                            );
+                                            chip(ui, &drive.smart.to_uppercase(), col);
                                         }
                                     },
                                 );
@@ -682,11 +678,7 @@ impl App {
                     mono_badge(ui, &d.kind.to_uppercase(), MUTED);
                     if let Some(h) = health {
                         if !h.smart.is_empty() {
-                            chip(
-                                ui,
-                                &format!("✓ {}", h.smart.to_uppercase()),
-                                smart_color(&h.smart),
-                            );
+                            chip(ui, &h.smart.to_uppercase(), smart_color(&h.smart));
                         }
                     }
                     ui.label(
@@ -777,7 +769,7 @@ impl App {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(&a.name).strong().size(11.5).color(TEXT));
                                 if a.status.eq_ignore_ascii_case("up") {
-                                    chip(ui, "✓ UP", GREEN);
+                                    chip(ui, "UP", GREEN);
                                 }
                                 ui.label(
                                     RichText::new(format!("{} · {}", a.description, a.speed))

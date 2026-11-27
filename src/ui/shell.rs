@@ -174,8 +174,10 @@ impl App {
                     } else {
                         // Toggle secondary tree sidebar
                         let tree_btn = egui::Button::new(
-                            RichText::new(if self.sidebar_open { "◧" } else { "☰" })
-                                .size(13.0)
+                            RichText::new(if self.sidebar_open { "<" } else { ">" })
+                                .monospace()
+                                .size(12.0)
+                                .strong()
                                 .color(TEXT_DIM),
                         )
                         .fill(INPUT)
@@ -273,7 +275,7 @@ impl App {
                         if !narrow {
                             // Floating HUD toggle
                             let hud_btn = egui::Button::new(
-                                RichText::new(if self.show_widget { "● HUD" } else { "HUD" })
+                                RichText::new(if self.show_widget { "HUD ON" } else { "HUD" })
                                     .size(11.0)
                                     .color(if self.show_widget { GREEN } else { TEXT_DIM }),
                             )
@@ -494,7 +496,7 @@ impl App {
                                         if stopping {
                                             "Stopping…"
                                         } else {
-                                            "■ Stop Check"
+                                            "Stop Check"
                                         },
                                         true,
                                         26.0,
@@ -829,9 +831,9 @@ impl App {
                 page_rule(ui);
                 ui.add_space(10.0);
                 let rows = [
-                    ("Ctrl/⌘ K", "Open Quick Jump command palette"),
-                    ("Ctrl/⌘ 1–9", "Overview, CPU, GPU, Memory, Storage, Thermals, Details, Processes, Reports"),
-                    ("Ctrl/⌘ Shift 1–6", "Board, Drivers, Network, Bluetooth, Frames, Stress Lab"),
+                    ("Ctrl/Cmd K", "Open Quick Jump command palette"),
+                    ("Ctrl/Cmd 1-9", "Overview, CPU, GPU, Memory, Storage, Thermals, Details, Processes, Reports"),
+                    ("Ctrl/Cmd Shift 1-6", "Board, Drivers, Network, Bluetooth, Frames, Stress Lab"),
                     ("Esc", "Stop running check, or close overlay"),
                     ("?  /  F1", "Toggle shortcuts help"),
                 ];
@@ -914,7 +916,7 @@ pub fn floating_hud(ui: &mut egui::Ui, s: &Snapshot, pinned: &[String], stale_af
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| match s.updated_at {
                 Some(at) if at.elapsed() >= stale_after => chip(ui, "STALE", AMBER),
-                Some(_) if s.ready => chip(ui, "● LIVE", GREEN),
+                Some(_) if s.ready => pill(ui, "LIVE", GREEN),
                 _ => chip(ui, "INIT", MUTED),
             },
         );

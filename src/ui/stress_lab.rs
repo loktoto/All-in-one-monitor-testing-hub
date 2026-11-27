@@ -375,7 +375,7 @@ impl App {
             let label = if stopping {
                 "Stopping check…"
             } else {
-                "■ Stop Check (Esc)"
+                "Stop Check (Esc)"
             };
             if ui
                 .add_enabled_ui(!stopping, |ui| danger_button(ui, label, full_width, 32.0))
@@ -694,10 +694,10 @@ impl App {
                 match last {
                     Some(r) => {
                         let verdict = match r.status {
-                            Status::Completed => "✓ PASSED",
-                            Status::Stopped => "■ STOPPED",
-                            Status::Failed => "■ FAILED",
-                            Status::Inconclusive => "▲ INCONCLUSIVE",
+                            Status::Completed => "PASSED",
+                            Status::Stopped => "STOPPED",
+                            Status::Failed => "FAILED",
+                            Status::Inconclusive => "INCONCLUSIVE",
                             Status::Unavailable => "— UNAVAILABLE",
                         };
                         ui.horizontal_wrapped(|ui| {
@@ -720,7 +720,7 @@ impl App {
                         );
                         error_details(ui, &r.errors, r.error_count);
                         ui.add_space(8.0);
-                        if ghost_button(ui, "View & Compare Reports →").clicked() {
+                        if ghost_button(ui, "View & Compare Reports >").clicked() {
                             self.page = Page::Reports;
                         }
                     }

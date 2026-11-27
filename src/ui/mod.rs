@@ -208,12 +208,12 @@ impl Page {
             Self::Details => "7",
             Self::Processes => "8",
             Self::Reports => "9",
-            Self::Motherboard => "⇧1",
-            Self::Drivers => "⇧2",
-            Self::Network => "⇧3",
-            Self::Bluetooth => "⇧4",
-            Self::Frames => "⇧5",
-            Self::Tests => "⇧6",
+            Self::Motherboard => "Shift+1",
+            Self::Drivers => "Shift+2",
+            Self::Network => "Shift+3",
+            Self::Bluetooth => "Shift+4",
+            Self::Frames => "Shift+5",
+            Self::Tests => "Shift+6",
         }
     }
 

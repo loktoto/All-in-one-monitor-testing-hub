@@ -252,7 +252,7 @@ impl App {
                         };
                         ui.label(RichText::new(range_txt).monospace().size(10.0).color(MUTED));
                         if ui
-                            .link(RichText::new("Inspect →").size(10.5).color(ACCENT))
+                            .link(RichText::new("Inspect >").size(10.5).color(ACCENT))
                             .clicked()
                         {
                             self.page = Page::Cpu;
@@ -305,7 +305,7 @@ impl App {
                                 .color(MUTED),
                         );
                         if ui
-                            .link(RichText::new("DIMMs →").size(10.5).color(VIOLET))
+                            .link(RichText::new("DIMMs >").size(10.5).color(VIOLET))
                             .clicked()
                         {
                             self.page = Page::Memory;
@@ -346,7 +346,7 @@ impl App {
                 );
                 ui.add_space(4.0);
                 if ui
-                    .link(RichText::new("GPU-Z view →").size(10.5).color(ACCENT))
+                    .link(RichText::new("GPU-Z view >").size(10.5).color(ACCENT))
                     .clicked()
                 {
                     self.page = Page::Gpu;
@@ -368,16 +368,9 @@ impl App {
                         if !smart.is_empty() {
                             let short = smart.split('·').next().unwrap_or(smart).trim();
                             let col = smart_color(smart);
-                            let glyph = if col == GREEN {
-                                "✓ "
-                            } else if col == RED {
-                                "■ "
-                            } else {
-                                "▲ "
-                            };
-                            chip(ui, &format!("{glyph}{}", short.to_uppercase()), col);
+                            pill(ui, &short.to_uppercase(), col);
                         } else {
-                            chip(ui, "● LOCAL", GREEN);
+                            pill(ui, "LOCAL", GREEN);
                         }
                     });
                 });
@@ -747,7 +740,7 @@ impl App {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .link(RichText::new("Alerts & CSV →").size(10.5).color(ACCENT))
+                            .link(RichText::new("Alerts & CSV >").size(10.5).color(ACCENT))
                             .clicked()
                         {
                             self.page = Page::Thermal;
@@ -865,11 +858,7 @@ impl App {
                         mono_badge(ui, &d.kind.to_uppercase(), MUTED);
                         if let Some(h) = health {
                             if !h.smart.is_empty() {
-                                chip(
-                                    ui,
-                                    &format!("✓ {}", h.smart.to_uppercase()),
-                                    smart_color(&h.smart),
-                                );
+                                chip(ui, &h.smart.to_uppercase(), smart_color(&h.smart));
                             }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -936,7 +925,7 @@ impl App {
                         280.0,
                     );
                     if ui
-                        .add_enabled(!active && !finishing, egui::Button::new("● Record CSV"))
+                        .add_enabled(!active && !finishing, egui::Button::new("Record CSV"))
                         .clicked()
                     {
                         match Recorder::start(std::path::Path::new(&self.log_path)) {
