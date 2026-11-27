@@ -16,6 +16,11 @@ use std::{
     time::Duration,
 };
 
+pub(crate) enum SmartUpdate {
+    Scan(Result<Vec<smart::Device>, String>),
+    Read(String, Result<smart::SmartReport, String>),
+}
+
 impl App {
     pub fn view_hardware_page(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let specs: Option<Arc<SystemSpecs>> = self.specs.lock().ok().and_then(|held| held.clone());
@@ -36,6 +41,11 @@ impl App {
             Page::Network => self.view_network_dive(ui, snapshot, specs.as_deref()),
             Page::Bluetooth => self.view_bluetooth_dive(ui, specs.as_deref()),
             _ => {}
+        }
+
+        if page == Page::Storage {
+            ui.add_space(10.0);
+            self.smart_report_ui(ui);
         }
 
         let check = match page {
@@ -70,11 +80,6 @@ impl App {
                     self.kind = kind;
                 }
                 self.view_stress_lab(ui, snapshot, Some(kind));
-            }
-            if page == Page::Storage {
-                ui.add_space(10.0);
-                egui::CollapsingHeader::new("Import S.M.A.R.T. report (smartctl -a -j)")
-                    .show(ui, |ui| self.smart_report_ui(ui));
             }
             self.recent_device_checks(ui, kind);
         }
@@ -595,7 +600,7 @@ impl App {
             section_title(
                 ui,
                 "Storage & Drive Health",
-                Some("CrystalDiskInfo-style · volumes & physical drives"),
+                Some("Volumes & physical drives"),
             );
             ui.add_space(8.0);
             if let Some(sp) = specs {
@@ -1230,33 +1235,130 @@ impl App {
     }
 
     pub fn smart_report_ui(&mut self, ui: &mut egui::Ui) {
-        card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            section_title(ui, "Import S.M.A.R.T. Report", Some("smartctl -a -j JSON"));
-            ui.horizontal_wrapped(|ui| {
-                text_field(ui, &mut self.smart_path, "Path to smartctl JSON", 340.0);
-                if ghost_button(ui, "Open report").clicked() {
-                    match smart::read(std::path::Path::new(&self.smart_path)) {
-                        Ok(report) => {
+        use std::sync::mpsc::TryRecvError;
+        if let Some(update) = self.smart_update.as_ref().map(|job| job.try_recv()) {
+            match update {
+                Ok(update) => {
+                    self.smart_update = None;
+                    match update {
+                        SmartUpdate::Scan(Ok(devices)) => {
+                            self.smart_devices = devices;
+                            self.smart_device = 0;
+                            self.smart_message = if self.smart_devices.is_empty() {
+                                "SMART discovery found no accessible drives.".into()
+                            } else {
+                                String::new()
+                            };
+                        }
+                        SmartUpdate::Read(source, Ok(report)) => {
+                            self.smart_source = source;
                             self.smart_report = Some(report);
                             self.smart_message.clear();
                         }
-                        Err(error) => {
-                            self.smart_report = None;
-                            self.smart_message = error;
+                        SmartUpdate::Scan(Err(error)) | SmartUpdate::Read(_, Err(error)) => {
+                            self.smart_message = error
                         }
                     }
                 }
-                if self.smart_report.is_some() && ghost_button(ui, "Clear").clicked() {
-                    self.smart_report = None;
+                Err(TryRecvError::Disconnected) => {
+                    self.smart_update = None;
+                    self.smart_message = "The SMART request ended without a result.".into();
                 }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(
+                ui,
+                "S.M.A.R.T. diagnostics",
+                Some("Read with smartmontools or import JSON"),
+            );
+            ui.add_enabled_ui(self.smart_update.is_none(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ghost_button(ui, "Find drives").clicked() {
+                        self.begin_smart_request(ui.ctx(), || SmartUpdate::Scan(smart::scan()));
+                    }
+                    if !self.smart_devices.is_empty() {
+                        egui::ComboBox::from_id_salt("smart-device")
+                            .selected_text(self.smart_devices[self.smart_device].label())
+                            .show_ui(ui, |ui| {
+                                for (index, device) in self.smart_devices.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.smart_device,
+                                        index,
+                                        device.label(),
+                                    );
+                                }
+                            });
+                        if ghost_button(ui, "Read drive health").clicked() {
+                            let device = self.smart_devices[self.smart_device].clone();
+                            self.begin_smart_request(ui.ctx(), move || {
+                                SmartUpdate::Read(device.label(), smart::read_device(&device))
+                            });
+                        }
+                    }
+                });
+                egui::CollapsingHeader::new("Import report from file").show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        text_field(ui, &mut self.smart_path, "Path to smartctl JSON", 300.0);
+                        if ghost_button(ui, "Open report").clicked() {
+                            match smart::read(std::path::Path::new(&self.smart_path)) {
+                                Ok(report) => {
+                                    self.smart_source = "Imported file".into();
+                                    self.smart_report = Some(report);
+                                    self.smart_message.clear();
+                                }
+                                Err(error) => self.smart_message = error,
+                            }
+                        }
+                    });
+                });
             });
+            if self.smart_update.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading SMART data…");
+                });
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
             if !self.smart_message.is_empty() {
                 ui.colored_label(AMBER, &self.smart_message);
             }
             if let Some(report) = &self.smart_report {
                 ui.add_space(6.0);
-                ui.strong(format!("Imported · {}", report.model));
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&report.model);
+                    mono_badge(ui, &self.smart_source, MUTED);
+                    match report.health {
+                        Some(true) => chip(ui, "SMART PASS", GREEN),
+                        Some(false) => chip(ui, "SMART FAIL", RED),
+                        None => chip(ui, "HEALTH UNAVAILABLE", MUTED),
+                    };
+                });
+                if report.exit_status.is_some_and(|s| s != 0) {
+                    ui.colored_label(
+                        AMBER,
+                        format!(
+                            "smartctl reported status 0x{:02X}",
+                            report.exit_status.unwrap_or(0)
+                        ),
+                    );
+                }
+                for message in &report.messages {
+                    ui.label(message);
+                }
+                if !report.details.is_empty() {
+                    egui::Grid::new("smart_device_details")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (name, reading) in &report.details {
+                                ui.label(name);
+                                ui.label(RichText::new(reading).monospace());
+                                ui.end_row();
+                            }
+                        });
+                }
                 if !report.nvme.is_empty() {
                     egui::Grid::new("smart_nvme").striped(true).show(ui, |ui| {
                         for (k, v) in &report.nvme {
@@ -1286,8 +1388,35 @@ impl App {
                             });
                         });
                 }
+                if report.truncated {
+                    ui.label("Showing the first 512 SMART attributes.");
+                }
+                if ghost_button(ui, "Clear SMART report").clicked() {
+                    self.smart_report = None;
+                    self.smart_source.clear();
+                    self.smart_message.clear();
+                }
             }
         });
+    }
+
+    fn begin_smart_request(
+        &mut self,
+        ctx: &egui::Context,
+        run: impl FnOnce() -> SmartUpdate + Send + 'static,
+    ) {
+        let (send, receive) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        self.smart_message.clear();
+        match std::thread::Builder::new()
+            .name("smart-diagnostics".into())
+            .spawn(move || {
+                let _ = send.send(run());
+                ctx.request_repaint();
+            }) {
+            Ok(_) => self.smart_update = Some(receive),
+            Err(error) => self.smart_message = format!("Cannot start SMART request: {error}"),
+        }
     }
 
     fn recent_device_checks(&mut self, ui: &mut egui::Ui, kind: Kind) {
