@@ -365,9 +365,9 @@ fn text_rows(
         .iter()
         .map(|t| {
             row(
-                format!("{} ({})", t.label, t.key),
+                format!("{} ({} · {})", t.label, t.source, t.key),
                 format!(
-                    "now {} · min {} · max {} °C",
+                    "now {} · min {} · max {} · avg {} °C",
                     t.celsius
                         .map(|v| format!("{v:.1}"))
                         .unwrap_or_else(|| "unavailable".into()),
@@ -375,6 +375,9 @@ fn text_rows(
                         .map(|v| format!("{v:.1}"))
                         .unwrap_or_else(|| "unavailable".into()),
                     t.max
+                        .map(|v| format!("{v:.1}"))
+                        .unwrap_or_else(|| "unavailable".into()),
+                    t.average
                         .map(|v| format!("{v:.1}"))
                         .unwrap_or_else(|| "unavailable".into())
                 ),

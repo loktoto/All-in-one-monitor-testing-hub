@@ -1,11 +1,11 @@
-//! Micro-profile of the per-frame read path that was optimised.
+//! Micro-profile of the per-frame read path and high-core / high-sensor scaling.
 //!
 //! Run with `cargo run --release --example perf`. No hardware is touched and
 //! nothing is written to disk. The numbers are indicative for this machine.
 
 use hardware_hub::{
     history::History,
-    telemetry::{Process, Snapshot},
+    telemetry::{Process, Snapshot, Temperature},
 };
 use std::{sync::Arc, time::Instant};
 
@@ -15,13 +15,27 @@ fn main() {
         cpu_usage: 42.0,
         ..Default::default()
     };
-    snapshot.cores = vec![0.0; 32];
+    // Simulate a heavy workstation: 128 threads, 500 processes, 100 sensors.
+    snapshot.cores = (0..128).map(|i| ((i * 7) % 100) as f32).collect();
+    snapshot.core_mhz = vec![3600; 128];
     snapshot.processes = (0..500)
         .map(|pid| Process {
             pid,
             name: format!("process-{pid}"),
             cpu_usage: pid as f32 / 10.0,
             memory: 1_000_000,
+        })
+        .collect();
+    snapshot.temperatures = (0..100)
+        .map(|i| Temperature {
+            key: format!("T{i:03}"),
+            label: format!("Sensor {i}"),
+            source: "hwmon",
+            celsius: Some(40.0 + (i % 45) as f32),
+            min: Some(32.0),
+            max: Some(78.0),
+            average: Some(61.0),
+            cpu_core: i < 64,
         })
         .collect();
     let shared = Arc::new(snapshot.clone());
@@ -56,6 +70,7 @@ fn main() {
     }
     let graph_ns = started.elapsed().as_nanos() as f64 / iterations as f64;
 
+    println!("Workstation profile: 128 threads · 500 processes · 100 sensors");
     println!("Snapshot deep clone: {deep:.0} ns/read (previous UI path)");
     println!("Arc snapshot read:   {shared_ns:.0} ns/read (current UI path)");
     println!("History graph split: {graph_ns:.0} ns/frame for 60 samples");

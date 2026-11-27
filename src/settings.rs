@@ -1,9 +1,9 @@
 //! Small, dependency-free settings store.
 //!
 //! The app writes a single JSON file next to the platform's per-user config
-//! directory so a restart resumes the same page, sampling cadence, worker
-//! count and alert thresholds. Every field is optional on read: a missing or
-//! corrupt file silently falls back to the built-in defaults, so a bad config
+//! directory so a restart resumes the same page, window mode, sampling cadence,
+//! worker count and alert thresholds. Every field is optional on read: a missing
+//! or corrupt file silently falls back to the built-in defaults, so a bad config
 //! can never stop the app from starting.
 
 use serde::{Deserialize, Serialize};
@@ -25,11 +25,10 @@ pub struct OverviewOpen {
 impl Default for OverviewOpen {
     fn default() -> Self {
         Self {
-            // The first screen shows the live picture: load, the chart and the
-            // sensor table. Detail lists start folded but still show a summary
-            // on their header, so nothing is hidden without a hint.
+            // The first screen shows the live picture: load, liquid core tiles,
+            // the chart and the HWMonitor sensor tree.
             activity: true,
-            cores: false,
+            cores: true,
             sensors: true,
             graphics: false,
             storage: false,
@@ -43,14 +42,30 @@ impl Default for OverviewOpen {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Settings {
-    /// Page label, e.g. "CPU" or "Thermal". Unknown labels fall back to Overview.
+    /// Page label, e.g. "CPU" or "Thermals / fans". Unknown labels fall back to Overview.
     pub page: String,
+    /// Compact HWMonitor-style narrow window mode (~440px wide) vs Expanded Workspace.
+    pub compact_mode: bool,
+    /// Last non-fullscreen expanded window dimensions (logical points).
+    pub window_width: f32,
+    pub window_height: f32,
+    /// High-density Pro (HWMonitor) mode vs calm Simple mode.
+    pub pro_density: bool,
+    /// Disable eased animations when enabled.
+    pub reduce_motion: bool,
     /// Telemetry sampling interval in milliseconds.
     pub poll_ms: u64,
+    pub libre_monitor_enabled: bool,
+    pub libre_monitor_port: u16,
+    pub hwinfo_gadget_enabled: bool,
     /// Worker threads for the software checks.
     pub workers: usize,
-    /// Default duration for a check, in seconds.
+    /// Default duration for a timed check, in seconds.
     pub seconds: u64,
+    /// Stress run mode: "timed", "continuous", or "passes".
+    pub stress_mode: String,
+    /// Target pass count when `stress_mode == "passes"`.
+    pub stress_passes: u64,
     /// Default memory working set, in MiB.
     pub mib: usize,
     /// Disk scratch-file write cap, in MiB.
@@ -59,10 +74,14 @@ pub struct Settings {
     pub directory: String,
     /// Advisory alert threshold in Celsius.
     pub alert_celsius: f32,
+    /// An empty key watches the hottest available temperature.
+    pub alert_sensor_key: String,
     /// Seconds a reading must stay above the threshold before it fires.
     pub alert_hold_secs: u64,
-    /// Opt-in: stop the software check when the peak reaches the threshold.
+    /// Opt-in: stop the software check when fresh samples meet the heat limit for the hold time.
     pub auto_stop_on_heat: bool,
+    /// Sensor keys pinned to the Floating Monitor HUD.
+    pub pinned_sensors: Vec<String>,
     /// Default export paths.
     pub history_path: String,
     pub log_path: String,
@@ -74,19 +93,32 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        let logical = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         Self {
             page: "Overview".into(),
+            compact_mode: true,
+            window_width: 1120.0,
+            window_height: 720.0,
+            pro_density: false,
+            reduce_motion: false,
             poll_ms: 1000,
-            workers: std::thread::available_parallelism()
-                .map(|n| n.get().min(4))
-                .unwrap_or(1),
-            seconds: 15,
-            mib: 64,
-            disk_write_limit_mib: 64,
+            libre_monitor_enabled: false,
+            libre_monitor_port: 8085,
+            hwinfo_gadget_enabled: false,
+            workers: logical,
+            seconds: 1800,
+            stress_mode: "timed".into(),
+            stress_passes: 4,
+            mib: 256,
+            disk_write_limit_mib: 256,
             directory: std::env::temp_dir().to_string_lossy().into_owned(),
             alert_celsius: 85.0,
+            alert_sensor_key: String::new(),
             alert_hold_secs: 5,
             auto_stop_on_heat: false,
+            pinned_sensors: Vec::new(),
             history_path: "hardware-hub-history.csv".into(),
             log_path: "hardware-hub-session.csv".into(),
             sensor_log_path: "hardware-hub-sensor.csv".into(),
@@ -165,6 +197,9 @@ mod tests {
         assert!(s.workers >= 1);
         assert!(s.alert_celsius > 0.0);
         assert!(!s.page.is_empty());
+        assert!(s.compact_mode);
+        assert!(!s.auto_stop_on_heat);
+        assert!(s.window_width >= 880.0 && s.window_height >= 560.0);
     }
 
     #[test]
@@ -175,14 +210,24 @@ mod tests {
         assert_eq!(s.page, "CPU");
         assert_eq!(s.poll_ms, 500);
         assert_eq!(s.workers, Settings::default().workers);
+        assert_eq!(s.window_width, Settings::default().window_width);
+        assert_eq!(s.stress_mode, "timed");
+        assert!(s.alert_sensor_key.is_empty());
     }
 
     #[test]
     fn roundtrips_through_json() {
         let s = Settings {
             page: "Reports".into(),
+            compact_mode: true,
+            window_width: 440.0,
+            window_height: 700.0,
+            pro_density: false,
             poll_ms: 750,
             alert_celsius: 90.0,
+            alert_sensor_key: "TZ01".into(),
+            stress_mode: "continuous".into(),
+            pinned_sensors: vec!["TZ01".into()],
             ..Settings::default()
         };
         let text = serde_json::to_string(&s).unwrap();

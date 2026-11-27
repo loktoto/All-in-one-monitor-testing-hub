@@ -346,25 +346,31 @@ mod tests {
         sample.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: Some(61.5),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         sample.temperatures.push(Temperature {
             key: "TCSF".into(),
             label: "Skin".into(),
+            source: "SMC",
             celsius: Some(40.0),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         history.record(&sample, now);
         let mut later = snapshot(now + Duration::from_secs(1));
         later.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: None,
             min: None,
             max: None,
+            ..Temperature::default()
         });
         history.record(&later, now + Duration::from_secs(1));
         assert_eq!(temperature_keys(&history), vec!["TC0P", "TCSF"]);
@@ -401,25 +407,31 @@ mod tests {
         sample.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: Some(61.5),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         sample.temperatures.push(Temperature {
             key: "TCSF".into(),
             label: "Skin".into(),
+            source: "SMC",
             celsius: Some(40.0),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         history.record(&sample, now);
         let mut later = snapshot(now + Duration::from_secs(1));
         later.temperatures.push(Temperature {
             key: "TC0P".into(),
             label: "CPU".into(),
+            source: "SMC",
             celsius: Some(63.0),
             min: None,
             max: None,
+            ..Temperature::default()
         });
         // TCSF missing in the second sample: blank, never zero.
         history.record(&later, now + Duration::from_secs(1));

@@ -21,10 +21,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1.3"
 
-# X11 is only needed on Linux. On macOS (CGL) and Windows the window is created
-# natively, so requesting the X11 backend there pulls unused system libraries.
+# Linux uses either Wayland or X11. Windows and macOS use their native windows.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
@@ -34,6 +33,8 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 # counters in ROOT\CIMV2 (readable as a standard user). `sysinfo` has no
 # component provider on Windows.
 [target.'cfg(target_os = "windows")'.dependencies]
+ureq = { version = "~3.2.1", default-features = false }
+winreg = "0.55"
 wmi = "0.18"
 
 [profile.release]
@@ -43,3 +44,8 @@ opt-level = 3
 lto = false
 codegen-units = 16
 strip = true
+
+# Naga translates the benchmark shaders during setup. Keep the generated shader
+# and the rest of the test workload at the usual release optimisation level.
+[profile.release.package.naga]
+opt-level = "s"

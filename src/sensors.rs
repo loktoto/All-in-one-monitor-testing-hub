@@ -1,33 +1,54 @@
 //! Sensor providers.
 //!
-//! `sysinfo` exposes at most a temperature or two on a Mac, because it reads a
-//! single SMC key. Tools such as HWMonitor read the SMC directly, which reveals
-//! the per-subsystem sensors (CPU proximity, GPU, battery, memory, fans). This
-//! module does the same when the platform offers it and returns nothing when it
-//! does not, so callers fall back to `sysinfo` instead of showing invented data.
+//! - **macOS**: Reads AppleSMC directly via IOKit FFI (Intel + Apple Silicon key
+//!   sets), revealing per-subsystem temperatures and `F<n>Ac` fan speeds.
+//! - **Windows**: Reads ACPI thermal zones from the standard-user `Thermal Zone
+//!   Information` performance counters (`ROOT\CIMV2`) and elevated `ROOT\WMI`
+//!   `MSAcpi_ThermalZoneTemperature` when available.
+//! - **Linux**: Reads `/sys/class/hwmon` directly without root privileges
+//!   (`coretemp`, `k10temp`, `zenpower`, `amdgpu`, `nvme`, `acpitz`, fan RPM).
 //!
-//! Every reading is tagged with the raw SMC key it came from; a value is only
-//! reported when the key decodes to a plausible number.
+//! Every reading is tagged with its raw provider key and provenance source; a
+//! value is only reported when it decodes to a plausible number.
 
-#[derive(Clone, Copy, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod hwinfo;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod lhm;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExternalThermals {
+    #[default]
+    Disabled,
+    Unavailable,
+    Connected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
     Celsius,
     Rpm,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Sensor {
     /// Raw provider key, shown so an unfamiliar sensor is still traceable.
     pub key: String,
     pub label: String,
+    /// Short provenance tag (e.g. `SMC`, `ACPI`, `hwmon`, `sysinfo`).
+    pub source: &'static str,
     pub value: Option<f32>,
     pub unit: Unit,
+    /// Identified as a core by the provider's hardware channel identity.
+    pub cpu_core: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Readings {
     pub temps: Vec<Sensor>,
     pub fans: Vec<Sensor>,
+    #[cfg(target_os = "linux")]
+    core_temps: std::collections::HashMap<(u32, u32), Option<f32>>,
 }
 
 pub struct Reader {
@@ -37,6 +58,8 @@ pub struct Reader {
     keys: Vec<KeyEntry>,
     #[cfg(target_os = "windows")]
     inner: win::Wmi,
+    #[cfg(target_os = "linux")]
+    inner: linux::Hwmon,
 }
 
 /// Opens the platform sensor provider, if one is available to an unprivileged app.
@@ -60,51 +83,83 @@ pub fn open() -> Option<Reader> {
     {
         win::Wmi::open().map(|inner| Reader { inner })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::Hwmon::open().map(|inner| Reader { inner })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         None
     }
 }
 
 impl Reader {
+    pub fn core_temperatures(
+        &self,
+        readings: &Readings,
+        cpus: &[sysinfo::Cpu],
+    ) -> Vec<Option<f32>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.core_temperatures(readings, cpus)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (readings, cpus);
+            Vec::new()
+        }
+    }
+
     pub fn readings(&mut self) -> Readings {
         #[cfg(target_os = "windows")]
         {
             self.inner.readings()
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.readings()
+        }
+        #[cfg(target_os = "macos")]
         {
             let mut out = Readings::default();
-            #[cfg(target_os = "macos")]
-            {
-                for entry in &self.keys {
-                    let Some(value) = self.inner.read_number(&entry.key) else {
-                        continue;
-                    };
-                    let plausible = match entry.unit {
-                        Unit::Celsius => (-20.0..=150.0).contains(&value),
-                        Unit::Rpm => (0.0..=20_000.0).contains(&value),
-                    };
-                    if !plausible {
-                        continue;
-                    }
-                    let sensor = Sensor {
-                        key: entry.key.clone(),
-                        label: entry.label.clone(),
-                        value: Some(value as f32),
-                        unit: entry.unit,
-                    };
-                    match entry.unit {
-                        Unit::Celsius => out.temps.push(sensor),
-                        Unit::Rpm => out.fans.push(sensor),
-                    }
+            for entry in &self.keys {
+                let Some(value) = self.inner.read_number(&entry.key) else {
+                    continue;
+                };
+                let plausible = match entry.unit {
+                    Unit::Celsius => (-20.0..=150.0).contains(&value),
+                    Unit::Rpm => (0.0..=20_000.0).contains(&value),
+                };
+                if !plausible {
+                    continue;
                 }
-                out.temps.sort_by(|a, b| a.key.cmp(&b.key));
-                out.fans.sort_by(|a, b| a.key.cmp(&b.key));
+                let sensor = Sensor {
+                    key: entry.key.clone(),
+                    label: entry.label.clone(),
+                    source: "SMC",
+                    value: Some(value as f32),
+                    unit: entry.unit,
+                    cpu_core: entry.unit == Unit::Celsius && apple_core_key(&entry.key),
+                };
+                match entry.unit {
+                    Unit::Celsius => out.temps.push(sensor),
+                    Unit::Rpm => out.fans.push(sensor),
+                }
             }
+            out.temps.sort_by(|a, b| a.key.cmp(&b.key));
+            out.fans.sort_by(|a, b| a.key.cmp(&b.key));
             out
         }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Readings::default()
+        }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apple_core_key(key: &str) -> bool {
+    matches!(key.as_bytes(), [b'T', b'p' | b'e', a, b] if a.is_ascii_digit() && b.is_ascii_digit())
 }
 
 /// `MSAcpi_ThermalZoneTemperature` reports tenths of a degree Kelvin.
@@ -133,6 +188,208 @@ fn thermal_zone_label(instance_name: &str) -> String {
         instance_name.to_owned()
     } else {
         format!("ACPI zone {zone}")
+    }
+}
+
+/// Parse a Linux `hwmon` `temp*_input` value (millidegrees Celsius) into Celsius.
+#[cfg(any(target_os = "linux", test))]
+fn parse_hwmon_millidegrees(text: &str) -> Option<f32> {
+    let milli: i64 = text.trim().parse().ok()?;
+    let celsius = milli as f32 / 1000.0;
+    (-20.0..=150.0).contains(&celsius).then_some(celsius)
+}
+
+/// Parse a Linux `hwmon` `fan*_input` value (RPM).
+#[cfg(any(target_os = "linux", test))]
+fn parse_hwmon_rpm(text: &str) -> Option<f32> {
+    let rpm: f32 = text.trim().parse().ok()?;
+    (0.0..=20_000.0).contains(&rpm).then_some(rpm)
+}
+
+/// Friendly chip label for common Linux `hwmon` drivers.
+#[cfg(any(target_os = "linux", test))]
+fn hwmon_chip_label(driver: &str) -> &str {
+    match driver.trim() {
+        "coretemp" => "Intel CPU",
+        "k10temp" | "zenpower" => "AMD CPU",
+        "amdgpu" => "AMD GPU",
+        "nouveau" => "NVIDIA GPU",
+        "nvme" => "NVMe SSD",
+        "iwlwifi_1" | "iwlwifi" => "Wi-Fi",
+        "acpitz" => "ACPI thermal",
+        "BAT0" | "BAT1" => "Battery",
+        other => other,
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::{
+        hwmon_chip_label, parse_hwmon_millidegrees, parse_hwmon_rpm, Readings, Sensor, Unit,
+    };
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    struct HwmonEntry {
+        key: String,
+        label: String,
+        input_path: PathBuf,
+        unit: Unit,
+        physical_core: Option<(u32, u32)>,
+    }
+
+    pub struct Hwmon {
+        entries: Vec<HwmonEntry>,
+        topology: HashMap<String, (u32, u32)>,
+    }
+
+    impl Hwmon {
+        pub fn open() -> Option<Hwmon> {
+            let root = Path::new("/sys/class/hwmon");
+            let mut entries = Vec::new();
+            let dirs = fs::read_dir(root).ok()?;
+            for dir in dirs.flatten() {
+                let path = dir.path();
+                let dir_name = dir.file_name().to_string_lossy().into_owned();
+                let chip = fs::read_to_string(path.join("name"))
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_else(|_| dir_name.clone());
+                let chip_friendly = hwmon_chip_label(&chip).to_owned();
+                let package = (chip == "coretemp")
+                    .then(|| number_label(&path.join("temp1_label"), "Package id "))
+                    .flatten();
+                let Ok(files) = fs::read_dir(&path) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let fname = file.file_name().to_string_lossy().into_owned();
+                    if let Some(stem) = fname.strip_suffix("_input") {
+                        let unit = if stem.starts_with("temp") {
+                            Unit::Celsius
+                        } else if stem.starts_with("fan") {
+                            Unit::Rpm
+                        } else {
+                            continue;
+                        };
+                        let label_path = path.join(format!("{stem}_label"));
+                        let sub_label = fs::read_to_string(label_path)
+                            .ok()
+                            .map(|s| s.trim().to_owned())
+                            .filter(|s| !s.is_empty());
+                        let physical_core = package.zip(
+                            sub_label
+                                .as_deref()
+                                .and_then(|label| label.strip_prefix("Core "))
+                                .and_then(|n| n.parse().ok()),
+                        );
+                        let label = match sub_label {
+                            Some(sub) => format!("{chip_friendly} · {sub}"),
+                            None => format!("{chip_friendly} ({stem})"),
+                        };
+                        entries.push(HwmonEntry {
+                            key: format!("{dir_name}:{chip}:{stem}"),
+                            label,
+                            input_path: file.path(),
+                            unit,
+                            physical_core,
+                        });
+                    }
+                }
+            }
+            if entries.is_empty() {
+                return None;
+            }
+            entries.sort_by(|a, b| a.key.cmp(&b.key));
+            let topology = if entries.iter().any(|entry| entry.physical_core.is_some()) {
+                cpu_topology(Path::new("/sys/devices/system/cpu"))
+            } else {
+                HashMap::new()
+            };
+            Some(Hwmon { entries, topology })
+        }
+
+        pub fn core_temperatures(
+            &self,
+            readings: &Readings,
+            cpus: &[sysinfo::Cpu],
+        ) -> Vec<Option<f32>> {
+            if readings.core_temps.is_empty() {
+                return Vec::new();
+            }
+            cpus.iter()
+                .map(|cpu| {
+                    let ids = self.topology.get(cpu.name())?;
+                    readings.core_temps.get(ids).copied().flatten()
+                })
+                .collect()
+        }
+
+        pub fn readings(&mut self) -> Readings {
+            let mut out = Readings::default();
+            for entry in &self.entries {
+                let Ok(raw) = fs::read_to_string(&entry.input_path) else {
+                    continue;
+                };
+                let value = match entry.unit {
+                    Unit::Celsius => parse_hwmon_millidegrees(&raw),
+                    Unit::Rpm => parse_hwmon_rpm(&raw),
+                };
+                let Some(value) = value else {
+                    continue;
+                };
+                if let Some(ids) = entry.physical_core {
+                    out.core_temps
+                        .entry(ids)
+                        .and_modify(|value| *value = None)
+                        .or_insert(Some(value));
+                }
+                let sensor = Sensor {
+                    key: entry.key.clone(),
+                    label: entry.label.clone(),
+                    source: "hwmon",
+                    value: Some(value),
+                    unit: entry.unit,
+                    cpu_core: entry.physical_core.is_some(),
+                };
+                match entry.unit {
+                    Unit::Celsius => out.temps.push(sensor),
+                    Unit::Rpm => out.fans.push(sensor),
+                }
+            }
+            out
+        }
+    }
+
+    fn number_label(path: &Path, prefix: &str) -> Option<u32> {
+        fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .strip_prefix(prefix)?
+            .parse()
+            .ok()
+    }
+
+    fn cpu_topology(root: &Path) -> HashMap<String, (u32, u32)> {
+        let Ok(dirs) = fs::read_dir(root) else {
+            return HashMap::new();
+        };
+        dirs.flatten()
+            .filter_map(|dir| {
+                let name = dir.file_name().into_string().ok()?;
+                name.strip_prefix("cpu")?.parse::<u32>().ok()?;
+                let topology = dir.path().join("topology");
+                Some((
+                    name,
+                    (
+                        number_label(&topology.join("physical_package_id"), "")?,
+                        number_label(&topology.join("core_id"), "")?,
+                    ),
+                ))
+            })
+            .collect()
     }
 }
 
@@ -228,8 +485,10 @@ mod win {
         out.temps.push(Sensor {
             label: thermal_zone_label(&instance_name),
             key: instance_name,
+            source: "ACPI",
             value: Some(celsius),
             unit: Unit::Celsius,
+            cpu_core: false,
         });
     }
 }
@@ -242,11 +501,13 @@ struct KeyEntry {
 }
 
 /// Reads every key the SMC exposes and keeps the temperature and fan ones.
+/// Supports both Intel (`sp78` / `fpe2`) and Apple Silicon (`flt ` / `sp78`)
+/// SMC encodings.
 #[cfg(target_os = "macos")]
 fn enumerate(smc: &mut mac::Smc, count: usize) -> Vec<KeyEntry> {
     let mut found = Vec::new();
-    // Older machines expose ~400 keys; the cap keeps a bad response from stalling startup.
-    for index in 0..count.min(2000) {
+    // Older machines expose ~400 keys; Apple Silicon can expose >1000.
+    for index in 0..count.min(3000) {
         let Some(key) = smc.key_at(index) else {
             continue;
         };
@@ -256,7 +517,8 @@ fn enumerate(smc: &mut mac::Smc, count: usize) -> Vec<KeyEntry> {
         let unit = match (kind.as_str(), key.as_str()) {
             ("sp78", _) if key.starts_with('T') => Unit::Celsius,
             ("fpe2", _) if is_fan_key(&key) => Unit::Rpm,
-            // Battery and power sensors sometimes decode as plain floats.
+            // Apple Silicon reports temperatures and fans as IEEE-754 floats (`flt `).
+            ("flt ", _) if is_fan_key(&key) => Unit::Rpm,
             ("flt ", _) if key.starts_with('T') => Unit::Celsius,
             _ => continue,
         };
@@ -283,6 +545,8 @@ fn is_fan_key(key: &str) -> bool {
 }
 
 /// SMC keys are four characters: the first two identify the subsystem.
+/// Covers both Intel Mac (`TC`, `TG`, `TB`, ...) and Apple Silicon SoC
+/// prefixes (`Tp` P-core die, `Te` E-core die, `Tg` GPU die, `TR` NAND/SSD).
 pub fn label_for(key: &str, unit: Unit) -> String {
     if unit == Unit::Rpm {
         let number = key.as_bytes().get(1).copied().unwrap_or(b'0');
@@ -297,19 +561,23 @@ pub fn label_for(key: &str, unit: Unit) -> String {
     };
     let area = match prefix {
         "TC" => "CPU",
-        "TG" => "GPU",
+        "Tp" => "CPU P-core",
+        "Te" => "CPU E-core",
+        "TG" | "Tg" => "GPU",
         "TB" => "Battery",
         "TA" => "Ambient",
-        "Tm" => "Memory",
+        "Tm" | "TM" => "Memory",
         "TN" => "Northbridge",
         "TH" => "Heatsink",
+        "TR" => "Storage NAND",
         "Ts" => "Palm rest",
-        "Tp" => "Power supply",
+        "TP" => "Power supply",
         "TW" => "Wireless",
         "TI" => "Thunderbolt",
         "Tf" => "Fan",
         "TL" => "Display",
         "TV" => "VRM",
+        "TD" => "SoC die",
         _ => return key.to_owned(),
     };
     // Last character distinguishes neighbouring sensors in the same area.
@@ -491,8 +759,13 @@ mod mac {
             ("sp78", 2) => Some(i16::from_be_bytes([bytes[0], bytes[1]]) as f64 / 256.0),
             // Unsigned fixed point 14.2, the format used by fan RPM keys.
             ("fpe2", 2) => Some(u16::from_be_bytes([bytes[0], bytes[1]]) as f64 / 4.0),
+            // Apple Silicon SMC `flt ` values are little-endian IEEE-754 floats.
             ("flt ", 4) => {
-                Some(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64)
+                #[cfg(target_arch = "aarch64")]
+                let val = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
+                #[cfg(not(target_arch = "aarch64"))]
+                let val = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
+                Some(val)
             }
             ("ui8 ", 1) => Some(bytes[0] as f64),
             ("ui16", 2) => Some(u16::from_be_bytes([bytes[0], bytes[1]]) as f64),
@@ -535,11 +808,24 @@ mod tests {
     #[test]
     fn labels_name_the_subsystem() {
         assert_eq!(label_for("TC0P", Unit::Celsius), "CPU (P)");
+        assert_eq!(label_for("Tp01", Unit::Celsius), "CPU P-core (1)");
+        assert_eq!(label_for("Te05", Unit::Celsius), "CPU E-core (5)");
         assert_eq!(label_for("TG0D", Unit::Celsius), "GPU (D)");
+        assert_eq!(label_for("Tg05", Unit::Celsius), "GPU (5)");
         assert_eq!(label_for("TB0T", Unit::Celsius), "Battery (T)");
+        assert_eq!(label_for("TR0Z", Unit::Celsius), "Storage NAND (Z)");
         assert_eq!(label_for("F0Ac", Unit::Rpm), "Fan 0");
         assert_eq!(label_for("F1Ac", Unit::Rpm), "Fan 1");
         assert_eq!(label_for("ZZ1Z", Unit::Celsius), "ZZ1Z");
+    }
+
+    #[test]
+    fn apple_core_group_keeps_other_smc_channels_separate() {
+        assert!(apple_core_key("Tp01"));
+        assert!(apple_core_key("Te05"));
+        assert!(!apple_core_key("TC0P"));
+        assert!(!apple_core_key("Tp0P"));
+        assert!(!apple_core_key("Té05"));
     }
 
     #[test]
@@ -549,6 +835,18 @@ mod tests {
         assert_eq!(label_for("€x", Unit::Celsius), "€x");
         assert_eq!(label_for("€TC", Unit::Celsius), "€TC");
         assert_eq!(label_for("é", Unit::Celsius), "é");
+    }
+
+    #[test]
+    fn linux_hwmon_parsers_decode_and_guard_outliers() {
+        assert_eq!(parse_hwmon_millidegrees("54250\n"), Some(54.25));
+        assert_eq!(parse_hwmon_millidegrees("250000"), None);
+        assert_eq!(parse_hwmon_millidegrees("not-a-number"), None);
+        assert_eq!(parse_hwmon_rpm("1850\n"), Some(1850.0));
+        assert_eq!(parse_hwmon_rpm("-10"), None);
+        assert_eq!(hwmon_chip_label("k10temp"), "AMD CPU");
+        assert_eq!(hwmon_chip_label("coretemp"), "Intel CPU");
+        assert_eq!(hwmon_chip_label("nvme"), "NVMe SSD");
     }
 
     #[test]

@@ -292,7 +292,11 @@ pub fn collect() -> SystemSpecs {
     {
         windows::collect()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::collect()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         portable::collect()
     }
@@ -518,9 +522,239 @@ mod portable {
         specs.cpu.physical_cores = system.physical_core_count().map(|n| n as u32);
         specs.cpu.logical_cores = Some(system.cpus().len() as u32);
         specs.memory.total_bytes = Some(system.total_memory());
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         specs.unavailable.push(
-            "Cache sizes, memory module details, drive health and battery state are collected only on macOS in this build."
+            "Cache sizes, memory module details, drive health and battery state are collected only on supported desktop platforms."
+                .into(),
+        );
+        specs
+    }
+}
+
+/// Parse Linux sysfs cache size strings such as `32K`, `512K`, `16384K`, `16M`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_sysfs_cache_size(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (num_str, mult) = if let Some(s) = trimmed.strip_suffix('K') {
+        (s, 1024u64)
+    } else if let Some(s) = trimmed.strip_suffix('M') {
+        (s, 1024 * 1024)
+    } else if let Some(s) = trimmed.strip_suffix('G') {
+        (s, 1024 * 1024 * 1024)
+    } else {
+        (trimmed, 1)
+    };
+    num_str
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(mult))
+}
+
+/// Extract common CPU instruction set highlights from `/proc/cpuinfo` flags.
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_cpu_flags(cpuinfo: &str) -> String {
+    let mut found = Vec::new();
+    let line = cpuinfo
+        .lines()
+        .find(|l| l.starts_with("flags") || l.starts_with("Features"));
+    let Some((_, rhs)) = line.and_then(|l| l.split_once(':')) else {
+        return String::new();
+    };
+    let tokens: Vec<&str> = rhs.split_whitespace().collect();
+    for (flag, label) in [
+        ("sse4_2", "SSE4.2"),
+        ("avx", "AVX"),
+        ("avx2", "AVX2"),
+        ("avx512f", "AVX-512"),
+        ("aes", "AES-NI"),
+        ("fma", "FMA3"),
+        ("sha_ni", "SHA"),
+        ("vmx", "VT-x"),
+        ("svm", "AMD-V"),
+        ("asimd", "NEON"),
+    ] {
+        if tokens.contains(&flag) {
+            found.push(label);
+        }
+    }
+    found.join(", ")
+}
+
+/// Linux read-only hardware inventory from `/sys` and `/proc` without root.
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use std::fs;
+
+    fn read_trim(path: &str) -> Option<String> {
+        let text = fs::read_to_string(path).ok()?;
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    pub fn collect() -> SystemSpecs {
+        let mut specs = super::portable::collect();
+        specs.sources = "sysinfo · Linux sysfs (/sys, /proc, read-only)".into();
+
+        // DMI / SMBIOS motherboard & firmware identity (world-readable sysfs files)
+        let sys_vendor = read_trim("/sys/class/dmi/id/sys_vendor").unwrap_or_default();
+        let prod_name = read_trim("/sys/class/dmi/id/product_name").unwrap_or_default();
+        let model = [sys_vendor, prod_name]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !model.is_empty() {
+            specs.model_name = model;
+        }
+        specs.model_id = read_trim("/sys/class/dmi/id/product_sku")
+            .or_else(|| read_trim("/sys/class/dmi/id/product_family"))
+            .unwrap_or_default();
+        let bios_vendor = read_trim("/sys/class/dmi/id/bios_vendor").unwrap_or_default();
+        let bios_ver = read_trim("/sys/class/dmi/id/bios_version").unwrap_or_default();
+        let bios_date = read_trim("/sys/class/dmi/id/bios_date").unwrap_or_default();
+        let fw = [bios_vendor, bios_ver]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        specs.firmware = if !fw.is_empty() && !bios_date.is_empty() {
+            format!("{fw} ({bios_date})")
+        } else {
+            fw
+        };
+        specs.board_vendor = read_trim("/sys/class/dmi/id/board_vendor").unwrap_or_default();
+        specs.board_model = read_trim("/sys/class/dmi/id/board_name").unwrap_or_default();
+        specs.board_version = read_trim("/sys/class/dmi/id/board_version").unwrap_or_default();
+        let board_combined = [specs.board_vendor.clone(), specs.board_model.clone()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !board_combined.is_empty() {
+            specs.board_id = Some(board_combined);
+        }
+
+        // CPU caches & instruction flags
+        if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu/cpu0/cache") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let level = fs::read_to_string(path.join("level"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let kind = fs::read_to_string(path.join("type"))
+                    .ok()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .unwrap_or_default();
+                let size = fs::read_to_string(path.join("size"))
+                    .ok()
+                    .and_then(|s| parse_sysfs_cache_size(&s));
+                let line = fs::read_to_string(path.join("coherency_line_size"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                if specs.cpu.cache_line_bytes.is_none() {
+                    specs.cpu.cache_line_bytes = line;
+                }
+                match (level, kind.as_str(), size) {
+                    (Some(1), "data", Some(sz)) => specs.cpu.l1_data_bytes = Some(sz),
+                    (Some(1), "instruction", Some(sz)) => specs.cpu.l1_instruction_bytes = Some(sz),
+                    (Some(2), _, Some(sz)) => specs.cpu.l2_bytes = Some(sz),
+                    (Some(3), _, Some(sz)) => specs.cpu.l3_bytes = Some(sz),
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+            specs.cpu.instructions = parse_linux_cpu_flags(&cpuinfo);
+            if let Some(stepping) = cpuinfo
+                .lines()
+                .find(|l| l.starts_with("stepping"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_owned())
+            {
+                specs.cpu.stepping = stepping;
+            }
+        }
+        if let Some(max_khz) = read_trim("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            specs.cpu.max_mhz = Some(max_khz / 1000);
+        }
+
+        // Block devices (NVMe / SATA models, firmware, capacity)
+        if let Ok(entries) = fs::read_dir("/sys/block") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("dm-") {
+                    continue;
+                }
+                let dev_dir = entry.path().join("device");
+                let model = fs::read_to_string(dev_dir.join("model"))
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default();
+                if model.is_empty() {
+                    continue;
+                }
+                let firmware = fs::read_to_string(dev_dir.join("firmware_rev"))
+                    .or_else(|_| fs::read_to_string(dev_dir.join("rev")))
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default();
+                let sectors = fs::read_to_string(entry.path().join("size"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let protocol = if name.starts_with("nvme") {
+                    "NVMe".to_owned()
+                } else {
+                    "Block".to_owned()
+                };
+                specs.drives.push(DriveSpec {
+                    model,
+                    firmware,
+                    protocol,
+                    link: name,
+                    trim: None,
+                    smart: String::new(),
+                    serial: String::new(),
+                    capacity_bytes: sectors.map(|s| s.saturating_mul(512)),
+                });
+            }
+        }
+
+        // Power supply / Battery
+        if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let kind = fs::read_to_string(path.join("type"))
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .unwrap_or_default();
+                if kind.eq_ignore_ascii_case("Battery") {
+                    let cap = fs::read_to_string(path.join("capacity"))
+                        .ok()
+                        .map(|s| s.trim().to_owned());
+                    let status = fs::read_to_string(path.join("status"))
+                        .ok()
+                        .map(|s| s.trim().to_owned());
+                    if let Some(cap) = cap {
+                        let summary = match status {
+                            Some(st) if !st.is_empty() => format!("{cap}% · {st}"),
+                            _ => format!("{cap}%"),
+                        };
+                        specs.battery = Some(summary);
+                        break;
+                    }
+                }
+            }
+        }
+
+        specs.unavailable.push(
+            "Per-DIMM SMBIOS records require root (dmidecode) on Linux and are not read by a standard user."
                 .into(),
         );
         specs
@@ -2057,6 +2291,18 @@ NVMExpress:
         std::fs::write(&path, bumped).unwrap();
         assert!(load_cache(&path).is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn linux_sysfs_parsers_handle_caches_and_flags() {
+        assert_eq!(parse_sysfs_cache_size("32K\n"), Some(32 * 1024));
+        assert_eq!(parse_sysfs_cache_size("16M"), Some(16 * 1024 * 1024));
+        assert_eq!(parse_sysfs_cache_size(""), None);
+        let flags =
+            parse_linux_cpu_flags("processor\t: 0\nflags\t\t: fpu sse4_2 avx avx2 aes fma vmx\n");
+        assert!(flags.contains("AVX2"));
+        assert!(flags.contains("AES-NI"));
+        assert!(flags.contains("VT-x"));
     }
 
     #[test]
