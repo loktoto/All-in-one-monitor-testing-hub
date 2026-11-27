@@ -10,12 +10,54 @@ use hardware_hub::{
     history,
     logging::Recorder,
     specs::SystemSpecs,
-    telemetry::Snapshot,
+    telemetry::{Disk, Snapshot},
 };
 use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
+
+fn volume_fraction(disk: &Disk) -> f32 {
+    disk.total.saturating_sub(disk.available) as f32 / disk.total.max(1) as f32
+}
+
+fn transfer_rate(delta: u64, interval: f64) -> String {
+    format!("{}/s", bytes((delta as f64 / interval).round() as u64))
+}
+
+fn overview_reading(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    color: egui::Color32,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("{label} {value}"))
+    });
+    let painter = ui.painter_at(rect);
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let offset = 86.0;
+    let name = elided(ui, label, 11.5, TEXT_DIM, offset - 8.0);
+    let reading = elided(ui, value, 12.0, color, rect.width() - offset - 4.0);
+    painter.galley(
+        egui::pos2(rect.left() + 4.0, rect.center().y - name.size().y / 2.0),
+        name,
+        TEXT_DIM,
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + offset,
+            rect.center().y - reading.size().y / 2.0,
+        ),
+        reading,
+        color,
+    );
+    response.on_hover_text(value)
+}
 
 impl App {
     pub fn view_overview(&mut self, ui: &mut egui::Ui, s: &Snapshot) {
@@ -43,6 +85,10 @@ impl App {
 
         let avail_w = ui.available_width();
         let narrow = self.compact_mode || avail_w < 680.0;
+        if narrow || self.pro_density {
+            self.dense_overview(ui, s, specs.as_deref());
+            return;
+        }
 
         let memory_fraction = if s.memory_total > 0 {
             s.memory_used as f32 / s.memory_total as f32
@@ -74,18 +120,13 @@ impl App {
             })
             .unwrap_or("");
 
-        // -------------------------------------------------------- top KPI glance strip
-        if narrow {
-            self.compact_glance_strip(ui, s, memory_fraction, peak_celsius, smart);
-        } else {
-            self.expanded_kpi_row(ui, s, memory_fraction, peak_celsius, smart);
-        }
+        self.expanded_kpi_row(ui, s, memory_fraction, peak_celsius, smart);
         ui.add_space(10.0);
 
         // -------------------------------------------------------- main HWMonitor split
         // In expanded mode (>= 940px), show HWMonitor Sensor Tree on the left (62%)
         // and Live Trend Inspector + Recent Activity on the right (38%).
-        if !narrow && avail_w >= 920.0 {
+        if avail_w >= 920.0 {
             let left_w = (avail_w * 0.60).floor();
             let gap = 12.0;
             let right_w = (avail_w - left_w - gap).max(260.0);
@@ -115,15 +156,15 @@ impl App {
         } else {
             // Compact HWMonitor vertical flow: sensor tree first, inline plot on click,
             // then liquid core tiles and recent activity.
-            self.hwmonitor_tree_card(ui, s, specs.as_deref(), narrow);
+            self.hwmonitor_tree_card(ui, s, specs.as_deref(), false);
             if !self.selected_temp_key.is_empty() {
                 ui.add_space(8.0);
                 self.sensor_inspector_card(ui, s);
             }
             ui.add_space(8.0);
-            self.liquid_cores_card(ui, s, specs.as_deref(), narrow);
+            self.liquid_cores_card(ui, s, specs.as_deref(), false);
             ui.add_space(8.0);
-            self.recent_activity_card(ui, narrow);
+            self.recent_activity_card(ui, false);
             ui.add_space(8.0);
             self.storage_snapshot_card(ui, s, specs.as_deref());
         }
@@ -133,73 +174,160 @@ impl App {
         ui.add_space(8.0);
     }
 
-    fn compact_glance_strip(
-        &mut self,
-        ui: &mut egui::Ui,
-        s: &Snapshot,
-        memory_fraction: f32,
-        peak_celsius: Option<f32>,
-        smart: &str,
-    ) {
-        compact_card_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.columns(2, |cols| {
-                // CPU + RAM
-                let cpu_txt = if s.cores.is_empty() || !s.cpu_usage.is_finite() {
-                    "—".into()
-                } else {
-                    format!("{:.0}%", s.cpu_usage)
-                };
-                cols[0].horizontal(|ui| {
-                    ui.label(RichText::new("CPU").size(10.0).strong().color(MUTED));
-                    ui.label(
-                        RichText::new(cpu_txt)
-                            .monospace()
-                            .size(14.0)
-                            .strong()
-                            .color(load_color(s.cpu_usage / 100.0)),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("RAM").size(10.0).strong().color(MUTED));
-                    ui.label(
-                        RichText::new(format!("{:.0}%", memory_fraction * 100.0))
-                            .monospace()
-                            .size(14.0)
-                            .strong()
-                            .color(VIOLET),
-                    );
-                });
-                cols[0].add_space(4.0);
-                bar(
-                    &mut cols[0],
-                    "compact-cpu",
-                    s.cpu_usage / 100.0,
-                    load_color(s.cpu_usage / 100.0),
-                    4.0,
-                );
+    fn dense_overview(&mut self, ui: &mut egui::Ui, s: &Snapshot, specs: Option<&SystemSpecs>) {
+        let unavailable = || "—".to_owned();
+        let cpu = if !s.cores.is_empty() && s.cpu_usage.is_finite() {
+            format!("{:.0}% · {} threads", s.cpu_usage, s.cores.len())
+        } else {
+            unavailable()
+        };
+        let ram = if s.memory_total > 0 {
+            format!("{:.1} / {:.1} GiB", gib(s.memory_used), gib(s.memory_total))
+        } else {
+            unavailable()
+        };
+        let gpu = s
+            .adapters
+            .iter()
+            .find(|a| !a.software)
+            .map(|gpu| gpu.name.clone())
+            .unwrap_or_else(unavailable);
+        let disk = s
+            .disks
+            .iter()
+            .filter(|disk| disk.total > 0)
+            .max_by(|a, b| volume_fraction(a).total_cmp(&volume_fraction(b)))
+            .map(|disk| {
+                format!(
+                    "{:.0}% used · {} free",
+                    volume_fraction(disk) * 100.0,
+                    bytes(disk.available)
+                )
+            })
+            .unwrap_or_else(unavailable);
+        let network = s
+            .network_interval_seconds
+            .filter(|interval| interval.is_finite() && *interval > 0.0)
+            .zip(
+                s.networks
+                    .iter()
+                    .max_by_key(|n| n.received.saturating_add(n.transmitted)),
+            )
+            .map(|(interval, link)| {
+                format!(
+                    "{} RX · {} TX",
+                    transfer_rate(link.received, interval),
+                    transfer_rate(link.transmitted, interval)
+                )
+            })
+            .unwrap_or_else(unavailable);
+        let hottest = s
+            .temperatures
+            .iter()
+            .filter_map(|sensor| sensor.celsius)
+            .filter(|value| value.is_finite())
+            .max_by(f32::total_cmp);
+        let temp = hottest
+            .map(|value| format!("{value:.0} °C peak"))
+            .unwrap_or_else(unavailable);
+        let fan = s
+            .fans
+            .iter()
+            .filter_map(|sensor| sensor.rpm)
+            .filter(|value| value.is_finite())
+            .max_by(f32::total_cmp)
+            .map(|value| format!("{value:.0} RPM max"))
+            .unwrap_or_else(unavailable);
 
-                // Peak Temp + Health
-                cols[1].horizontal(|ui| {
-                    ui.label(RichText::new("PEAK").size(10.0).strong().color(MUTED));
-                    let peak_str = peak_celsius
-                        .map(|v| format!("{v:.0}°C"))
-                        .unwrap_or_else(|| "—".into());
-                    ui.label(
-                        RichText::new(peak_str)
-                            .monospace()
-                            .size(14.0)
-                            .strong()
-                            .color(peak_celsius.map(temperature_color).unwrap_or(MUTED)),
-                    );
-                    if !smart.is_empty() {
-                        ui.add_space(6.0);
-                        let short = smart.split('·').next().unwrap_or(smart).trim();
-                        chip(ui, &short.to_uppercase(), smart_color(smart));
+        compact_card_frame().show(ui, |ui| {
+            for (label, value, page, color) in [
+                ("CPU", cpu, Page::Cpu, ACCENT),
+                ("RAM", ram, Page::Memory, VIOLET),
+                ("GPU", gpu, Page::Gpu, TEXT_DIM),
+                ("Storage", disk, Page::Storage, TEXT_DIM),
+                ("Network", network, Page::Network, TEXT_DIM),
+                (
+                    "Temperature",
+                    temp,
+                    Page::Thermal,
+                    hottest.map(temperature_color).unwrap_or(MUTED),
+                ),
+                ("Fans", fan, Page::Thermal, TEXT_DIM),
+            ] {
+                if overview_reading(ui, label, &value, color).clicked() {
+                    self.page = page;
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        let mut temperatures: Vec<_> = s.temperatures.iter().collect();
+        temperatures.sort_by(|a, b| {
+            let priority = |sensor: &hardware_hub::telemetry::Temperature| {
+                (
+                    self.pinned_sensors.iter().any(|key| key == &sensor.key),
+                    sensor.cpu_core,
+                )
+            };
+            priority(b)
+                .cmp(&priority(a))
+                .then_with(|| {
+                    b.celsius
+                        .unwrap_or(f32::NEG_INFINITY)
+                        .total_cmp(&a.celsius.unwrap_or(f32::NEG_INFINITY))
+                })
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        compact_card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("Temperature sensors");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ghost_button(ui, &format!("All {}", temperatures.len())).clicked() {
+                        self.page = Page::Thermal;
                     }
                 });
-                cols[1].add_space(4.0);
-                bar(&mut cols[1], "compact-ram", memory_fraction, VIOLET, 4.0);
             });
+            if temperatures.is_empty() {
+                empty_note(ui, "No temperature channels are available.");
+            } else {
+                let rows: Vec<_> = temperatures
+                    .into_iter()
+                    .take(5)
+                    .map(RowView::from)
+                    .collect();
+                let selection = sensor_table(
+                    ui,
+                    "overview-glance-temps",
+                    "",
+                    &rows,
+                    Some(&self.selected_temp_key),
+                    &self.pinned_sensors,
+                    true,
+                );
+                if let Some(key) = selection.clicked_key {
+                    self.selected_temp_key = key;
+                    self.focus_temperature_chart = true;
+                    self.page = Page::Thermal;
+                }
+                if let Some(key) = selection.toggled_pin {
+                    self.toggle_pin_sensor(&key);
+                }
+            }
+        });
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("All sensors and ranges").show(ui, |ui| {
+            self.hwmonitor_tree_card(ui, s, specs, true);
+            if !self.selected_temp_key.is_empty() {
+                self.sensor_inspector_card(ui, s);
+            }
+        });
+        egui::CollapsingHeader::new("Core activity").show(ui, |ui| {
+            liquid_core_grid(ui, "overview-glance-cores", s, true);
+        });
+        egui::CollapsingHeader::new("Charts, drives and session recording").show(ui, |ui| {
+            self.recent_activity_card(ui, true);
+            self.storage_snapshot_card(ui, s, specs);
+            self.session_log_card(ui);
         });
     }
 

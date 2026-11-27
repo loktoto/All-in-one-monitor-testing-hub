@@ -1051,6 +1051,88 @@ mod tests {
     }
 
     #[test]
+    fn compact_overview_shows_system_readings_in_the_first_scroll_view() {
+        fn walk(shape: &egui::Shape, rendered: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, rendered)),
+                egui::Shape::Text(text) => rendered.push(text.galley.job.text.clone()),
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let mut app = App::from_settings(Settings::default(), true);
+        app.dark_titlebar_ticks = 3;
+        app.show_widget = false;
+        *app.snapshot.lock().unwrap() = Arc::new(Snapshot {
+            ready: true,
+            updated_at: Some(Instant::now()),
+            cpu_usage: 27.0,
+            cores: vec![10.0, 44.0],
+            memory_used: 6 << 30,
+            memory_total: 16 << 30,
+            disks: vec![telemetry::Disk {
+                total: 100 << 30,
+                available: 40 << 30,
+                ..Default::default()
+            }],
+            networks: vec![telemetry::Network {
+                received: 4096,
+                transmitted: 2048,
+                ..Default::default()
+            }],
+            network_interval_seconds: Some(2.0),
+            temperatures: vec![telemetry::Temperature {
+                key: "test-core-0".into(),
+                label: "Core 0".into(),
+                source: "fixture",
+                celsius: Some(63.0),
+                cpu_core: true,
+                ..Default::default()
+            }],
+            fans: vec![telemetry::Fan {
+                key: "fan".into(),
+                label: "Fan".into(),
+                source: "fixture",
+                rpm: Some(1420.0),
+                min: None,
+                max: None,
+            }],
+            ..Default::default()
+        });
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 520.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render(ctx),
+        );
+        let mut rendered = Vec::new();
+        for shape in &output.shapes {
+            walk(&shape.shape, &mut rendered);
+        }
+        for value in [
+            "27% · 2 threads",
+            "6.0 / 16.0 GiB",
+            "GPU",
+            "60% used · 40.0 GiB free",
+            "2 KiB/s RX · 1 KiB/s TX",
+            "63 °C peak",
+            "1420 RPM max",
+            "Core 0",
+        ] {
+            assert!(
+                rendered.iter().any(|text| text == value),
+                "Missing {value:?} from compact Overview"
+            );
+        }
+    }
+
+    #[test]
     fn quick_jump_opens_a_temperature_sensor_with_the_keyboard() {
         let ctx = egui::Context::default();
         install_theme(&ctx);
