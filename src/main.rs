@@ -222,6 +222,11 @@ pub(crate) struct App {
     pub cpu_workload: CpuWorkload,
     pub mib: usize,
     pub disk_write_limit_mib: u64,
+    pub disk_benchmark: Option<hardware_hub::diskbench::Run>,
+    pub disk_bench_mount: String,
+    pub disk_bench_mib: usize,
+    pub disk_bench_direct: bool,
+    pub disk_bench_message: String,
     pub directory: String,
     pub mem_pattern: MemPattern,
     pub disk_pattern: DiskPattern,
@@ -389,6 +394,11 @@ impl App {
             } else {
                 settings.directory.clone()
             },
+            disk_benchmark: None,
+            disk_bench_mount: String::new(),
+            disk_bench_mib: 16,
+            disk_bench_direct: cfg!(windows),
+            disk_bench_message: String::new(),
             mem_pattern: MemPattern::Alternating,
             disk_pattern: DiskPattern::Constant,
             gpu_intensity: GpuIntensity::Standard,
@@ -714,6 +724,8 @@ impl App {
             } else if running && !self.cancel.load(Ordering::Relaxed) {
                 self.cancel.store(true, Ordering::Relaxed);
                 self.message = "Stopping after the current work or I/O operation…".into();
+            } else if let Some(bench) = &self.disk_benchmark {
+                bench.stop();
             }
         }
 
