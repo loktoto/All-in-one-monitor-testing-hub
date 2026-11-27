@@ -200,6 +200,7 @@ pub(crate) struct App {
     pub sampling_control: Arc<SamplingControl>,
     pub libre_monitor_enabled: bool,
     pub libre_monitor_port: u16,
+    pub hwinfo_gadget_enabled: bool,
     pub stop: Arc<AtomicBool>,
     pub stats_reset: Arc<AtomicBool>,
     pub cancel: Arc<AtomicBool>,
@@ -355,6 +356,7 @@ impl App {
             poll_ms: Arc::new(AtomicU64::new(settings.poll_ms.clamp(250, 5000))),
             sampling_control: Arc::new(SamplingControl::default()),
             libre_monitor_enabled: settings.libre_monitor_enabled,
+            hwinfo_gadget_enabled: settings.hwinfo_gadget_enabled,
             libre_monitor_port: if settings.libre_monitor_port == 0 {
                 8085
             } else {
@@ -470,6 +472,7 @@ impl App {
             poll_ms: self.poll_ms.load(Ordering::Relaxed),
             libre_monitor_enabled: self.libre_monitor_enabled,
             libre_monitor_port: self.libre_monitor_port,
+            hwinfo_gadget_enabled: self.hwinfo_gadget_enabled,
             workers: self.workers,
             seconds: self.seconds,
             stress_mode: run_mode_key(self.stress_mode).to_owned(),
@@ -915,7 +918,14 @@ impl App {
         };
         let previous_pause = self.sampling_control.paused.swap(paused, Ordering::Relaxed);
         let previous_port = self.sampling_control.lhm_port.swap(port, Ordering::Relaxed);
-        if paused != previous_pause || port != previous_port {
+        let previous_hwinfo = self
+            .sampling_control
+            .hwinfo_gadget_enabled
+            .swap(self.hwinfo_gadget_enabled, Ordering::Relaxed);
+        if paused != previous_pause
+            || port != previous_port
+            || self.hwinfo_gadget_enabled != previous_hwinfo
+        {
             self.sampling_control.wake();
         }
         if running || recording {

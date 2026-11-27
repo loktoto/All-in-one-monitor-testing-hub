@@ -19,12 +19,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: System libraries (eframe / glow / x11)
+      - name: System libraries (OpenGL, Wayland and X11)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev \
-            libxrandr-dev libxinerama-dev libxkbcommon-dev
+            libxrandr-dev libxinerama-dev libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -33,17 +33,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: System libraries (eframe / glow / x11)
+      - name: System libraries (OpenGL, Wayland and X11)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev \
-            libxrandr-dev libxinerama-dev libxkbcommon-dev
+            libxrandr-dev libxinerama-dev libxkbcommon-dev libwayland-dev
       - run: cargo test --locked

@@ -34,7 +34,7 @@ Graphics discovery uses Metal. If you install a binary produced by CI instead of
 2. In this folder run `cargo run --release`. Or use the Windows executable artifact from a successful GitHub Actions run.
 3. The same pages are available; GPU discovery uses DX12.
 
-Linux is supported for development where an X11/graphics stack is available (the `x11` feature is enabled only for Linux targets).
+On Linux, run from a Wayland or X11 desktop session with an OpenGL driver.
 
 ## What each page shows
 
@@ -49,6 +49,8 @@ Hardware Hub opens in Compact mode on a fresh setup. **Expand** opens the wider 
 **CPU core temperatures** appears on CPU and Thermals / fans. Each reported channel has its own current value, session minimum, maximum and average. Click a row for its recent graph, or use session CSV recording for longer runs. **Reset statistics** restarts the session extrema and average. Package and ACPI zone temperatures stay in the other-temperature list. Each provider determines which cores and sensor channels are exposed.
 
 On Windows, **Read LibreHardwareMonitor** optionally reads `/data.json` from `127.0.0.1` using the selected port (8085 by default). Start LibreHardwareMonitor's web server with the loopback address and the matching port before enabling the feed. Hardware Hub reads the feed through local HTTP. A package-only feed still supplies package temperature. The Core table lists the physical sensor channels by provider label and key.
+
+**Read HWiNFO Gadget** is a second Windows option in the CPU core temperature section. In HWiNFO, open Sensor Settings → HWiNFO Gadget, enable Gadget reporting and select the temperature and fan channels to export. Hardware Hub reads their current values from the Gadget registry output and tracks session ranges locally. The feed must have updated within 30 seconds. Available channels depend on the CPU, board and HWiNFO; each source keeps its own sensor identities.
 
 **Processes** — filter by process name or PID and sort by CPU or memory; per-interface network rates use received/sent byte deltas divided by the measured refresh interval. CPU percentage is relative to one logical core and can exceed 100%. Process and interface availability depend on OS permissions, and virtual interfaces can appear. No process control or GPU attribution is provided.
 
@@ -111,7 +113,7 @@ cargo run --release --example perf  # micro-profile of the UI read path
 cargo run
 ```
 
-CI builds and tests on Windows and macOS and publishes each release executable as a workflow artifact. See the [current capability inventory](docs/capabilities.md), [architecture and roadmap](docs/architecture.md) and the [public reference study](docs/reference-study.md) for evidence, feature gaps and boundaries. Test on actual hardware with representative NVIDIA/AMD/Intel/Apple adapters and storage devices before relying on it. No real hardware validation is implied by a CI build.
+CI tests Linux, Windows and macOS on x64 and ARM64. The Windows and macOS build workflows publish release executables for both architectures. See the [current capability inventory](docs/capabilities.md), [architecture and roadmap](docs/architecture.md) and the [public reference study](docs/reference-study.md) for evidence, feature gaps and boundaries. Test on actual hardware with representative NVIDIA/AMD/Intel/Apple adapters and storage devices before relying on it. No real hardware validation is implied by a CI build.
 
 ## 繁體中文
 

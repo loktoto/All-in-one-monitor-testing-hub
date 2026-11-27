@@ -1020,6 +1020,19 @@ impl App {
                     }
                     ui.add_space(5.0);
                 }
+                ui.checkbox(&mut self.hwinfo_gadget_enabled, "Read HWiNFO Gadget");
+                if self.hwinfo_gadget_enabled {
+                    let (status, color) = match snapshot.hwinfo_thermals {
+                        ExternalThermals::Connected => ("Gadget data live", GREEN),
+                        ExternalThermals::Unavailable | ExternalThermals::Disabled => {
+                            ("Waiting for Gadget data", AMBER)
+                        }
+                    };
+                    pill(ui, status, color);
+                    if snapshot.hwinfo_thermals != ExternalThermals::Connected {
+                        ui.label("In HWiNFO Sensor Settings, enable Gadget reporting and select your core temperatures.");
+                    }
+                }
             }
             let count = snapshot.temperatures.iter().filter(|sensor| sensor.cpu_core).count();
             if count == 0 {

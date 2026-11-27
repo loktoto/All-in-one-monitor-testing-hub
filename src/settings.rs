@@ -57,6 +57,7 @@ pub struct Settings {
     pub poll_ms: u64,
     pub libre_monitor_enabled: bool,
     pub libre_monitor_port: u16,
+    pub hwinfo_gadget_enabled: bool,
     /// Worker threads for the software checks.
     pub workers: usize,
     /// Default duration for a timed check, in seconds.
@@ -103,6 +104,7 @@ impl Default for Settings {
             poll_ms: 1000,
             libre_monitor_enabled: false,
             libre_monitor_port: 8085,
+            hwinfo_gadget_enabled: false,
             workers: logical,
             seconds: 1800,
             stress_mode: "timed".into(),

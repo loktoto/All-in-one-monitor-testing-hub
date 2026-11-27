@@ -102,6 +102,7 @@ pub struct Snapshot {
     pub adapters: Vec<Adapter>,
     pub temperatures: Vec<Temperature>,
     pub external_thermals: ExternalThermals,
+    pub hwinfo_thermals: ExternalThermals,
     pub fans: Vec<Fan>,
     pub cpu_range: Range,
     pub memory_range: Range,
@@ -414,6 +415,7 @@ pub struct SamplingControl {
     pub paused: AtomicBool,
     /// Zero disables the local LibreHardwareMonitor feed.
     pub lhm_port: AtomicU16,
+    pub hwinfo_gadget_enabled: AtomicBool,
     sampler: OnceLock<thread::Thread>,
 }
 
@@ -631,15 +633,7 @@ fn spawn_inner(
                         temperatures.push(track_temperature(&mut temp_stats, sensor));
                     }
                     for sensor in readings.fans {
-                        let (min, max) = note(&mut fan_bounds, &sensor.key, sensor.value);
-                        fans.push(Fan {
-                            key: sensor.key,
-                            label: sensor.label,
-                            source: sensor.source,
-                            rpm: sensor.value,
-                            min,
-                            max,
-                        });
+                        fans.push(track_fan(&mut fan_bounds, sensor));
                     }
                 }
                 _ => {
@@ -696,6 +690,24 @@ fn spawn_inner(
             };
             #[cfg(not(target_os = "windows"))]
             let external_thermals = ExternalThermals::Disabled;
+            #[cfg(target_os = "windows")]
+            let hwinfo_thermals = {
+                let enabled = control
+                    .as_ref()
+                    .is_some_and(|c| c.hwinfo_gadget_enabled.load(Ordering::Relaxed));
+                let (status, readings) = crate::sensors::hwinfo::sample(enabled);
+                for sensor in readings {
+                    match sensor.unit {
+                        crate::sensors::Unit::Celsius => {
+                            temperatures.push(track_temperature(&mut temp_stats, sensor))
+                        }
+                        crate::sensors::Unit::Rpm => fans.push(track_fan(&mut fan_bounds, sensor)),
+                    }
+                }
+                status
+            };
+            #[cfg(not(target_os = "windows"))]
+            let hwinfo_thermals = ExternalThermals::Disabled;
             let mut network_list: Vec<Network> = networks
                 .iter()
                 .map(|(name, data)| Network {
@@ -746,6 +758,7 @@ fn spawn_inner(
                 adapters: adapters.clone(),
                 temperatures,
                 external_thermals,
+                hwinfo_thermals,
                 fans,
                 cpu_range,
                 memory_range,
@@ -834,6 +847,18 @@ fn track_temperature(
 
 /// Tracks an all-time low/high for a named sensor. A missing sample never
 /// becomes a zero, and never clears what was already observed.
+fn track_fan(bounds: &mut HashMap<String, (f32, f32)>, sensor: Sensor) -> Fan {
+    let (min, max) = note(bounds, &sensor.key, sensor.value);
+    Fan {
+        key: sensor.key,
+        label: sensor.label,
+        source: sensor.source,
+        rpm: sensor.value,
+        min,
+        max,
+    }
+}
+
 fn note(
     bounds: &mut HashMap<String, (f32, f32)>,
     key: &str,

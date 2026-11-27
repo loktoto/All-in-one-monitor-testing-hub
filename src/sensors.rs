@@ -12,6 +12,8 @@
 //! value is only reported when it decodes to a plausible number.
 
 #[cfg(any(target_os = "windows", test))]
+pub(crate) mod hwinfo;
+#[cfg(any(target_os = "windows", test))]
 pub(crate) mod lhm;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
