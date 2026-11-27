@@ -385,6 +385,12 @@ impl App {
                 self.cancel.store(true, Ordering::Relaxed);
                 self.message = "Stopping after the current work or I/O operation…".into();
             }
+        } else if self
+            .disk_benchmark
+            .as_ref()
+            .is_some_and(|run| run.progress().running)
+        {
+            ui.label("The storage benchmark is running. Press Esc to stop it.");
         } else if primary_button(ui, "Start stability check", full_width, 32.0).clicked() {
             self.launch_stress_check(s);
             ui.ctx().request_repaint();

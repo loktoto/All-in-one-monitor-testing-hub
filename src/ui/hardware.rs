@@ -6,7 +6,7 @@ use crate::App;
 use eframe::egui::{self, CornerRadius, RichText, Stroke};
 use egui_plot::{Line, Plot, PlotPoints};
 use hardware_hub::{
-    history, netcheck, smart,
+    diskbench, history, netcheck, smart,
     specs::{self, SystemSpecs},
     stress::Kind,
     telemetry::Snapshot,
@@ -30,7 +30,11 @@ impl App {
             }
             Page::Gpu => self.view_gpu_dive(ui, snapshot, specs.as_deref(), narrow),
             Page::Memory => self.view_memory_dive(ui, snapshot, specs.as_deref(), narrow),
-            Page::Storage => self.view_storage_dive(ui, snapshot, specs.as_deref()),
+            Page::Storage => {
+                self.view_storage_dive(ui, snapshot, specs.as_deref());
+                ui.add_space(8.0);
+                self.storage_benchmark(ui, snapshot);
+            }
             Page::Motherboard => self.view_motherboard_dive(ui, specs.as_deref()),
             Page::Drivers => self.view_drivers_dive(ui, specs.as_deref()),
             Page::Network => self.view_network_dive(ui, snapshot, specs.as_deref()),
@@ -579,6 +583,159 @@ impl App {
                                 .color(MUTED),
                         );
                     });
+                }
+            }
+        });
+    }
+
+    fn storage_benchmark(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        compact_card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "Drive benchmark", Some("Queue depth 1"));
+            let progress = self.disk_benchmark.as_ref().map(diskbench::Run::progress);
+            let running = progress.as_ref().is_some_and(|p| p.running);
+            let stress_running = self.state.lock().is_ok_and(|s| s.running);
+            let mounts: Vec<_> = snapshot.disks.iter().filter(|d| d.total > 0).collect();
+            let temp = std::env::temp_dir();
+            let temp_volume = mounts
+                .iter()
+                .filter(|d| temp.starts_with(&d.mount))
+                .max_by_key(|d| d.mount.len());
+            // An empty choice refers to the temporary folder on the current user's volume.
+            if !self.disk_bench_mount.is_empty()
+                && !mounts.iter().any(|d| d.mount == self.disk_bench_mount)
+            {
+                self.disk_bench_mount.clear();
+            }
+            ui.add_enabled_ui(!running, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt("bench-volume")
+                        .selected_text(if self.disk_bench_mount.is_empty() {
+                            "System temp folder"
+                        } else {
+                            &self.disk_bench_mount
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.disk_bench_mount,
+                                String::new(),
+                                "System temp folder",
+                            );
+                            for volume in &mounts {
+                                ui.selectable_value(
+                                    &mut self.disk_bench_mount,
+                                    volume.mount.clone(),
+                                    &volume.mount,
+                                );
+                            }
+                        });
+                    egui::ComboBox::from_id_salt("bench-size")
+                        .selected_text(format!("{} MiB", self.disk_bench_mib))
+                        .show_ui(ui, |ui| {
+                            for size in diskbench::SIZES_MIB {
+                                ui.selectable_value(
+                                    &mut self.disk_bench_mib,
+                                    size,
+                                    format!("{size} MiB"),
+                                );
+                            }
+                        });
+                    #[cfg(windows)]
+                    ui.checkbox(&mut self.disk_bench_direct, "Bypass OS file cache");
+                });
+            });
+            if !self.disk_bench_direct {
+                ui.label(
+                    RichText::new("Buffered I/O. Cached reads can exceed device speed.")
+                        .size(10.5)
+                        .color(MUTED),
+                );
+            }
+            let target = if self.disk_bench_mount.is_empty() {
+                temp_volume
+            } else {
+                mounts.iter().find(|d| d.mount == self.disk_bench_mount)
+            };
+            let has_space = target
+                .is_some_and(|d| d.available >= (self.disk_bench_mib as u64 + 64) * 1024 * 1024);
+            ui.horizontal_wrapped(|ui| {
+                if running {
+                    if danger_button(ui, "Stop benchmark", false, 28.0).clicked() {
+                        if let Some(bench) = &self.disk_benchmark {
+                            bench.stop();
+                        }
+                    }
+                } else if ui
+                    .add_enabled(
+                        !stress_running && has_space,
+                        egui::Button::new("Run benchmark"),
+                    )
+                    .clicked()
+                {
+                    let ctx = ui.ctx().clone();
+                    let folder = if self.disk_bench_mount.is_empty() {
+                        temp
+                    } else {
+                        self.disk_bench_mount.clone().into()
+                    };
+                    match diskbench::Run::start(
+                        folder,
+                        self.disk_bench_mib,
+                        self.disk_bench_direct,
+                        move || ctx.request_repaint(),
+                    ) {
+                        Ok(bench) => {
+                            self.disk_benchmark = Some(bench);
+                            self.disk_bench_message.clear();
+                        }
+                        Err(error) => self.disk_bench_message = error,
+                    }
+                }
+                if stress_running {
+                    ui.colored_label(AMBER, "A stability check is running.");
+                } else if !has_space && !running {
+                    ui.label("Choose a mounted volume with enough free space.");
+                }
+            });
+            if !self.disk_bench_message.is_empty() {
+                ui.colored_label(AMBER, &self.disk_bench_message);
+            }
+            if let (Some(bench), Some(progress)) = (&self.disk_benchmark, progress) {
+                let mode = if bench.direct { "Direct" } else { "Buffered" };
+                ui.label(format!(
+                    "{} · {} MiB · {} · {}",
+                    bench.folder.display(),
+                    bench.mib,
+                    mode,
+                    progress.status
+                ));
+                let mut clipboard = format!(
+                    "{}\t{} MiB\t{mode} QD1\t{}\nTest\tMB/s\tIOPS\tMean µs\n",
+                    bench.folder.display(),
+                    bench.mib,
+                    progress.status
+                );
+                for row in &progress.rows {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(row.access.label());
+                        ui.monospace(format!(
+                            "{:.1} MB/s  ·  {:.0} IOPS  ·  {:.1} µs",
+                            row.mbps, row.iops, row.mean_us
+                        ));
+                    });
+                    use std::fmt::Write;
+                    let _ = writeln!(
+                        clipboard,
+                        "{}\t{:.1}\t{:.0}\t{:.1}",
+                        row.access.label(),
+                        row.mbps,
+                        row.iops,
+                        row.mean_us
+                    );
+                }
+                if !progress.rows.is_empty() && ghost_button(ui, "Copy benchmark results").clicked()
+                {
+                    ui.ctx().copy_text(clipboard);
                 }
             }
         });

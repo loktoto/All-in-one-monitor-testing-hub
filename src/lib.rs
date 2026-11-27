@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod diskbench;
 pub mod frames;
 pub mod history;
 pub mod logging;

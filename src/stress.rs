@@ -982,13 +982,29 @@ fn memory(
     ))
 }
 
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
+#[cfg(unix)]
+impl Scratch {
+    pub(crate) fn unlink(&self) -> std::io::Result<()> {
+        fs::remove_file(&self.0)
+    }
+}
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
 }
 fn scratch(dir: &Path) -> Result<(Scratch, fs::File), String> {
+    scratch_with_options(
+        dir,
+        OpenOptions::new().read(true).write(true).create_new(true),
+    )
+}
+
+pub(crate) fn scratch_with_options(
+    dir: &Path,
+    options: &OpenOptions,
+) -> Result<(Scratch, fs::File), String> {
     for attempt in 0..100 {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -998,12 +1014,7 @@ fn scratch(dir: &Path) -> Result<(Scratch, fs::File), String> {
             "hardware-hub-{}-{nonce}-{attempt}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        match options.open(&path) {
             Ok(file) => return Ok((Scratch(path), file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("Cannot create test file: {e}")),
